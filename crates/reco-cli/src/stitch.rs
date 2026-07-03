@@ -23,7 +23,7 @@ pub struct StitchArgs<'a> {
     pub output: &'a str,
     pub width: u32,
     pub height: u32,
-    pub blend: f32,
+    pub blend: Option<f32>,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
     pub max_frames: Option<u64>,
@@ -85,7 +85,7 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
     // and pass the pre-loaded calibration to StitchJob. `field_roi` is
     // only consumed under the autocam feature; a leading underscore
     // silences the unused-var lint on `--no-default-features` builds.
-    let cal = reco_core::calibration::MatchCalibration::from_file(Path::new(args.calibration))?;
+    let cal = reco_core::calibration::Calibration::from_file(Path::new(args.calibration))?;
     #[cfg_attr(not(feature = "autocam"), allow(unused_variables))]
     let field_roi = cal.field_roi.clone();
 
@@ -116,7 +116,6 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
     .codec(parse_codec(args.codec))
     .quality(parse_quality(args.quality))
     .resolution(args.width, args.height)
-    .blend_width(args.blend)
     .on_progress(move |p: &reco_core::session::types::FrameProgress| {
         // Use the session's own elapsed clock so the reported
         // rate excludes one-time GPU / encoder / ORT init and
@@ -124,6 +123,9 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
         progress.report_with_elapsed(p.frames_completed, p.elapsed);
     });
 
+    if let Some(b) = args.blend {
+        job = job.blend_width(b);
+    }
     if let Some(t) = args.start_time {
         job = job.start_time(t);
     }
