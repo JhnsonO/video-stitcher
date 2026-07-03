@@ -17,7 +17,9 @@ use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use nalgebra::{Unit, UnitQuaternion, Vector3};
 
-use crate::projection::{CoverageBoundary, VirtualCamera};
+use crate::projection::CoverageBoundary;
+
+use super::virtual_camera::VirtualCamera;
 
 /// The tilted+rolled reference frame `view_matrix` composes before applying
 /// yaw/pitch: the yaw axis `u` (world up after tilt, then roll) and the rest
@@ -63,7 +65,7 @@ pub(crate) fn rig_frame(
 /// Exact for any tilt+roll (the round-trip test against `view_matrix`
 /// is the guard); the previous quaternion-conjugation inverse was exact
 /// for tilt but drifted up to ~4 deg under combined tilt+roll.
-pub(crate) fn world_to_render_pose(
+pub fn world_to_render_pose(
     cam: &VirtualCamera,
     world_yaw: f32,
     world_pitch: f32,
@@ -166,7 +168,7 @@ pub(crate) fn render_viewport_roll(
 /// route through this, so their coverage clamp and rig tilt+roll
 /// correction can never drift into per-call copies. Interactive
 /// consumers clamp ([`CoverageBoundary::safe_clamp`] via
-/// `PoseControl`) and orient (`StitchRenderer::orient_pose`) as separate
+/// `PoseControl`) and orient (`StitchCore::orient_pose`) as separate
 /// steps, sharing the same [`world_to_render_pose`] leaf.
 ///
 /// It bridges the two halves of the geometry seam:
@@ -185,7 +187,7 @@ pub(crate) fn render_viewport_roll(
 ///
 /// (Steps 6-8 will dispatch stage 1 through the `Projection` trait so a
 /// new projection brings its own clamp; stage 2 stays shared.)
-pub(crate) fn resolve_render_pose(
+pub fn resolve_render_pose(
     coverage: &CoverageBoundary,
     cam: &VirtualCamera,
     rig_tilt: f32,
@@ -233,7 +235,7 @@ mod tests {
     /// the wrong way).
     #[test]
     fn world_to_render_inverts_view_matrix_under_tilt_and_roll() {
-        use crate::render::renderer::view_matrix;
+        use crate::geometry::matrices::view_matrix;
         let position = [1.0_f32, 0.0, 1.0];
         let cam = VirtualCamera::new(&position);
         for &(tilt, roll) in &[

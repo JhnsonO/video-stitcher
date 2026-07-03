@@ -3,10 +3,12 @@
 use std::f32::consts::FRAC_PI_2;
 
 use crate::calibration::Calibration;
-use crate::detect::detector::CameraId;
+use crate::geometry::CameraId;
 use crate::render::scene::SceneGeometry;
 
-use super::{VirtualCamera, camera_to_panorama};
+use crate::geometry::VirtualCamera;
+
+use super::camera_to_panorama;
 
 // -- Coverage Boundary --
 //
@@ -303,6 +305,7 @@ impl CoverageBoundary {
     /// boundary samples (`SceneGeometry` consumes only `axis_offset`).
     /// Only the roll-aware clamp margins read these scalars, so a live
     /// tilt/roll change needs no dense re-projection.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))] // live-orientation engine hook
     pub(crate) fn set_rig_orientation(&mut self, rig_tilt: f32, rig_roll: f32) {
         self.rig_tilt = rig_tilt;
         self.rig_roll = rig_roll;
@@ -410,7 +413,7 @@ impl CoverageBoundary {
         // Evaluate the roll at the first-pass pose - it varies slowly, so
         // one refinement pass suffices - and re-clamp with the rotated
         // rectangle's extents as margins.
-        let vroll = crate::lens::rig_correction::render_viewport_roll(
+        let vroll = crate::geometry::render_viewport_roll(
             &self.cam,
             first.yaw,
             first.pitch,

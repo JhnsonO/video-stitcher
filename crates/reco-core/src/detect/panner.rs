@@ -18,10 +18,11 @@
 //!   left-right within coverage bounds.
 //! - `FilePanner` - replays a precomputed pose trajectory from CSV.
 
-use super::director::{MappedDetection, ViewportPosition};
+use super::director::MappedDetection;
 use super::pipeline_event::{PipelineEvent, PipelineEventSink};
 use super::tracker::{Tracker, WorldState};
 use crate::calibration::Calibration;
+use crate::geometry::ViewportPosition;
 
 /// Per-frame context a [`Panner`] receives alongside the world state.
 ///
@@ -131,7 +132,6 @@ pub(crate) struct DispatchContext<'a> {
 /// of the Step 6 trace vocabulary.
 pub(crate) struct DispatchResult {
     pub pose: ViewportPosition,
-    pub world_state: WorldState,
     pub active_tracks: u32,
     pub ball_present: bool,
 }
@@ -173,7 +173,6 @@ pub(crate) fn dispatch(
     ball_tracker: Option<&mut Box<dyn Tracker>>,
     previous_panner_pose: &mut ViewportPosition,
     mut event_sink: Option<&mut (dyn PipelineEventSink + '_)>,
-    future_world_states: &[WorldState],
     ctx: DispatchContext<'_>,
 ) -> Option<DispatchResult> {
     let panner = panner?;
@@ -203,7 +202,11 @@ pub(crate) fn dispatch(
         .as_ref()
         .is_some_and(|b| !matches!(b.state, super::tracker::TrackState::Lost));
 
-    let pose = panner.decide_with_lookahead(&world, future_world_states, &pan_ctx);
+    // The lookahead-aware path does not come through here: the
+    // buffered loop calls `StitchCore::decide_pose_with_lookahead`
+    // with the real future window. This immediate-mode dispatch has
+    // no future frames by construction.
+    let pose = panner.decide_with_lookahead(&world, &[], &pan_ctx);
     *previous_panner_pose = pose;
 
     if let Some(sink) = event_sink.as_mut() {
@@ -218,7 +221,6 @@ pub(crate) fn dispatch(
 
     Some(DispatchResult {
         pose,
-        world_state: world,
         active_tracks,
         ball_present,
     })
@@ -228,8 +230,8 @@ pub(crate) fn dispatch(
 mod tests {
     use super::*;
     use crate::calibration::{Calibration, Framing, Lens, Topology};
-    use crate::detect::detector::CameraId;
     use crate::detect::tracker::{TrackState, TrackedEntity, WorldState};
+    use crate::geometry::CameraId;
 
     /// A fixture calibration shaped like the v1 test JSON without
     /// needing disk access or real lens data.

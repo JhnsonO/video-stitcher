@@ -9,12 +9,12 @@
 //! implementation-defined unorm rounding), so it doubles as the agreement oracle.
 
 use crate::calibration::Calibration;
+use crate::projection::Projection;
 use crate::render::planes::{Nv12Planes, YuvPlanes};
 use crate::render::viewport::ViewportConfig;
 
-use super::StitchError;
-use super::SurfaceMap;
-use super::geometry::l_shape_plane_maps;
+use super::executor::StitchError;
+use super::{BlendRule, SurfaceMap};
 
 /// Reject degenerate source dimensions that would underflow chroma indexing.
 fn check_source_dims(cw: u32, ch: u32) -> Result<(), StitchError> {
@@ -56,7 +56,8 @@ fn check_plane(plane: &[u8], expected: usize) -> Result<(), StitchError> {
 /// rather than panicking - this is the GPU-less render path, so callers (e.g.
 /// the X5) get a typed error instead of an out-of-bounds panic.
 #[allow(clippy::too_many_arguments)]
-pub fn stitch_l_shape_rgba(
+pub(crate) fn stitch_rgba(
+    projection: &dyn Projection,
     left: &Nv12Planes,
     right: &Nv12Planes,
     cam: (u32, u32),
@@ -73,7 +74,8 @@ pub fn stitch_l_shape_rgba(
     check_plane(left.uv, w * (h / 2))?;
     check_plane(right.y, w * h)?;
     check_plane(right.uv, w * (h / 2))?;
-    Ok(stitch_l_shape_with(
+    Ok(stitch_with(
+        projection,
         calib,
         config,
         yaw,
@@ -85,11 +87,12 @@ pub fn stitch_l_shape_rgba(
 
 /// Stitch two YUV420p (planar) camera frames into an RGBA panorama on the CPU.
 ///
-/// Identical to [`stitch_l_shape_rgba`] but for the software-decode planar
+/// Identical to [`stitch_rgba`] but for the software-decode planar
 /// format (separate Y, U, V planes). Useful as the GPU-less rendering path on
 /// desktop/cloud where FFmpeg software decode yields YUV420p.
 #[allow(clippy::too_many_arguments)]
-pub fn stitch_l_shape_rgba_yuv420p(
+pub(crate) fn stitch_rgba_yuv420p(
+    projection: &dyn Projection,
     left: &YuvPlanes,
     right: &YuvPlanes,
     cam: (u32, u32),
@@ -109,7 +112,8 @@ pub fn stitch_l_shape_rgba_yuv420p(
     check_plane(right.y, w * h)?;
     check_plane(right.u, chroma)?;
     check_plane(right.v, chroma)?;
-    Ok(stitch_l_shape_with(
+    Ok(stitch_with(
+        projection,
         calib,
         config,
         yaw,
@@ -119,13 +123,14 @@ pub fn stitch_l_shape_rgba_yuv420p(
     ))
 }
 
-/// Format-agnostic L-shape gather and composite.
+/// Format-agnostic gather and composite driven by the projection.
 ///
-/// `sample_left` / `sample_right` map a normalised camera UV to sRGB-domain
-/// RGB for their respective source frame; the loop itself knows nothing about
-/// the pixel format. Left plane is the opaque base; the right plane fades in
-/// over it with a smoothstep seam, matching the GPU's two-draw alpha blend.
-fn stitch_l_shape_with(
+/// The surface list comes from [`Projection::surface_maps`] - this is the
+/// L1 dispatch made real. `sample_left` / `sample_right` map a normalised
+/// camera UV to sRGB-domain RGB for their respective source frame; the
+/// loop itself knows nothing about the pixel format.
+fn stitch_with(
+    projection: &dyn Projection,
     calib: &Calibration,
     config: &ViewportConfig,
     yaw: f32,
@@ -133,32 +138,49 @@ fn stitch_l_shape_with(
     sample_left: impl Fn(f64, f64) -> [f64; 3],
     sample_right: impl Fn(f64, f64) -> [f64; 3],
 ) -> Vec<u8> {
-    let (out_w, out_h) = (config.width, config.height);
-    let (lmap, rmap) = l_shape_plane_maps(calib, config, yaw, pitch);
-    let blend_width = calib.topology.blend_width as f64;
+    let surfaces = projection.surface_maps(calib, config, yaw, pitch);
+    let samplers: [&dyn Fn(f64, f64) -> [f64; 3]; 2] = [&sample_left, &sample_right];
+    composite_rgba(&surfaces, &samplers, config.width, config.height)
+}
 
+/// Composite an ordered surface list into an opaque RGBA buffer.
+///
+/// Surface `i` samples source `i` through `samplers[i]`. Surfaces apply in
+/// order: the first covered surface lays the base, later ones blend over it
+/// per their [`BlendRule`]. This is the projection-agnostic core the
+/// N-surface projections (mono cylinder next) drive.
+fn composite_rgba(
+    surfaces: &[(Box<dyn SurfaceMap>, BlendRule)],
+    samplers: &[&dyn Fn(f64, f64) -> [f64; 3]],
+    out_w: u32,
+    out_h: u32,
+) -> Vec<u8> {
+    // A real assert (not debug): a length mismatch would make the zip
+    // silently truncate in release and composite a wrong image with no
+    // error. Once per frame, so the check is free next to the per-pixel
+    // work.
+    assert_eq!(
+        surfaces.len(),
+        samplers.len(),
+        "projection emitted {} surfaces but the kernel supplied {} samplers",
+        surfaces.len(),
+        samplers.len()
+    );
     let mut out = vec![0u8; (out_w * out_h * 4) as usize];
     for py in 0..out_h {
         for px in 0..out_w {
-            let left_rgb = lmap.sample_uv(px, py).map(|s| sample_left(s.u, s.v));
-            let right_s = rmap.sample_uv(px, py);
-            let right_rgb = right_s.map(|s| sample_right(s.u, s.v));
-            let right_alpha = match right_s {
-                Some(s) if blend_width > 0.0 => smoothstep(0.0, blend_width, s.edge),
-                Some(_) => 1.0,
-                None => 0.0,
-            };
-
-            let base = left_rgb.unwrap_or([0.0; 3]);
-            let rgb = match right_rgb {
-                Some(r) => [
-                    base[0] + (r[0] - base[0]) * right_alpha,
-                    base[1] + (r[1] - base[1]) * right_alpha,
-                    base[2] + (r[2] - base[2]) * right_alpha,
-                ],
-                None => base,
-            };
-
+            let mut rgb = [0.0f64; 3];
+            for ((map, rule), sample) in surfaces.iter().zip(samplers) {
+                if let Some(s) = map.sample_uv(px, py) {
+                    let alpha = rule.alpha(s.edge);
+                    let src = sample(s.u, s.v);
+                    rgb = [
+                        rgb[0] + (src[0] - rgb[0]) * alpha,
+                        rgb[1] + (src[1] - rgb[1]) * alpha,
+                        rgb[2] + (src[2] - rgb[2]) * alpha,
+                    ];
+                }
+            }
             let i = ((py * out_w + px) * 4) as usize;
             out[i] = to_u8(rgb[0]);
             out[i + 1] = to_u8(rgb[1]);
@@ -272,13 +294,6 @@ fn bilinear_chroma(uv: &[u8], stride: usize, cw: usize, ch: usize, fx: f64, fy: 
     (lerp(0), lerp(1))
 }
 
-/// Hermite smoothstep, matching WGSL `smoothstep`.
-#[inline]
-fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
 /// Quantise an sRGB-domain channel in `[0, 1]` to a `u8` (round-to-nearest).
 /// The GPU's `Rgba8Unorm` unorm rounding is implementation-defined, so this
 /// agrees to ~1 LSB rather than bit-exactly.
@@ -293,6 +308,7 @@ mod tests {
 
     #[test]
     fn smoothstep_endpoints_and_midpoint() {
+        use crate::stitch::smoothstep;
         assert_eq!(smoothstep(0.0, 1.0, -1.0), 0.0);
         assert_eq!(smoothstep(0.0, 1.0, 2.0), 1.0);
         assert!((smoothstep(0.0, 1.0, 0.5) - 0.5).abs() < 1e-12);

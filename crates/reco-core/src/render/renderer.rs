@@ -26,19 +26,17 @@
 use super::scene::SceneGeometry;
 use super::viewport::ResolvedViewport;
 use crate::calibration::{Calibration, Lens};
+use crate::geometry::{
+    FAR_PLANE, NEAR_PLANE, matrix4_to_columns, opengl_to_wgpu_matrix, view_matrix,
+};
 use crate::gpu::GpuContext;
 
 use bytemuck::{Pod, Zeroable};
-use nalgebra::{Matrix4, Perspective3, Point3, UnitQuaternion};
+use nalgebra::{Matrix4, Perspective3};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
 // ---- Constants ----
-
-/// Near clipping plane for the perspective projection.
-pub(crate) const NEAR_PLANE: f32 = 0.01;
-/// Far clipping plane for the perspective projection.
-pub(crate) const FAR_PLANE: f32 = 5.0;
 
 /// Errors from the renderer.
 #[derive(Debug, Clone, Error)]
@@ -66,13 +64,13 @@ pub(crate) struct GpuUniforms {
 /// Vertex with 3D position and UV coordinates.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct Vertex {
+pub(crate) struct Vertex {
     position: [f32; 3],
     uv: [f32; 2],
 }
 
 impl Vertex {
-    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    pub(crate) const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Vertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &[
@@ -246,8 +244,10 @@ impl Renderer {
     ///
     /// `input_format` selects between YUV420P (3 separate planes) and
     /// NV12 (Y + interleaved UV). NV12 is the native NVDEC output format.
+    #[allow(clippy::too_many_arguments)] // construction-only plumbing
     pub fn new(
         gpu: &GpuContext,
+        program: &crate::render::GpuProgram,
         output_width: u32,
         output_height: u32,
         input_width: u32,
@@ -258,10 +258,11 @@ impl Renderer {
     ) -> Self {
         let device = &gpu.device;
 
-        // Shader
+        // Shader: compiled from the projection's GPU program descriptor -
+        // the render pipeline builds exactly what the projection declares.
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("fisheye"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/fisheye.wgsl").into()),
+            label: Some("projection_composite"),
+            source: wgpu::ShaderSource::Wgsl(program.wgsl.into()),
         });
 
         // Vertex buffer (quad for both planes — same shape, different model matrices)
@@ -325,24 +326,17 @@ impl Renderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_main"),
+                entry_point: Some(program.vs_entry),
                 compilation_options: Default::default(),
-                buffers: &[Vertex::LAYOUT],
+                buffers: std::slice::from_ref(&program.vertex_layout),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
+                entry_point: Some(program.fs_entry),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: output_format,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::SrcAlpha,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent::OVER,
-                    }),
+                    blend: Some(program.blend),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -1157,67 +1151,6 @@ fn upload_nv12(
     Ok(())
 }
 
-/// Build the view matrix for the virtual camera.
-///
-/// Camera sits at `position` and looks at the origin (corner where the two
-/// planes meet) by default. This matches v1 Three.js where the OrbitControls
-/// target is `[0, 0, 0]`. `yaw` rotates around Y (left/right from center),
-/// `pitch` rotates around X (up/down).
-pub(crate) fn view_matrix(
-    position: &[f32; 3],
-    yaw: f32,
-    pitch: f32,
-    rig_tilt: f32,
-    rig_roll: f32,
-) -> Matrix4<f32> {
-    // Basis is owned by VirtualCamera so view_matrix and the yaw/pitch
-    // decomposition in projection.rs share a single source of truth.
-    // The right-handed `(base_forward, base_right, world_up)` triple
-    // makes view_matrix's yaw sign agree with
-    // `direction_to_yaw_pitch` without any downstream sign reconciliation.
-    let cam = crate::projection::VirtualCamera::new(position);
-    let eye = Point3::from(cam.eye);
-    let mut base_forward = cam.base_forward;
-    let base_right = cam.base_right;
-    let mut world_up = crate::projection::VirtualCamera::world_up();
-
-    // Rig tilt: rotate the entire reference frame around the base right axis.
-    // This tilts "up" and "forward" so that yaw/pitch operate in the tilted
-    // coordinate system. Panning in this tilted frame naturally introduces
-    // roll that compensates for edge distortion from a tilted camera rig.
-    if rig_tilt.abs() > 1e-6 {
-        let tilt_q =
-            UnitQuaternion::from_axis_angle(&nalgebra::Unit::new_normalize(base_right), rig_tilt);
-        base_forward = tilt_q * base_forward;
-        world_up = tilt_q * world_up;
-    }
-
-    // Rig roll: rotate around the forward axis to correct lateral lean.
-    // Negated because roll describes the camera's lean direction, and we
-    // need to rotate the opposite way to straighten the horizon.
-    // (Tilt is not negated because it shifts the view center to match
-    // where the camera points, which is the same direction.)
-    if rig_roll.abs() > 1e-6 {
-        let roll_q = UnitQuaternion::from_axis_angle(
-            &nalgebra::Unit::new_normalize(base_forward),
-            -rig_roll,
-        );
-        world_up = roll_q * world_up;
-    }
-
-    // Yaw: rotate around the (possibly tilted) up axis
-    let up_axis = nalgebra::Unit::new_normalize(world_up);
-    let yaw_q = UnitQuaternion::from_axis_angle(&up_axis, yaw);
-    // Pitch: rotate around the yaw-rotated right axis
-    let right = yaw_q * base_right;
-    let pitch_q = UnitQuaternion::from_axis_angle(&nalgebra::Unit::new_normalize(right), pitch);
-    let rotation = pitch_q * yaw_q;
-    let forward = rotation * base_forward;
-    let up = rotation * world_up;
-    let target = Point3::from(eye.coords + forward);
-    nalgebra::Isometry3::look_at_rh(&eye, &target, &up).to_homogeneous()
-}
-
 /// Build the GPU uniform struct for one plane.
 ///
 /// `flip_180`: when true, the shader flips UV coordinates to apply
@@ -1266,31 +1199,6 @@ pub(crate) fn build_gpu_uniforms(
     }
 }
 
-/// Convert a nalgebra `Matrix4` to column-major `[[f32; 4]; 4]` for wgpu.
-pub(crate) fn matrix4_to_columns(m: &Matrix4<f32>) -> [[f32; 4]; 4] {
-    let s = m.as_slice();
-    [
-        [s[0], s[1], s[2], s[3]],
-        [s[4], s[5], s[6], s[7]],
-        [s[8], s[9], s[10], s[11]],
-        [s[12], s[13], s[14], s[15]],
-    ]
-}
-
-/// OpenGL to wgpu clip space correction: Z from \[-1,1\] to \[0,1\].
-///
-/// nalgebra's `Perspective3` uses OpenGL conventions. wgpu expects
-/// clip space Z in [0, 1], so we apply this correction.
-#[rustfmt::skip]
-pub(crate) fn opengl_to_wgpu_matrix() -> Matrix4<f32> {
-    Matrix4::new(
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 0.5, 0.5,
-        0.0, 0.0, 0.0, 1.0,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1324,70 +1232,5 @@ mod tests {
         // is_right = 0, use_nv12 = 0
         assert_eq!(u.flags[0], 0);
         assert_eq!(u.flags[1], 0);
-    }
-
-    #[test]
-    fn opengl_to_wgpu_maps_z() {
-        let m = opengl_to_wgpu_matrix();
-        // Point at Z = -1 (OpenGL near) should map to Z = 0 (wgpu near)
-        let p = m * nalgebra::Vector4::new(0.0, 0.0, -1.0, 1.0);
-        assert!((p.z - (-0.5 + 0.5)).abs() < 1e-5); // -0.5 + 0.5 = 0
-        // Point at Z = 1 (OpenGL far) should map to Z = 1 (wgpu far)
-        let p = m * nalgebra::Vector4::new(0.0, 0.0, 1.0, 1.0);
-        assert!((p.z - 1.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn view_matrix_self_consistent_with_direction_to_yaw_pitch() {
-        // Step 1e (un-ignored by Step 2's VirtualCamera basis fix):
-        // directions synthesized at a known (yaw, pitch), run through
-        // direction_to_yaw_pitch, then fed to view_matrix, must
-        // transform a point on the dir ray to the camera's -Z axis
-        // (the right-hand convention nalgebra::Isometry3::look_at_rh
-        // uses).
-        //
-        // rig_tilt and rig_roll are both zero here: direction_to_yaw_pitch
-        // does not take them (Model 4), so any non-zero tilt/roll
-        // would break the round-trip by definition. Step 4 lands
-        // RigCorrection and unblocks the full (yaw, pitch, tilt, roll)
-        // version of this test.
-        let camera_position = [0.24_f32, 0.0, 0.24];
-        let yaw_steps = [-1.0_f32, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0];
-        let pitch_steps = [-0.6_f32, -0.2, 0.0, 0.2, 0.6];
-
-        for &yaw in &yaw_steps {
-            for &pitch in &pitch_steps {
-                let dir = crate::projection::yaw_pitch_to_direction(yaw, pitch, &camera_position);
-                let pos = crate::projection::direction_to_yaw_pitch(&dir, &camera_position);
-
-                let view = view_matrix(&camera_position, pos.yaw, pos.pitch, 0.0, 0.0);
-
-                // A point at eye + dir (unit step along the direction)
-                // must land on camera-space -Z at distance 1.
-                let target = nalgebra::Vector4::new(
-                    camera_position[0] + dir.x,
-                    camera_position[1] + dir.y,
-                    camera_position[2] + dir.z,
-                    1.0,
-                );
-                let cam = view * target;
-
-                assert!(
-                    cam.x.abs() < 1e-4,
-                    "x should be zero (on camera forward axis), got {} at yaw={yaw} pitch={pitch}",
-                    cam.x
-                );
-                assert!(
-                    cam.y.abs() < 1e-4,
-                    "y should be zero (on camera forward axis), got {} at yaw={yaw} pitch={pitch}",
-                    cam.y
-                );
-                assert!(
-                    (cam.z + 1.0).abs() < 1e-4,
-                    "z should be -1 (camera looks down -Z), got {} at yaw={yaw} pitch={pitch}",
-                    cam.z
-                );
-            }
-        }
     }
 }

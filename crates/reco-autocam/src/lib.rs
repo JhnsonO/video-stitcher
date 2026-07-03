@@ -3,7 +3,7 @@
 //! The intelligence layer. [`trackers`] turn noisy per-frame detections
 //! into a clean [`WorldState`](reco_core::detect::tracker::WorldState) with
 //! stable identities and lifecycle flags; [`panners`] turn that world
-//! state into a virtual-camera [`ViewportPosition`](reco_core::detect::director::ViewportPosition).
+//! state into a virtual-camera [`ViewportPosition`](reco_core::geometry::ViewportPosition).
 //! Detector backends live in [`reco_detect`] and are re-exported at
 //! crate root for convenience but are not owned here.
 //!
@@ -195,7 +195,7 @@ pub fn setup_autocam(
         return Ok(false);
     }
 
-    let (input_width, input_height) = target.pipeline().source_info();
+    let (input_width, input_height) = target.source_info();
     let use_zero_copy = source_is_gpu_resident;
     let model_path = config.model_path.to_str().unwrap_or("");
     let detection_interval = config.detection_interval;
@@ -346,10 +346,10 @@ pub fn setup_autocam(
     }
 
     #[cfg(all(feature = "ort", target_os = "macos"))]
-    if use_zero_copy {
+    if use_zero_copy && let Some(gpu) = target.gpu() {
         match MetalYoloDetector::try_new(
             model_path,
-            target.gpu(),
+            gpu,
             input_width,
             input_height,
             config.confidence_threshold.unwrap_or(0.10),
@@ -406,8 +406,10 @@ pub fn setup_autocam(
     // preprocessor (NV12 → float32 CHW) + CpuYoloDetector with DirectML EP.
     // Works on any DX12 GPU including Pascal, AMD, and Intel.
     #[cfg(feature = "ort")]
-    if !detection_active && use_zero_copy {
-        let gpu = target.gpu();
+    if !detection_active
+        && use_zero_copy
+        && let Some(gpu) = target.gpu()
+    {
         let yolo = CpuYoloDetector::with_config(
             model_path,
             config.confidence_threshold.unwrap_or(0.10),

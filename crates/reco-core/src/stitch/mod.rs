@@ -1,8 +1,11 @@
-//! CPU stitching backend (projection-agnostic).
+//! Stitch executors (L2): the CPU software path and the GPU pipeline owner.
 //!
-//! A pure-Rust, no-wgpu software stitcher that mirrors the GPU fisheye shader
-//! (`shaders/fisheye.wgsl`, the fragment stage in [`crate::render`]) per output
-//! pixel. It serves two roles:
+//! [`GpuExecutor`] owns the wgpu render pipeline;
+//! [`StitchCore`](crate::core::StitchCore) embeds one as its render
+//! substrate. The rest of this module is the pure-Rust, no-wgpu software
+//! stitcher that mirrors the GPU fisheye shader (`shaders/fisheye.wgsl`,
+//! the fragment stage in [`crate::render`]) per output pixel. The CPU
+//! path serves two roles:
 //!
 //! 1. **Correctness oracle** for the GPU path. The geometry reuses
 //!    `crate::lens::kb4` and the same view/projection matrices as
@@ -13,9 +16,9 @@
 //!
 //! ## Projection seam
 //!
-//! [`SurfaceMap`] is the only projection-specific piece: it maps an output
+//! `SurfaceMap` is the only projection-specific piece: it maps an output
 //! pixel to a source-camera UV. The two-plane L-shape provides one
-//! [`PlaneMap`] per camera. The gather loop in `cpu` is currently specialised
+//! `PlaneMap` per camera. The gather loop in `cpu` is currently specialised
 //! to the two-surface L-shape composite; the trait is the seam that N-surface
 //! projections (cylinder, N-camera) build on.
 //!
@@ -25,13 +28,44 @@
 //! memory-tuned specialisation and NV12-direct output are deliberate later
 //! additions, gated on profiling (see the cpu-stitch portability work).
 
-mod backend;
 mod cpu;
-mod geometry;
+mod executor;
+pub(crate) mod geometry;
 
-pub use backend::{CpuStitchBackend, GpuStitchBackend, StitchBackend, StitchError};
-pub use cpu::{stitch_l_shape_rgba, stitch_l_shape_rgba_yuv420p};
-pub use geometry::{PlaneMap, l_shape_plane_maps};
+pub use executor::{CpuExecutor, Executor, StitchError, StitchExecutor};
+#[cfg(feature = "gpu")]
+pub use executor::{GpuExecutor, GpuExecutorConfig};
+
+/// How one projection surface composites over the surfaces before it.
+///
+/// Paired with a [`SurfaceMap`] in the ordered surface list a projection
+/// emits: the first surface lays the base, later ones blend over it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BlendRule {
+    /// Fully replaces whatever is underneath wherever this surface covers.
+    Opaque,
+    /// Fades in over `[0, width]` of the surface's [`SurfaceUv::edge`]
+    /// coordinate (the GPU's seam smoothstep). A non-positive width
+    /// renders fully opaque wherever the surface covers.
+    Smoothstep(f64),
+}
+
+impl BlendRule {
+    /// Blend factor for a covered pixel with the given edge coordinate.
+    pub(crate) fn alpha(&self, edge: f64) -> f64 {
+        match *self {
+            BlendRule::Opaque => 1.0,
+            BlendRule::Smoothstep(width) if width > 0.0 => smoothstep(0.0, width, edge),
+            BlendRule::Smoothstep(_) => 1.0,
+        }
+    }
+}
+
+/// GLSL-compatible smoothstep (SYNC_WITH `fisheye.wgsl`'s seam blend).
+fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
 
 /// A source-camera sample location produced by a [`SurfaceMap`].
 #[derive(Debug, Clone, Copy)]
@@ -63,7 +97,13 @@ pub trait SurfaceMap {
 /// Shared test fixtures + GPU acquisition for the stitch test modules.
 #[cfg(test)]
 pub(crate) mod test_support {
+    // The agreement types + pattern generators only run under the gpu
+    // feature (they gate GPU-vs-CPU comparisons); keep them compiled
+    // either way so the fixtures stay in sync.
+    #![cfg_attr(not(feature = "gpu"), allow(dead_code))]
+
     use crate::calibration::{Calibration, Framing, Lens, Topology};
+    #[cfg(feature = "gpu")]
     use crate::gpu::{GpuContext, GpuError};
 
     /// Two-camera calibration (shared dims, mild fisheye, centred) for tests.
@@ -112,6 +152,7 @@ pub(crate) mod test_support {
     /// `RECO_REQUIRE_GPU` is set, in which case a missing adapter is a hard
     /// failure (so CI with a software adapter cannot silently skip the
     /// agreement tests).
+    #[cfg(feature = "gpu")]
     pub fn gpu_or_skip() -> Option<GpuContext> {
         match pollster::block_on(GpuContext::new()) {
             Ok(g) => Some(g),
@@ -220,8 +261,21 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{Agreement, AgreementBounds, calib, gpu_or_skip, nv12};
-    use super::*;
+    #![cfg_attr(not(feature = "gpu"), allow(dead_code))]
+
+    use crate::projection::LShapeProjection;
+    #[cfg(feature = "gpu")]
+    use crate::projection::Projection;
+
+    use super::cpu::stitch_rgba;
+    #[cfg(feature = "gpu")]
+    use super::cpu::stitch_rgba_yuv420p;
+    #[cfg(feature = "gpu")]
+    use super::test_support::gpu_or_skip;
+    #[cfg(feature = "gpu")]
+    use super::test_support::{Agreement, AgreementBounds};
+    use super::test_support::{calib, nv12};
+    #[cfg(feature = "gpu")]
     use crate::calibration::Calibration;
     use crate::render::planes::Nv12Planes;
     use crate::render::viewport::ViewportConfig;
@@ -240,8 +294,18 @@ mod tests {
         let left = Nv12Planes { y: &ly, uv: &luv };
         let right = Nv12Planes { y: &ry, uv: &ruv };
 
-        let out =
-            stitch_l_shape_rgba(&left, &right, (w, h), &calib, &cfg, 0.0, 0.0, false).unwrap();
+        let out = stitch_rgba(
+            &LShapeProjection,
+            &left,
+            &right,
+            (w, h),
+            &calib,
+            &cfg,
+            0.0,
+            0.0,
+            false,
+        )
+        .unwrap();
         assert_eq!(out.len(), (w * h * 4) as usize);
         // Alpha channel is fully opaque.
         assert!(out.iter().skip(3).step_by(4).all(|&a| a == 255));
@@ -261,8 +325,30 @@ mod tests {
         let left = Nv12Planes { y: &ly, uv: &luv };
         let right = Nv12Planes { y: &ry, uv: &ruv };
 
-        let a = stitch_l_shape_rgba(&left, &right, (w, h), &calib, &cfg, 0.0, 0.0, false).unwrap();
-        let b = stitch_l_shape_rgba(&left, &right, (w, h), &calib, &cfg, 0.0, 0.0, false).unwrap();
+        let a = stitch_rgba(
+            &LShapeProjection,
+            &left,
+            &right,
+            (w, h),
+            &calib,
+            &cfg,
+            0.0,
+            0.0,
+            false,
+        )
+        .unwrap();
+        let b = stitch_rgba(
+            &LShapeProjection,
+            &left,
+            &right,
+            (w, h),
+            &calib,
+            &cfg,
+            0.0,
+            0.0,
+            false,
+        )
+        .unwrap();
         assert_eq!(a, b, "stitch must be deterministic");
 
         // Some pixels are covered (non-black) - the planes are in view.
@@ -281,6 +367,7 @@ mod tests {
     /// `lens::kb4`, the only differences are f32-vs-f64 and hardware-vs-software
     /// bilinear - so the RGB match should be tight. Skips when no GPU adapter.
     #[test]
+    #[cfg(feature = "gpu")]
     fn cpu_matches_gpu_within_tolerance() {
         use crate::render::renderer::InputFormat;
 
@@ -306,6 +393,7 @@ mod tests {
         // render the same frame three times to drain one result.
         let pipeline = crate::render::pipeline::StitchPipeline::with_gpu(
             gpu,
+            &crate::projection::LShapeProjection.gpu_program(),
             calib.clone(),
             config.clone(),
             cam_w,
@@ -333,7 +421,8 @@ mod tests {
         let gpu_rgba = gpu_rgba.expect("gpu should produce a frame after 3 renders");
 
         // CPU reference on the same inputs (limited range, matching the GPU default).
-        let cpu_rgba = stitch_l_shape_rgba(
+        let cpu_rgba = stitch_rgba(
+            &LShapeProjection,
             &left,
             &right,
             (cam_w, cam_h),
@@ -367,6 +456,7 @@ mod tests {
     /// YUV420p planar input must agree with the GPU's YUV420p path too,
     /// validating the separate-plane chroma sampler against the shader.
     #[test]
+    #[cfg(feature = "gpu")]
     fn cpu_yuv420p_matches_gpu_within_tolerance() {
         use crate::render::planes::YuvPlanes;
         use crate::render::renderer::InputFormat;
@@ -399,6 +489,7 @@ mod tests {
 
         let pipeline = crate::render::pipeline::StitchPipeline::with_gpu(
             gpu,
+            &crate::projection::LShapeProjection.gpu_program(),
             calib.clone(),
             config.clone(),
             cam_w,
@@ -425,7 +516,8 @@ mod tests {
         }
         let gpu_rgba = gpu_rgba.expect("gpu should produce a frame after 3 renders");
 
-        let cpu_rgba = stitch_l_shape_rgba_yuv420p(
+        let cpu_rgba = stitch_rgba_yuv420p(
+            &LShapeProjection,
             &left,
             &right,
             (cam_w, cam_h),
@@ -488,6 +580,7 @@ mod tests {
     /// cpu_rgba)`, or `None` if there is no GPU adapter. The shared agreement
     /// primitive: callers diff the buffers however they need (aggregate stats,
     /// coverage/black-region masks).
+    #[cfg(feature = "gpu")]
     fn gpu_cpu_rgba(
         calib: &Calibration,
         config: &ViewportConfig,
@@ -503,6 +596,7 @@ mod tests {
         let (cam_w, cam_h) = cam;
         let mut pipeline = crate::render::pipeline::StitchPipeline::with_gpu(
             gpu,
+            &crate::projection::LShapeProjection.gpu_program(),
             calib.clone(),
             config.clone(),
             cam_w,
@@ -532,8 +626,18 @@ mod tests {
             }
         }
         let gpu_rgba = gpu_rgba.expect("gpu frame");
-        let cpu_rgba =
-            stitch_l_shape_rgba(left, right, cam, calib, config, yaw, pitch, full_range).unwrap();
+        let cpu_rgba = stitch_rgba(
+            &LShapeProjection,
+            left,
+            right,
+            cam,
+            calib,
+            config,
+            yaw,
+            pitch,
+            full_range,
+        )
+        .unwrap();
         Some((gpu_rgba, cpu_rgba))
     }
 
@@ -543,6 +647,7 @@ mod tests {
     /// GPU (a geometry divergence blows mean and the >16 fraction far past these
     /// bounds - the original bugs gave 35-68% wrong pixels here).
     #[test]
+    #[cfg(feature = "gpu")]
     fn cpu_matches_gpu_across_regimes() {
         let (cam_w, cam_h) = (256u32, 144u32);
         let cfg = |w: u32, h: u32, fov: f32| ViewportConfig {
@@ -664,6 +769,7 @@ mod tests {
     /// the GPU discards - a large coverage divergence (mean in the hundreds,
     /// most channels off by >16). Regression guard for the near-plane clip.
     #[test]
+    #[cfg(feature = "gpu")]
     fn cpu_matches_gpu_near_plane_clip() {
         let (cam_w, cam_h) = (256u32, 144u32);
         let (ly, luv) = textured_nv12(cam_w, cam_h, 0.0);
@@ -714,6 +820,7 @@ mod tests {
     /// because sharp edges produce isolated f32/f64 + texture-filter-precision
     /// spikes; a real convention bug would blow the mean into the tens.
     #[test]
+    #[cfg(feature = "gpu")]
     fn cpu_matches_gpu_high_frequency() {
         let (cam_w, cam_h) = (256u32, 144u32);
         let cal = calib(cam_w, cam_h);
@@ -747,6 +854,7 @@ mod tests {
     /// deliberate future opt-in for *both* backends, not an accidental CPU-only
     /// divergence.)
     #[test]
+    #[cfg(feature = "gpu")]
     fn cpu_black_region_matches_gpu() {
         let (cam_w, cam_h) = (256u32, 144u32);
         let cal = calib(cam_w, cam_h);
@@ -799,6 +907,7 @@ mod tests {
     /// near-plane clip divergence was). Uses the offset-sensitive ramp scene; a
     /// flat scene would hide the misregistration.
     #[test]
+    #[cfg(feature = "gpu")]
     fn agreement_oracle_detects_subpixel_offset() {
         let (cam_w, cam_h) = (256u32, 144u32);
         let cal = calib(cam_w, cam_h);
@@ -830,7 +939,8 @@ mod tests {
         good.assert_within(AgreementBounds::DEFAULT, "probe-correct");
 
         // ~1px of output (fov 75 over 192px ~= 0.007 rad/px); 0.01 rad is decisive.
-        let perturbed = stitch_l_shape_rgba(
+        let perturbed = stitch_rgba(
+            &LShapeProjection,
             &left,
             &right,
             (cam_w, cam_h),

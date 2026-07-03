@@ -11,8 +11,8 @@
 use nalgebra::{Matrix3, Matrix4, Perspective3, Vector3};
 
 use crate::calibration::{Calibration, Lens};
+use crate::geometry::{FAR_PLANE, NEAR_PLANE, opengl_to_wgpu_matrix, view_matrix};
 use crate::lens::kb4;
-use crate::render::renderer::{FAR_PLANE, NEAR_PLANE, opengl_to_wgpu_matrix, view_matrix};
 use crate::render::scene::SceneGeometry;
 use crate::render::viewport::ViewportConfig;
 
@@ -25,7 +25,7 @@ use super::{SurfaceMap, SurfaceUv};
 /// is a closed-form per-pixel evaluation with no allocation.
 ///
 /// [`sample_uv`]: SurfaceMap::sample_uv
-pub struct PlaneMap {
+pub(crate) struct PlaneMap {
     /// Inverse of the MVP's drop-z 3x3: maps `[ndc_x, ndc_y, 1]` (up to scale)
     /// to plane-local `[x, y, 1]`. `None` if the MVP is singular (e.g. an
     /// edge-on plane), in which case the plane covers nothing - like the GPU's
@@ -174,7 +174,7 @@ impl SurfaceMap for PlaneMap {
 /// Reuses the same scene geometry, view matrix, and perspective projection as
 /// the GPU stitch pass, so the CPU and GPU sample the identical source UV for
 /// every output pixel (up to f32/f64 precision).
-pub fn l_shape_plane_maps(
+pub(crate) fn l_shape_plane_maps(
     calib: &Calibration,
     config: &ViewportConfig,
     yaw: f32,

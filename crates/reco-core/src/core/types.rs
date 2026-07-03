@@ -7,32 +7,44 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::calibration::Calibration;
-use crate::detect::director::ViewportPosition;
+use crate::geometry::ViewportPosition;
+#[cfg(feature = "gpu")]
 use crate::gpu::rgba_readback::RgbaReadbackError;
+#[cfg(feature = "gpu")]
 use crate::gpu::yuv_stack_packer::{PackerError, StackedAtlas};
-use crate::projection::Projection;
+#[cfg(feature = "gpu")]
 use crate::render::pipeline::PipelineError;
 use crate::render::planes::YuvPlanes;
-use crate::render::renderer::InputFormat;
-use crate::render::viewport::ViewportConfig;
-use crate::source::CameraInput;
+use crate::stitch::StitchError;
 
 /// Errors from [`super::StitchCore`]. `Clone + Send + Sync` so consumers
 /// posting render results to worker-thread channels carry the typed
 /// error instead of stringifying at the boundary.
 #[derive(Debug, Clone, Error)]
 pub enum StitchCoreError {
+    /// Executor construction or stitch error. The `From` impl lets
+    /// consumers `?` a [`GpuExecutor`](crate::stitch::GpuExecutor)
+    /// build straight into the engine's error type.
+    #[error("executor: {0}")]
+    Executor(#[from] StitchError),
     /// GPU pipeline error (upload, render, or state mismatch).
+    #[cfg(feature = "gpu")]
     #[error("pipeline: {0}")]
     Pipeline(#[from] PipelineError),
     /// Readback staging / mapping error.
+    #[cfg(feature = "gpu")]
     #[error("readback: {0}")]
     Readback(#[from] RgbaReadbackError),
     /// Caller-facing configuration error (e.g. unsupported combination).
     #[error("config: {0}")]
     Config(String),
+    /// The operation needs the GPU executor (streaming render,
+    /// zero-copy import, GPU readback) but the engine is running the
+    /// CPU executor. Route through the byte submit paths instead.
+    #[error("operation requires the GPU executor; this engine runs the CPU executor")]
+    RequiresGpu,
     /// GPU stacked-replay packer error (shader pipeline build, dim check).
+    #[cfg(feature = "gpu")]
     #[error("stacked packer: {0}")]
     StackedPacker(#[from] PackerError),
 }
@@ -40,11 +52,13 @@ pub enum StitchCoreError {
 /// Returned from every [`super::StitchCore::submit_frame_yuv`] /
 /// [`super::StitchCore::submit_frame_bgra`] call.
 ///
-/// The pipeline triple-buffers readback, so the first two calls produce
-/// [`RenderOutcome::Warmup`] while the GPU fills the staging ring; from
-/// the third call onward every submit produces
+/// On the GPU executor, readback is triple-buffered: the first two
+/// calls produce [`RenderOutcome::Warmup`] while the staging ring
+/// fills; from the third call onward every submit produces
 /// [`RenderOutcome::Rgba`] holding the tight RGBA bytes of the frame
-/// submitted two frames ago.
+/// submitted two frames ago. On the CPU executor the stitch is
+/// synchronous: every submit returns [`RenderOutcome::Rgba`] for the
+/// frame just submitted - `Warmup` never occurs.
 pub enum RenderOutcome<'a> {
     /// Pipeline warm-up - submit more frames before expecting output.
     /// Only returned on the first two submit calls after construction.
@@ -69,65 +83,6 @@ pub struct ReplayFrame {
     /// Viewport pose the frame was rendered with. Useful for replay
     /// overlays that want to annotate where the camera pointed.
     pub pose: ViewportPosition,
-}
-
-/// Configuration for building a [`super::StitchCore`].
-///
-/// Required fields: `calibration`, `input_width`, `input_height`,
-/// `input_format`. Everything else has sensible defaults.
-pub struct StitchCoreConfig {
-    /// Camera calibration data.
-    pub calibration: Calibration,
-    /// Output viewport (dimensions, blend width, FOV).
-    pub viewport: ViewportConfig,
-    /// Input frame width in pixels (per camera).
-    pub input_width: u32,
-    /// Input frame height in pixels (per camera).
-    pub input_height: u32,
-    /// GPU render target format. `Rgba8Unorm` is the default and is
-    /// what every compositor consumer needs; `Bgra8Unorm` matches
-    /// native Windows DirectX surfaces for consumers that prefer to
-    /// swizzle on upload instead of on readback.
-    pub output_format: wgpu::TextureFormat,
-    /// Input pixel format.
-    pub input_format: InputFormat,
-    /// Optional custom projection. Defaults to
-    /// [`LShapeProjection`](crate::projection::LShapeProjection) - the
-    /// 2-plane L-shape that matches today's geometric model.
-    pub projection: Option<Box<dyn Projection>>,
-    /// Optional camera-input marker. Defaults to
-    /// [`StereoCameraInput`](crate::source::StereoCameraInput); future
-    /// mono / N-input builds pick a different impl here.
-    pub camera_input: Option<Box<dyn CameraInput>>,
-    /// Opt-in replay ring buffer duration. `None` (default) keeps no
-    /// history and allocates nothing for replay.
-    pub replay_buffer_duration: Option<Duration>,
-}
-
-impl StitchCoreConfig {
-    /// New config with required fields only; defaults everywhere else.
-    pub fn new(
-        calibration: Calibration,
-        input_width: u32,
-        input_height: u32,
-        input_format: InputFormat,
-    ) -> Self {
-        Self {
-            calibration,
-            viewport: ViewportConfig {
-                width: 1920,
-                height: 1080,
-                ..Default::default()
-            },
-            input_width,
-            input_height,
-            output_format: wgpu::TextureFormat::Rgba8Unorm,
-            input_format,
-            projection: None,
-            camera_input: None,
-            replay_buffer_duration: None,
-        }
-    }
 }
 
 /// Recorder hook for the push-API replay backend (FRICTION A18 /
@@ -196,6 +151,7 @@ pub trait StackedReplayRecorder: Send {
 /// # Thread safety
 ///
 /// Owned by `StitchCore` on the render thread; `Send` is enough.
+#[cfg(feature = "gpu")]
 pub trait StackedReplayGpuRecorder: Send {
     /// Receive a packed YUV420P atlas. The bytes live in
     /// `atlas.y / u / v`; dimensions are `atlas.width x atlas.height`

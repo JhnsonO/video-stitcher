@@ -26,7 +26,7 @@ use super::renderer::{InputFormat, RenderError, Renderer};
 use super::scene::SceneGeometry;
 use super::viewport::{ResolvedViewport, ViewportConfig};
 use crate::calibration::Calibration;
-use crate::detect::director::ViewportPosition;
+use crate::geometry::ViewportPosition;
 use crate::gpu::{GpuContext, GpuError};
 
 use thiserror::Error;
@@ -102,6 +102,7 @@ impl StitchPipeline {
     /// and provides its own GPU context (selected with surface compatibility).
     pub fn with_gpu(
         gpu: GpuContext,
+        program: &crate::render::GpuProgram,
         calibration: Calibration,
         viewport: ViewportConfig,
         input_width: u32,
@@ -111,7 +112,7 @@ impl StitchPipeline {
     ) -> Result<Self, PipelineError> {
         // Validate inputs before GPU resource creation. This is THE
         // enforcement boundary for in-memory calibrations: every
-        // constructor (StitchRenderer, StitchCore, StitchSession,
+        // constructor (StitchCore, StitchSession, the preview bridge,
         // StitchJob) funnels through here, so a wrong lens count or a
         // NaN surfaces as a typed error instead of an index panic or a
         // GPU hang further down.
@@ -138,6 +139,7 @@ impl StitchPipeline {
         let scene = SceneGeometry::new(&calibration.topology, &calibration.framing, aspect);
         let renderer = Renderer::new(
             &gpu,
+            program,
             viewport.width,
             viewport.height,
             input_width,

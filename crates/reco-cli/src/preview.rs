@@ -10,11 +10,11 @@
 //! - Q / Escape: quit
 //!
 //! This module is intentionally CLI-only. The rendering is already handled by
-//! `StitchRenderer` in reco-core. What remains here is the winit event loop,
+//! `StitchCore` in reco-core. What remains here is the winit event loop,
 //! surface management, input handling, and frame pacing - all tightly coupled
 //! to the desktop window environment and not useful to library consumers
 //! (GUI, OBS, cloud). A future GUI app would use its own event loop and call
-//! the same `StitchRenderer` API directly.
+//! the same `StitchCore` API directly.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,9 +23,10 @@ use std::time::Instant;
 
 use reco_control::pose_control::HotkeyIntent;
 use reco_control::{ControlIntent, PoseIntent};
+use reco_core::core::StitchCore;
 use reco_core::encoder::{Encoder, OutputFrame, PixelFormat};
-use reco_core::render::stitch_renderer::StitchRenderer;
 use reco_core::source::{FrameSource, YuvData};
+use reco_core::stitch::{Executor, GpuExecutor, GpuExecutorConfig};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -139,7 +140,7 @@ pub fn run_preview(
     let frame_duration = std::time::Duration::from_secs_f64(1.0 / info.fps);
 
     // Precompute max FOV from coverage boundary using calibration metadata.
-    // The actual CoverageBoundary is computed inside StitchRenderer::new().
+    // The actual CoverageBoundary is computed inside StitchCore::new().
     let max_fov = {
         let aspect = info.width as f32 / info.height as f32;
         let scene =
@@ -171,7 +172,7 @@ pub fn run_preview(
 
         pose: {
             use reco_control::pose_control::{PoseControl, PoseControlConfig};
-            use reco_core::detect::director::ViewportPosition;
+            use reco_core::geometry::ViewportPosition;
             // Match preview's historical feel: 0.005 rad/px drag,
             // 0.05 rad arrow step, 3.0 deg scroll step, 0.3 smoothing.
             // `invert_drag_x = true` reproduces preview's "drag right
@@ -227,7 +228,7 @@ struct App {
     window: Option<Arc<Window>>,
     surface_format: reco_core::wgpu::TextureFormat,
     alpha_mode: reco_core::wgpu::CompositeAlphaMode,
-    renderer: Option<StitchRenderer>,
+    renderer: Option<StitchCore>,
     cal: reco_core::calibration::Calibration,
     input_width: u32,
     input_height: u32,
@@ -238,7 +239,7 @@ struct App {
     /// Unified pose state (target + current yaw/pitch/FOV with smoothing),
     /// stored in world space. Drives every pan / zoom input; the rig
     /// tilt/roll correction that keeps the horizon level under pan is
-    /// applied at the render site via `StitchRenderer::orient_pose`.
+    /// applied at the render site via `StitchCore::orient_pose`.
     pose: reco_control::pose_control::PoseControl,
     frame_count: u64,
     playing: bool,
@@ -351,7 +352,7 @@ impl App {
     fn apply_calibration_change(&mut self) {
         if let Some(ref mut r) = self.renderer {
             r.update_calibration(self.cal.clone());
-            self.max_fov = r.coverage().max_fov_degrees().min(FOV_MAX);
+            self.max_fov = r.max_fov_degrees().unwrap_or(FOV_MAX).min(FOV_MAX);
             if self.clamp_enabled {
                 // Narrow PoseControl's FOV ceiling so the target FOV
                 // can't exceed what coverage allows.
@@ -426,16 +427,14 @@ impl App {
 
         if self.clamp_enabled
             && let Some(ref renderer) = self.renderer
+            && let Some(coverage) = renderer.coverage()
         {
-            let coverage = renderer.coverage();
             let aspect = self.width as f32 / self.height as f32;
             self.pose.clamp_via_coverage(coverage, aspect);
         }
 
-        if let Some(r) = &mut self.renderer {
-            let target_fov = self.pose.current_fov_deg();
-            r.pipeline_mut().set_fov(target_fov.clamp(1.0, FOV_MAX));
-        }
+        // FOV rides the pose into every render call (render_to_view /
+        // render_and_readback_nv12), so no cached push is needed here.
 
         let after = self.pose.current_pose();
         let dy = (after.yaw - before.yaw).abs();
@@ -470,7 +469,7 @@ impl ApplicationHandler for App {
         log::info!("Surface format: {:?}", surface_format);
 
         // Configure surface with stripped sRGB view format to avoid double-gamma.
-        let render_format = StitchRenderer::strip_srgb(surface_format);
+        let render_format = reco_core::render::strip_srgb(surface_format);
         let view_formats = if render_format != surface_format {
             vec![render_format]
         } else {
@@ -502,16 +501,21 @@ impl ApplicationHandler for App {
             ..Default::default()
         };
 
-        let renderer = StitchRenderer::new(
-            self.cal.clone(),
+        let executor = GpuExecutor::new(
             gpu,
-            viewport,
-            self.input_width,
-            self.input_height,
-            surface_format,
-            reco_core::render::renderer::InputFormat::Yuv420p,
+            GpuExecutorConfig {
+                calibration: self.cal.clone(),
+                viewport,
+                input_width: self.input_width,
+                input_height: self.input_height,
+                input_format: reco_core::render::renderer::InputFormat::Yuv420p,
+                output_format: reco_core::render::strip_srgb(surface_format),
+                projection: None,
+                full_range: false,
+            },
         )
-        .expect("create renderer");
+        .expect("create executor");
+        let renderer = StitchCore::new(Executor::Gpu(Box::new(executor))).expect("create engine");
 
         println!(
             "Preview ready: GPU = {}, format = {:?}",
@@ -551,7 +555,7 @@ impl ApplicationHandler for App {
                 self.width = size.width;
                 self.height = size.height;
                 if let (Some(surface), Some(renderer)) = (&self.surface, &mut self.renderer) {
-                    let render_format = StitchRenderer::strip_srgb(self.surface_format);
+                    let render_format = reco_core::render::strip_srgb(self.surface_format);
                     let view_formats = if render_format != self.surface_format {
                         vec![render_format]
                     } else {
@@ -570,7 +574,7 @@ impl ApplicationHandler for App {
                             view_formats,
                         },
                     );
-                    renderer.pipeline_mut().resize(self.width, self.height);
+                    renderer.resize(self.width, self.height);
                     self.needs_redraw = true;
                 }
             }
@@ -833,7 +837,7 @@ impl ApplicationHandler for App {
                         return;
                     }
                 };
-                let render_format = StitchRenderer::strip_srgb(self.surface_format);
+                let render_format = reco_core::render::strip_srgb(self.surface_format);
                 let view = frame
                     .texture
                     .create_view(&reco_core::wgpu::TextureViewDescriptor {
@@ -847,17 +851,14 @@ impl ApplicationHandler for App {
                 // tilt/roll basis inversion (roll-aware; the horizon
                 // stays level under pan).
                 let render = renderer.orient_pose(self.pose.current_pose());
-                let (render_yaw, render_pitch) = (render.yaw, render.pitch);
-                if let Err(e) = renderer.render_yuv(&left, &right, render_yaw, render_pitch, &view)
-                {
+                if let Err(e) = renderer.render_to_view(&left, &right, render, &view) {
                     log::error!("Render failed: {e}");
                     return;
                 }
 
                 // Record: render to internal target + NV12 readback.
                 if self.recording.is_some() {
-                    match renderer.render_and_readback_nv12(&left, &right, render_yaw, render_pitch)
-                    {
+                    match renderer.render_and_readback_nv12(&left, &right, render) {
                         Ok(Some(nv12)) => {
                             let pts_us =
                                 (self.recording_frames as f64 / self.fps * 1_000_000.0) as i64;
