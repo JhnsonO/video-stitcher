@@ -1,21 +1,26 @@
 //! High-level stitching session.
 //!
-//! [`StitchSession`] bundles the GPU pipeline with the NV12 converter,
-//! providing a single entry point for rendering and encoding stitched
-//! panoramic frames. This keeps encode orchestration inside `reco-core`
-//! so that every consumer (CLI, GUI, OBS plugin, cloud worker) gets the
-//! same optimized frame loop without duplicating pipeline plumbing.
+//! [`StitchSession`] is the pull-loop orchestrator over the engine:
+//! it renders stitched panoramic frames and fans them out to the
+//! attached [`OutputSink`](crate::sink::OutputSink)s (encoders,
+//! snapshots, streams). This keeps delivery orchestration inside
+//! `reco-core` so that every consumer (CLI, GUI, OBS plugin, cloud
+//! worker) gets the same optimized frame loop without duplicating
+//! pipeline plumbing.
 //!
 //! ## Two-level API
 //!
-//! - [`StitchSession::process_frame`] - render one frame and submit it
-//!   to an encoder. Use this for interactive/GUI applications or when
-//!   the caller controls the frame loop (e.g. zero-copy GPU decode).
+//! - [`StitchSession::process_frame`] - render one frame and deliver
+//!   it to the sinks. Use this for interactive/GUI applications or
+//!   when the caller controls the frame loop (e.g. zero-copy GPU
+//!   decode).
 //!
 //! - [`StitchSession::run`] - batch-process an entire `FrameSource`
-//!   into an encoder, with optional progress reporting and interrupt
+//!   into the sinks, with optional progress reporting and interrupt
 //!   support. Use this for CLI batch encoding.
 
+/// Sink attachment options and delivery fan-out.
+pub mod sinks;
 /// Session type definitions, error types, and builder.
 pub mod types;
 
@@ -33,37 +38,35 @@ mod wiring;
 #[cfg(test)]
 mod tests;
 
-use crate::async_encode::AsyncEncodeThread;
+pub use sinks::{SinkDelivery, SinkErrorPolicy, SinkOptions};
+
 use crate::core::StitchCore;
 use crate::core::types::StitchCoreError;
 use crate::gpu::{GpuContext, OutputFormat};
 use crate::render::renderer::InputFormat;
 use crate::stitch::{Executor, GpuExecutor, GpuExecutorConfig};
 
-/// Callback type for the NV12 tap: receives `(nv12_data, width, height)`.
-pub type Nv12TapFn = Box<dyn FnMut(&[u8], u32, u32) + Send>;
-
 use types::{ErrorPolicy, SessionConfig, SessionError, SessionMetrics, StitchSessionBuilder};
 
 /// A high-level stitching session: a pull-loop orchestrator over the
-/// engine, adding frame buffering, encode fan-out, and telemetry.
+/// engine, adding frame buffering, sink fan-out, and telemetry.
 ///
 /// Created once per encoding job or application lifetime. Call
-/// [`set_encoder`](Self::set_encoder) to attach an encoder before
+/// [`add_sink`](Self::add_sink) to attach output sinks before
 /// rendering, then use [`submit_render_output`](Self::submit_render_output)
 /// for per-frame control or [`run`](Self::run) for batch processing.
 /// Call [`finish`](Self::finish) to flush the last frame and finalize
-/// encoding.
+/// every sink.
 pub struct StitchSession {
     /// The canonical push-first engine. Owns the render substrate,
     /// readback staging, coverage boundary, and the single AI stack
     /// (detector, trackers, panner, event sink). The session is the
-    /// pull-loop orchestrator over it: frame buffering, encode
+    /// pull-loop orchestrator over it: frame buffering, sink
     /// fan-out, telemetry, progress.
     pub(crate) core: StitchCore,
-    pub(crate) encoder: Option<AsyncEncodeThread>,
-    /// Additional encoders for multi-output (stream + record).
-    pub(crate) extra_encoders: Vec<AsyncEncodeThread>,
+    /// Attached output sinks; every rendered frame fans out to all of
+    /// them in attach order.
+    pub(crate) sinks: Vec<sinks::AttachedSink>,
     /// When true, `process_frame_any` skips detection (the produce phase
     /// already ran it and stored the WorldState in the buffer).
     pub(crate) skip_detection: bool,
@@ -99,10 +102,6 @@ pub struct StitchSession {
     pub(crate) gpu_pixel_format: crate::render::renderer::GpuPixelFormat,
     /// Full-range YUV (0-255) vs limited range (16-235).
     pub(crate) is_full_range: bool,
-    /// Optional callback invoked with NV12 data after each frame.
-    /// Used by reco-cli's snapshot writer for periodic JPEG output.
-    /// The callback receives `(nv12_data, width, height)`.
-    pub(crate) nv12_tap: Option<Nv12TapFn>,
 }
 
 impl StitchSession {
@@ -116,7 +115,7 @@ impl StitchSession {
             output_format: OutputFormat::Rgba8Unorm,
             input_format: InputFormat::Yuv420p,
             gpu: None,
-            encoder: None,
+            sinks: Vec::new(),
             detector: None,
             detection_interval: 1,
         }
@@ -166,11 +165,10 @@ impl StitchSession {
 
         Ok(Self {
             core,
-            encoder: None,
+            sinks: Vec::new(),
             skip_detection: false,
             lookahead_frames: 0,
             frame_count: 0,
-            extra_encoders: Vec::new(),
             session_start: None,
             error_policy: ErrorPolicy::default(),
             frames_dropped: 0,
@@ -184,7 +182,6 @@ impl StitchSession {
             right_rotation: 0,
             gpu_pixel_format: crate::render::renderer::GpuPixelFormat::Nv12,
             is_full_range: false,
-            nv12_tap: None,
         })
     }
 
@@ -282,16 +279,19 @@ impl StitchSession {
 
     /// Snapshot of the session's telemetry collector.
     ///
-    /// Merges the async encode thread's overlapped encode cost and
+    /// Merges the sink threads' overlapped consume cost and
     /// backpressure into the snapshot (the collector only sees the
-    /// per-frame submit cost).
+    /// per-frame submit cost). With several threaded sinks the worker
+    /// cost is the slowest sink's (the pipeline bottleneck) and the
+    /// backpressure stalls are summed - the render loop delivers
+    /// serially, so every sink's stall delays it.
     pub fn telemetry_snapshot(&self) -> crate::telemetry::TelemetrySnapshot {
         let mut snap = self.telemetry.snapshot();
-        if let Some(enc) = &self.encoder {
-            let (_frames, avg_encode_ms, bp_stalls, bp_ms) = enc.stats();
-            snap.avg_encode_worker_ms = avg_encode_ms;
-            snap.backpressure_stalls = bp_stalls;
-            snap.backpressure_ms = bp_ms;
+        for stats in self.sinks.iter().filter_map(|s| s.thread_stats()) {
+            let (_frames, avg_consume_ms, bp_stalls, bp_ms) = stats;
+            snap.avg_encode_worker_ms = snap.avg_encode_worker_ms.max(avg_consume_ms);
+            snap.backpressure_stalls += bp_stalls;
+            snap.backpressure_ms += bp_ms;
         }
         snap
     }
@@ -301,15 +301,22 @@ impl StitchSession {
         &mut self.telemetry
     }
 
-    /// Flush the NV12 triple-buffer and finalize the encoder.
+    /// Flush the NV12 triple-buffer and finalize every sink.
     ///
     /// Drains all pending frames from the triple-buffer pipeline and
-    /// submits them to the encoder, then shuts down the encode thread
-    /// and calls `Encoder::finish`. Must be called after the frame loop ends.
+    /// fans them out to the attached sinks, then calls
+    /// [`OutputSink::finish`](crate::sink::OutputSink::finish) on each
+    /// in attach order. Must be called after the frame loop ends.
     pub fn finish(&mut self) -> Result<(), SessionError> {
         // Flush remaining frames from the NV12 triple-buffer. Field-path
         // borrow: `nv12_data` borrows the executor inside `core` while
-        // the loop body feeds the session-owned encoders.
+        // the fan-out feeds the session-owned sinks.
+        //
+        // An Abort error here skips `finish_all`, but no output is left
+        // without its trailer: dropping a SinkThread disconnects its
+        // channel and the worker runs the sink's own `finish` on exit,
+        // and inline sinks finalize in their Drop impls.
+        let (nv12_width, nv12_height) = self.gpu_exec_ref().nv12_dims();
         while let Some(nv12_data) = self
             .core
             .executor
@@ -317,22 +324,17 @@ impl StitchSession {
             .expect("the streaming session runs on the GPU executor")
             .flush_nv12()?
         {
-            if let Some(ref encoder) = self.encoder {
-                encoder.submit(nv12_data, self.frame_count as i64)?;
-            }
-            for enc in &self.extra_encoders {
-                enc.submit(nv12_data, self.frame_count as i64)?;
-            }
+            sinks::deliver_frame(
+                &mut self.sinks,
+                nv12_data,
+                nv12_width,
+                nv12_height,
+                self.frame_count as i64,
+            )?;
             self.frame_count += 1;
         }
 
-        // Shut down all encode threads.
-        if let Some(mut encoder) = self.encoder.take() {
-            encoder.finish()?;
-        }
-        for mut enc in self.extra_encoders.drain(..) {
-            enc.finish()?;
-        }
+        sinks::finish_all(&mut self.sinks)?;
 
         Ok(())
     }

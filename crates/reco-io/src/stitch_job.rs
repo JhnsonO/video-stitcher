@@ -202,9 +202,9 @@ pub enum StitchError {
     /// Session/pipeline error during stitching.
     #[error("session: {0}")]
     Session(#[from] reco_core::session::types::SessionError),
-    /// Encoder error.
+    /// Encoder sink error.
     #[error("encoder: {0}")]
-    Encoder(#[from] reco_core::encoder::EncodeError),
+    Encoder(#[from] reco_core::sink::SinkError),
     /// Encoder completed without error but the output file has no
     /// usable video stream. Typical cause: an encoder ffmpeg listed as
     /// available silently rejected every frame (e.g. AV1/NVENC on
@@ -706,7 +706,10 @@ impl StitchJob {
         )?;
         let enc_name = encoder.encoder_name().to_string();
         session.telemetry_mut().set_encoder_name(enc_name.clone());
-        session.set_encoder(Box::new(encoder), 2);
+        session.add_sink(
+            Box::new(encoder),
+            reco_core::session::SinkOptions::threaded(2),
+        )?;
 
         #[cfg(feature = "stacked-output")]
         if let Some(ref mut cfg) = self.replay_recording
