@@ -27,35 +27,16 @@ pub(crate) mod frame_buffer;
 mod frame_processing;
 /// Batch processing entry points (run, run_immediate, setup_gpu_source).
 mod run_loop;
-/// VRAM texture pool for GPU-resident frame buffering.
-pub(crate) mod vram_pool;
-/// Lookahead VRAM fit estimate, for the export UI risk slider and the
-/// pre-flight budget check.
-pub use vram_pool::{LookaheadFit, lookahead_budget_bytes, lookahead_fit};
 /// Configuration wiring (set/clear/attach methods).
 mod wiring;
 
 #[cfg(test)]
 mod tests;
-#[cfg(target_os = "linux")]
-mod zero_copy_linux;
-
-#[cfg(target_os = "linux")]
-pub use zero_copy_linux::SharedTextureSet;
-
-// `LiveStitchSession` + `LiveSessionConfig` + `LiveSessionError` were
-// deleted 2026-04-19 (plan-execution §3 M3 step 3). Consumers that
-// previously held a `LiveStitchSession` migrate to `StitchCore` (via
-// `reco_core::core::StitchCore`) and call `submit_frame_*_at_pose`
-// for explicit-pose inputs. reco-obs completed the migration in the
-// same commit.
 
 use crate::async_encode::AsyncEncodeThread;
 use crate::core::StitchCore;
 use crate::core::types::StitchCoreError;
-use crate::gpu::nv12_converter::Nv12Converter;
 use crate::gpu::{GpuContext, OutputFormat};
-use crate::render::pipeline::StitchPipeline;
 use crate::render::renderer::InputFormat;
 use crate::stitch::{Executor, GpuExecutor, GpuExecutorConfig};
 
@@ -64,8 +45,8 @@ pub type Nv12TapFn = Box<dyn FnMut(&[u8], u32, u32) + Send>;
 
 use types::{ErrorPolicy, SessionConfig, SessionError, SessionMetrics, StitchSessionBuilder};
 
-/// A high-level stitching session that owns the GPU pipeline, NV12
-/// converter, and optionally an async encoder.
+/// A high-level stitching session: a pull-loop orchestrator over the
+/// engine, adding frame buffering, encode fan-out, and telemetry.
 ///
 /// Created once per encoding job or application lifetime. Call
 /// [`set_encoder`](Self::set_encoder) to attach an encoder before
@@ -80,7 +61,6 @@ pub struct StitchSession {
     /// pull-loop orchestrator over it: frame buffering, encode
     /// fan-out, telemetry, progress.
     pub(crate) core: StitchCore,
-    pub(crate) nv12_converter: Nv12Converter,
     pub(crate) encoder: Option<AsyncEncodeThread>,
     /// Additional encoders for multi-output (stream + record).
     pub(crate) extra_encoders: Vec<AsyncEncodeThread>,
@@ -102,65 +82,10 @@ pub struct StitchSession {
     /// render / readback / encode for accurate telemetry.
     pub(crate) last_readback_time: std::time::Duration,
     pub(crate) last_submit_time: std::time::Duration,
-    // ── GPU-resident source state (populated by configure_from_source) ──
-    /// Bind groups for GPU-resident shared textures.
-    /// Created lazily from the source's textures at the start of run().
-    #[cfg(target_os = "linux")]
-    pub(crate) gpu_bind_groups: Option<crate::render::pipeline::GpuSourceBindGroups>,
-    /// Slot-free senders for decode backpressure (GPU zero-copy).
-    #[cfg(target_os = "linux")]
-    pub(crate) gpu_slot_free_tx: Option<(
-        std::sync::mpsc::SyncSender<u8>,
-        std::sync::mpsc::SyncSender<u8>,
-    )>,
-    /// CUDA buffer info for GPU detection (GPU zero-copy).
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    pub(crate) gpu_buf_info: Option<(
-        crate::interop::zero_copy::GpuBufInfo,
-        crate::interop::zero_copy::GpuBufInfo,
-    )>,
-    /// Texture views for the 8 shared zero-copy textures, layout
-    /// `[left_y_0, left_uv_0, left_y_1, left_uv_1, right_y_0,
-    /// right_uv_0, right_y_1, right_uv_1]`. Stashed at
-    /// `setup_gpu_source` time so `step_gpu_with_bufs` can hand
-    /// slot-indexed views to the GPU stacked-replay pack without
-    /// rebuilding views every frame. TextureView holds an Arc on
-    /// the underlying texture so the shared-memory lifetime is
-    /// still bound to the SharedTextureSet the source owns.
-    #[cfg(target_os = "linux")]
-    pub(crate) gpu_shared_views: Option<[wgpu::TextureView; 8]>,
-    /// The 8 shared textures (2 slots x 2 cameras x Y/UV), cloned for
-    /// `copy_texture_to_texture` in the VRAM pool path. Cheap (Arc inside).
-    #[cfg(target_os = "linux")]
-    pub(crate) gpu_shared_textures: Option<[wgpu::Texture; 8]>,
-
-    /// VRAM buffer pool for GPU-resident lookahead.
-    pub(crate) vram_pool: Option<vram_pool::VramPool>,
-    /// VRAM pool slot for the frame currently being rendered.
+    /// VRAM pool slot for the frame currently being rendered
+    /// (buffered lookahead path; the pool itself lives on the
+    /// GPU executor).
     pub(crate) current_vram_slot: Option<usize>,
-
-    /// Metal texture cache for importing CVPixelBuffers as wgpu textures.
-    /// Created lazily on the first MetalResident frame.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    pub(crate) metal_texture_cache: Option<crate::interop::metal::MetalTextureCache>,
-
-    /// D3D11VA staging pool for zero-copy decode on Windows.
-    /// Created lazily when the first D3d11Resident frame arrives.
-    #[cfg(target_os = "windows")]
-    pub(crate) d3d11_staging_pool: Option<crate::interop::d3d11::D3d11StagingPool>,
-
-    /// DMA-buf -> Vulkan texture cache for the NVMM zero-copy render path
-    /// (Jetson). Keyed by DMA-buf fd; the ISP rotates a small fd pool so
-    /// each is imported once. Created lazily on the first NvmmResident frame.
-    #[cfg(target_os = "linux")]
-    pub(crate) nvmm_dmabuf_cache: Option<crate::interop::dmabuf::DmaBufTextureCache>,
-    /// Left-camera NvBufSurfTransform detection surface (Jetson NVMM path).
-    /// Allocated by [`setup_nvmm_detection`](Self::setup_nvmm_detection).
-    #[cfg(target_os = "linux")]
-    pub(crate) nvmm_det_left: Option<crate::nvbuf_transform::NvBufDetectionSurface>,
-    /// Right-camera NvBufSurfTransform detection surface (Jetson NVMM path).
-    #[cfg(target_os = "linux")]
-    pub(crate) nvmm_det_right: Option<crate::nvbuf_transform::NvBufDetectionSurface>,
 
     /// Camera rotation from stream metadata, populated by
     /// [`configure_from_source`](Self::configure_from_source).
@@ -208,15 +133,11 @@ impl StitchSession {
     /// Use this when the caller needs to control GPU selection (e.g.
     /// for zero-copy decode where the GPU must match the CUDA device).
     pub fn with_gpu(gpu: GpuContext, config: SessionConfig) -> Result<Self, SessionError> {
-        let output_width = config.viewport.width;
-        let output_height = config.viewport.height;
-
         // Build a `StitchCore` as the session's rendering foundation.
-        // The executor owns the pipeline + projection; the core layers
-        // readback + coverage on top. The session layers on NV12
-        // conversion, async encoding, lookahead, and the legacy
-        // per-platform detection pipeline (until the unified-detector
-        // migration of the session body completes).
+        // The executor owns the pipeline + projection + NV12 delivery;
+        // the core layers readback + coverage on top. The session
+        // layers on async encoding, lookahead, and the per-platform
+        // frame dispatch.
         //
         // Rotation is NOT applied here. It's handled by:
         // - CPU path: decoder reverses buffers in extract_yuv()
@@ -243,11 +164,8 @@ impl StitchSession {
         .map_err(StitchCoreError::from)?;
         let core = StitchCore::new(Executor::Gpu(Box::new(executor)))?;
 
-        let nv12_converter = Nv12Converter::new(core.gpu(), output_width, output_height)?;
-
         Ok(Self {
             core,
-            nv12_converter,
             encoder: None,
             skip_detection: false,
             lookahead_frames: 0,
@@ -259,28 +177,7 @@ impl StitchSession {
             telemetry: crate::telemetry::TelemetryCollector::new(),
             last_readback_time: std::time::Duration::ZERO,
             last_submit_time: std::time::Duration::ZERO,
-            #[cfg(target_os = "linux")]
-            gpu_bind_groups: None,
-            #[cfg(target_os = "linux")]
-            gpu_slot_free_tx: None,
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            gpu_buf_info: None,
-            #[cfg(target_os = "linux")]
-            gpu_shared_views: None,
-            #[cfg(target_os = "linux")]
-            gpu_shared_textures: None,
-            vram_pool: None,
             current_vram_slot: None,
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            metal_texture_cache: None,
-            #[cfg(target_os = "windows")]
-            d3d11_staging_pool: None,
-            #[cfg(target_os = "linux")]
-            nvmm_dmabuf_cache: None,
-            #[cfg(target_os = "linux")]
-            nvmm_det_left: None,
-            #[cfg(target_os = "linux")]
-            nvmm_det_right: None,
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             left_rotation: 0,
             #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -327,19 +224,6 @@ impl StitchSession {
         self.frame_count
     }
 
-    /// Shared reference to the underlying pipeline (via `StitchCore`).
-    pub fn pipeline(&self) -> &StitchPipeline {
-        self.core.pipeline()
-    }
-
-    /// Mutable reference to the underlying pipeline (via `StitchCore`).
-    ///
-    /// Needed for zero-copy setup (configure_gpu_source) and viewport
-    /// changes (resize, set_fov).
-    pub fn pipeline_mut(&mut self) -> &mut StitchPipeline {
-        self.core.pipeline_mut()
-    }
-
     /// Borrow the underlying [`StitchCore`]. Useful for consumers that
     /// want to reach through to the push-first API
     /// (`submit_frame_*`, replay buffer, etc.) without giving up the
@@ -353,14 +237,34 @@ impl StitchSession {
         &mut self.core
     }
 
-    /// Shared reference to the GPU context.
+    /// The engine's GPU executor - the resident-frame surface the
+    /// streaming session drives. The batch loop is a GPU-streaming
+    /// orchestrator, so its engine always runs the GPU arm.
+    pub(crate) fn gpu_exec(&mut self) -> &mut GpuExecutor {
+        self.core
+            .executor
+            .gpu_mut()
+            .expect("the streaming session runs on the GPU executor")
+    }
+
+    /// Shared-reference sibling of [`Self::gpu_exec`].
+    pub(crate) fn gpu_exec_ref(&self) -> &GpuExecutor {
+        self.core
+            .executor
+            .gpu()
+            .expect("the streaming session runs on the GPU executor")
+    }
+
+    /// Shared reference to the GPU context, for consumers that create
+    /// auxiliary resources on the session's device (demosaic kernels,
+    /// preview textures).
     pub fn gpu(&self) -> &GpuContext {
-        self.core.gpu()
+        self.gpu_exec_ref().pipeline.gpu()
     }
 
     /// The name of the GPU this session is running on.
     pub fn gpu_name(&self) -> &str {
-        self.core.pipeline().gpu_name()
+        self.gpu().gpu_name()
     }
 
     /// Get current session performance metrics.
@@ -403,8 +307,16 @@ impl StitchSession {
     /// submits them to the encoder, then shuts down the encode thread
     /// and calls `Encoder::finish`. Must be called after the frame loop ends.
     pub fn finish(&mut self) -> Result<(), SessionError> {
-        // Flush remaining frames from the NV12 triple-buffer.
-        while let Some(nv12_data) = self.nv12_converter.flush_pending(self.core.gpu())? {
+        // Flush remaining frames from the NV12 triple-buffer. Field-path
+        // borrow: `nv12_data` borrows the executor inside `core` while
+        // the loop body feeds the session-owned encoders.
+        while let Some(nv12_data) = self
+            .core
+            .executor
+            .gpu_mut()
+            .expect("the streaming session runs on the GPU executor")
+            .flush_nv12()?
+        {
             if let Some(ref encoder) = self.encoder {
                 encoder.submit(nv12_data, self.frame_count as i64)?;
             }
@@ -446,6 +358,6 @@ impl crate::detect::DetectionTarget for StitchSession {
         self.core.source_info()
     }
     fn gpu(&self) -> Option<&crate::gpu::GpuContext> {
-        Some(self.core.gpu())
+        Some(self.gpu())
     }
 }

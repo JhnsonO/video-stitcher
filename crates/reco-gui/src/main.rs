@@ -103,10 +103,10 @@ struct CalibrationOutput {
 }
 
 /// Result sent from the calibration background thread. The error is
-/// the typed [`reco_calibrate::video::CalibrateVideosError`] now that
-/// it is `Clone + Send + Sync` (plan step 7), so the UI thread can
-/// pattern-match specific failure modes (`Cancelled`, `NoFrames`,
-/// `Io(...)`, etc.) instead of parsing a stringified message.
+/// the typed [`reco_calibrate::video::CalibrateVideosError`] (which
+/// is `Clone + Send + Sync`), so the UI thread can pattern-match
+/// specific failure modes (`Cancelled`, `NoFrames`, `Io(...)`, etc.)
+/// instead of parsing a stringified message.
 type CalibrationResult = Result<CalibrationOutput, reco_calibrate::video::CalibrateVideosError>;
 
 /// Headless dev/test preload hook. When `RECO_AUTOLOAD` is set the GUI loads
@@ -1235,8 +1235,6 @@ fn sync_roi_points(state: &AppState, app: &RecoApp) {
 /// from reco-core / reco-io / reco-calibrate into tracing so user bug
 /// reports arrive as one structured event stream instead of two
 /// loggers writing to the same stderr.
-///
-/// M2 migration (deep-review-2026-04-18 decision 11).
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -4217,7 +4215,7 @@ fn budget_for_lookahead(free_vram: u64, total_vram: u64) -> usize {
     }
     // Same budget the export pre-flight uses, so the slider's risk zones match
     // what the engine will accept.
-    reco_core::session::lookahead_budget_bytes(free_vram, total_vram)
+    reco_core::gpu::vram_pool::lookahead_budget_bytes(free_vram, total_vram)
 }
 
 fn try_init_and_update(state: &Rc<RefCell<AppState>>, app_weak: &slint::Weak<RecoApp>) {
@@ -4292,7 +4290,8 @@ fn try_init_and_update(state: &Rc<RefCell<AppState>>, app_weak: &slint::Weak<Rec
                 {
                     Some((free, total)) if total > 0 && in_w > 0 && in_h > 0 => {
                         let budget = budget_for_lookahead(free, total);
-                        let fit = reco_core::session::lookahead_fit(in_w, in_h, 1, budget, fps);
+                        let fit =
+                            reco_core::gpu::vram_pool::lookahead_fit(in_w, in_h, 1, budget, fps);
                         app.set_lookahead_green_max(fit.safe_secs as f32);
                         app.set_lookahead_red_min(fit.max_secs as f32);
                         app.set_lookahead_risk_active(true);

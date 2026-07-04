@@ -31,6 +31,8 @@
 mod cpu;
 mod executor;
 pub(crate) mod geometry;
+#[cfg(feature = "gpu")]
+pub(crate) mod residency;
 
 pub use executor::{CpuExecutor, Executor, StitchError, StitchExecutor};
 #[cfg(feature = "gpu")]
@@ -362,7 +364,7 @@ mod tests {
         );
     }
 
-    /// The keystone: the CPU float reference must agree with the GPU shader on
+    /// The CPU float reference must agree with the GPU shader on
     /// the same scene. Because both share `view_matrix`, the projection, and
     /// `lens::kb4`, the only differences are f32-vs-f64 and hardware-vs-software
     /// bilinear - so the RGB match should be tight. Skips when no GPU adapter.
