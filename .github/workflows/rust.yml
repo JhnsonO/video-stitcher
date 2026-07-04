@@ -2,9 +2,9 @@ name: Rust CI
 
 on:
   push:
-    branches: [v2, main, v2-consolidation]
+    branches: [main, dev]
   pull_request:
-    branches: [v2, main]
+    branches: [main, dev]
 
 # Restrict default permissions to read-only. Jobs that need more
 # declare their own permissions block.
