@@ -2873,9 +2873,33 @@ export component RecoApp inherits Window {
 
     // ── Modal guard (topmost) ──
     // While a native file picker is open, dim the window and swallow
-    // every pointer event so no state can change under the dialog.
+    // pointer events so no state can change under the dialog. The
+    // click-to-dismiss escape hatch is deliberate: `file-dialog-open`
+    // is driven by a best-effort worker/poll pair, so a dropped result
+    // must never trap the user behind an undismissable scrim. Clearing
+    // it here only drops the visual guard - the Rust side keeps its own
+    // `file_dialog_open` flag, so a picked file still applies and a
+    // second picker still cannot stack.
     if root.file-dialog-open : Rectangle {
         background: root.bg-scrim;
-        TouchArea {}
+        guard-touch := TouchArea {
+            clicked => { root.file-dialog-open = false; }
+        }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: guard-label.preferred-width + 40px;
+            height: guard-label.preferred-height + 28px;
+            background: root.bg-card;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: root.border-mid;
+            guard-label := Text {
+                text: "Finish in the file picker window…\nClick here to dismiss";
+                color: root.text-primary;
+                horizontal-alignment: center;
+                font-size: 14px;
+            }
+        }
     }
 }
