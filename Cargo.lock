@@ -5573,6 +5573,7 @@ dependencies = [
  "image",
  "log",
  "open",
+ "pollster",
  "reco-autocam",
  "reco-calibrate",
  "reco-control",
