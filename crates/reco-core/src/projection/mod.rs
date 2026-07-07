@@ -126,7 +126,7 @@ impl Projection for LShapeProjection {
             (Box::new(left), BlendRule::Opaque),
             (
                 Box::new(right),
-                BlendRule::Smoothstep(calibration.topology.blend_width as f64),
+                BlendRule::Smoothstep(calibration.topology.blend_width() as f64),
             ),
         ]
     }
@@ -155,78 +155,17 @@ impl Projection for LShapeProjection {
 // ---------------------------------------------------------------------------
 // Cylindrical single-input projection.
 // ---------------------------------------------------------------------------
-//
-// Models a single video as a texture painted on the inside of a
-// cylinder of radius `focal_length`. The virtual camera sits on the
-// cylinder axis and looks outward; pan/tilt/zoom rotate the camera and
-// scale FOV. This is the standard projection for pre-stitched 180-degree
-// action-camera footage, so files from that ecosystem deproject with
-// small adapter code. Defaults (focal_length=2400, sweep=180deg) match
-// the convention such players established.
-//
-// Proves the `Projection` trait supports camera_count() != 2. The
-// inverse map + WGSL wiring into StitchCore land at the cylinder step
-// (needs a mono submit path and a different bind group layout); the
-// shader draft lives at `shaders/cylindrical_mono.wgsl`.
-
-/// Configuration for a [`CylindricalProjection`]. Defaults match the
-/// established 180-degree cylindrical-player convention (2400px focal
-/// length, no screen rotation).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CylindricalProjectionConfig {
-    /// Cylinder radius in world units. Larger values = narrower
-    /// cylindrical wrap per pixel, so the panorama feels flatter.
-    /// Conventional range is 1000-5000 with 2400 as the default.
-    pub focal_length: f32,
-    /// Full horizontal angular sweep in radians. `std::f32::consts::PI`
-    /// (180 degrees) is the canonical action-camera case; 2π would be
-    /// a full 360-degree cylinder.
-    pub angular_sweep_rad: f32,
-    /// Screen tilt around the view axis in radians (typically within
-    /// ±30 degrees), correcting a rig that is not level side-to-side.
-    pub screen_rotation_rad: f32,
-    /// Video height in world units. Defaults to `1.0` (normalized);
-    /// consumers with a known camera height can pass the actual value
-    /// so the cylinder has the right aspect.
-    pub video_height: f32,
-}
-
-impl Default for CylindricalProjectionConfig {
-    fn default() -> Self {
-        Self {
-            focal_length: 2400.0,
-            angular_sweep_rad: std::f32::consts::PI,
-            screen_rotation_rad: 0.0,
-            video_height: 1.0,
-        }
-    }
-}
 
 /// Single-input cylindrical projection.
 ///
 /// Consumes one camera (`camera_count() == 1`) and renders it as if
-/// painted on the inside of a cylinder of radius `config.focal_length`.
-/// The virtual camera sits on the cylinder axis.
-///
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CylindricalProjection {
-    /// Projection parameters (see [`CylindricalProjectionConfig::default`]).
-    pub config: CylindricalProjectionConfig,
-}
-
-impl CylindricalProjection {
-    /// Build a new cylindrical projection with the given config.
-    pub fn new(config: CylindricalProjectionConfig) -> Self {
-        Self { config }
-    }
-
-    /// Compute the cylinder's `theta_start` angle in radians:
-    /// `PI/2 - angular_sweep/2` - where the video's left edge lands on
-    /// the cylinder surface (the sweep centers on the +Z view axis).
-    pub fn theta_start_rad(&self) -> f32 {
-        std::f32::consts::FRAC_PI_2 - self.config.angular_sweep_rad * 0.5
-    }
-}
+/// painted on the inside of a cylinder; the virtual camera sits on the
+/// cylinder axis. The parameters live in the calibration document's
+/// [`CylinderTopology`](crate::calibration::CylinderTopology) - like
+/// the L-shape, the struct itself carries no state. This is the
+/// standard projection for pre-stitched 180-degree footage.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CylindricalProjection;
 
 impl Projection for CylindricalProjection {
     fn name(&self) -> &'static str {
@@ -237,18 +176,29 @@ impl Projection for CylindricalProjection {
         1
     }
 
-    /// Not wired yet: the mono cylinder's inverse map lands at the
-    /// cylinder-topology step (its WGSL lives at
-    /// `shaders/cylindrical_mono.wgsl`). Unreachable through StitchCore
-    /// today - construction rejects the camera-count mismatch.
     fn surface_maps(
         &self,
-        _calibration: &Calibration,
-        _config: &crate::render::viewport::ViewportConfig,
-        _yaw: f32,
-        _pitch: f32,
+        calibration: &Calibration,
+        config: &crate::render::viewport::ViewportConfig,
+        yaw: f32,
+        pitch: f32,
     ) -> Vec<(Box<dyn SurfaceMap>, BlendRule)> {
-        Vec::new()
+        let topology = calibration
+            .topology
+            .cylinder()
+            .expect("the cylindrical projection requires the cylinder topology");
+        vec![(
+            Box::new(crate::stitch::cylinder::CylinderMap::new(
+                topology,
+                &calibration.framing,
+                f64::from(calibration.lenses[0].height),
+                config,
+                yaw,
+                pitch,
+            )),
+            // Single surface: nothing underneath to blend with.
+            BlendRule::Opaque,
+        )]
     }
 
     #[cfg(feature = "gpu")]
@@ -259,11 +209,48 @@ impl Projection for CylindricalProjection {
             fs_entry: "fs_cylindrical_mono",
             // Mono: single surface, nothing to blend over.
             blend: wgpu::BlendState::REPLACE,
-            // Placeholder until the cylinder is wired: its composite is a
-            // fullscreen pass, and its real vertex/bind layout lands with
-            // the cylinder-topology step.
+            // TODO: placeholder until the mono GPU pass is wired
+            // (Step 13 PR B): its composite is a fullscreen pass with
+            // its own bind layout.
             vertex_layout: crate::render::renderer::Vertex::LAYOUT,
         }
+    }
+
+    /// The cylinder's panorama is exactly rectangular in (yaw, pitch):
+    /// yaw spans the angular sweep, pitch spans what the painted
+    /// height subtends at the radius.
+    fn coverage(&self, calibration: &Calibration, _scene: &SceneGeometry) -> CoverageBoundary {
+        let t = calibration
+            .topology
+            .cylinder()
+            .expect("the cylindrical projection requires the cylinder topology");
+        let yaw_half = (t.sweep_deg.to_radians() * 0.5) as f32;
+        let height = t
+            .video_height
+            .unwrap_or(f64::from(calibration.lenses[0].height));
+        let pitch_half = (((height * 0.5) / t.focal_length).atan()) as f32;
+        // The painted band is world-fixed; rig tilt/roll shape how
+        // panning traverses it, not where it is - the clamp's rotated
+        // viewport margining (the same mechanism a tilted L-shape
+        // uses) accounts for the edge roll.
+        CoverageBoundary::rectangular(
+            -yaw_half,
+            yaw_half,
+            -pitch_half,
+            pitch_half,
+            calibration.framing.tilt as f32,
+            calibration.framing.roll as f32,
+        )
+    }
+}
+
+/// The projection a calibration document calls for: the topology
+/// variant picks it. Consumers with a custom projection can still
+/// inject their own at executor construction.
+pub fn for_topology(topology: &crate::calibration::Topology) -> Box<dyn Projection> {
+    match topology {
+        crate::calibration::Topology::LShape(_) => Box::new(LShapeProjection),
+        crate::calibration::Topology::Cylinder(_) => Box::new(CylindricalProjection),
     }
 }
 
@@ -291,7 +278,7 @@ const CONVERGENCE_EPS: f64 = 1e-10;
 ///
 /// # fn example(cal: &Calibration) {
 /// let aspect = cal.lenses[0].width as f32 / cal.lenses[0].height as f32;
-/// let scene = SceneGeometry::new(&cal.topology, &cal.framing, aspect);
+/// let scene = SceneGeometry::for_calibration(cal, aspect);
 /// if let Some(pos) = camera_to_panorama(CameraId::Left, 0.5, 0.5, cal, &scene) {
 ///     println!("Center of left camera maps to yaw={:.3}, pitch={:.3}", pos.yaw, pos.pitch);
 /// }
@@ -468,11 +455,11 @@ pub(crate) fn yaw_pitch_to_direction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibration::{Calibration, Framing, Lens, Topology};
+    use crate::calibration::{Calibration, Framing, LShapeTopology, Lens};
 
     fn test_scene(cal: &Calibration) -> SceneGeometry {
         let aspect = cal.lenses[0].width as f32 / cal.lenses[0].height as f32;
-        SceneGeometry::new(&cal.topology, &cal.framing, aspect)
+        SceneGeometry::for_calibration(cal, aspect)
     }
 
     fn test_calibration() -> Calibration {
@@ -489,7 +476,7 @@ mod tests {
         };
         Calibration::new(
             vec![cam(), cam()],
-            Topology {
+            LShapeTopology {
                 intersect: 0.5446,
                 x_ty: 0.00476,
                 x_rz: 0.00753,
@@ -909,27 +896,27 @@ mod tests {
         assert_eq!(surfaces[0].1, crate::stitch::BlendRule::Opaque);
         assert_eq!(
             surfaces[1].1,
-            crate::stitch::BlendRule::Smoothstep(cal.topology.blend_width as f64)
+            crate::stitch::BlendRule::Smoothstep(cal.topology.blend_width() as f64)
         );
     }
 
     // ---- CylindricalProjection ---------------------------------------------
 
-    #[test]
-    fn cylindrical_defaults_match_convention() {
-        // Reference values are the established cylindrical-player
-        // convention (focal length 2400, 180-deg sweep, no screen tilt,
-        // normalized height). Regresses if the defaults silently change.
-        let c = CylindricalProjectionConfig::default();
-        assert_eq!(c.focal_length, 2400.0);
-        assert!((c.angular_sweep_rad - std::f32::consts::PI).abs() < 1e-6);
-        assert_eq!(c.screen_rotation_rad, 0.0);
-        assert_eq!(c.video_height, 1.0);
+    fn cylinder_cal() -> Calibration {
+        Calibration::new(
+            vec![Lens::flat(3840, 1080)],
+            crate::calibration::CylinderTopology::default(),
+            Framing {
+                axis_offset: 0.0,
+                tilt: 0.0,
+                roll: 0.0,
+            },
+        )
     }
 
     #[test]
     fn cylindrical_projection_reports_mono() {
-        let p = CylindricalProjection::default();
+        let p = CylindricalProjection;
         assert_eq!(p.name(), "cylindrical-mono-1camera");
         assert_eq!(
             p.camera_count(),
@@ -939,34 +926,59 @@ mod tests {
     }
 
     #[test]
-    fn cylindrical_theta_start_centers_the_sweep() {
-        // theta_start = PI/2 - s/2 where s is the angular sweep, so the
-        // sweep centers on the view axis. Verify for 180-deg (default)
-        // and for a 90-deg cylinder (quarter sweep).
-        let p180 = CylindricalProjection::default();
+    fn cylindrical_surface_maps_emit_one_opaque_surface() {
+        let cal = cylinder_cal();
+        let config = crate::render::viewport::ViewportConfig::default();
+        let surfaces = CylindricalProjection.surface_maps(&cal, &config, 0.0, 0.0);
+        assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0].1, crate::stitch::BlendRule::Opaque);
         assert!(
-            (p180.theta_start_rad() - std::f32::consts::FRAC_PI_2 * 0.0).abs() < 1e-6,
-            "180-deg sweep: theta_start = PI/2 - PI/2 = 0"
+            surfaces[0]
+                .0
+                .sample_uv(config.width / 2, config.height / 2)
+                .is_some(),
+            "the straight-ahead pixel is covered"
         );
+    }
 
-        let p90 = CylindricalProjection::new(CylindricalProjectionConfig {
-            angular_sweep_rad: std::f32::consts::FRAC_PI_2,
-            ..Default::default()
-        });
-        // 90-deg: theta_start = PI/2 - PI/4 = PI/4.
-        assert!((p90.theta_start_rad() - std::f32::consts::FRAC_PI_4).abs() < 1e-6);
+    #[test]
+    fn cylindrical_coverage_is_the_analytic_rectangle() {
+        let cal = cylinder_cal();
+        let scene = SceneGeometry::for_calibration(&cal, 3840.0 / 1080.0);
+        let coverage = CylindricalProjection.coverage(&cal, &scene);
+        let (y_lo, y_hi) = coverage.yaw_range();
+        assert!(
+            (y_lo + std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "yaw_min {y_lo}"
+        );
+        assert!(
+            (y_hi - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "yaw_max {y_hi}"
+        );
+        // pitch half-extent = atan((h/2)/r) for h = the source's 1080
+        // pixel height (the omitted-video_height default), r = 2400.
+        let expected = ((1080.0f64 * 0.5) / 2400.0).atan() as f32;
+        assert!((coverage.pitch_max - expected).abs() < 1e-6);
+        assert!((coverage.pitch_min + expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn for_topology_resolves_the_matching_projection() {
+        let l = for_topology(&test_calibration().topology);
+        assert_eq!(l.camera_count(), 2);
+        let c = for_topology(&cylinder_cal().topology);
+        assert_eq!(c.camera_count(), 1);
     }
 
     #[test]
     fn projection_dyn_dispatch_round_trip_with_mixed_camera_counts() {
-        // Compile-time: `Box<dyn Projection>` can hold concrete impls
-        // with different `camera_count()` results. Proves the trait
-        // API's claim that consumers can swap projections without a
-        // new type parameter on StitchCore.
-        let projections: Vec<Box<dyn Projection>> = vec![
-            Box::new(LShapeProjection),
-            Box::new(CylindricalProjection::default()),
-        ];
+        // Compile-time: the trait is object-safe, so one collection
+        // holds impls with different `camera_count()` results - what
+        // lets `for_topology` pick the projection at calibration-load
+        // time. The assertions pin the per-projection counts and that
+        // the diagnostic names stay distinct.
+        let projections: Vec<Box<dyn Projection>> =
+            vec![Box::new(LShapeProjection), Box::new(CylindricalProjection)];
         assert_eq!(projections[0].camera_count(), 2);
         assert_eq!(projections[1].camera_count(), 1);
         assert_ne!(projections[0].name(), projections[1].name());
@@ -976,6 +988,5 @@ mod tests {
     fn cylindrical_projection_is_send_sync() {
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<CylindricalProjection>();
-        assert_send_sync::<CylindricalProjectionConfig>();
     }
 }

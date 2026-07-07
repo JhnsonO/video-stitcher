@@ -568,6 +568,130 @@ pub fn create_encoder(
     Ok((encoder, name))
 }
 
+// -- FFmpeg Mono Source --
+
+/// Single-video source for mono topologies (pre-stitched panoramas).
+///
+/// Decodes one file on a background thread and delivers
+/// [`StereoFrame::Mono`] frames - the single-input dual of
+/// [`FfmpegFileSource`] for cylinder calibrations.
+#[cfg(feature = "ffmpeg")]
+pub struct FfmpegMonoSource {
+    rx: std::sync::mpsc::Receiver<YuvData>,
+    info: SourceInfo,
+    input: crate::stitch_job::InputPath,
+    software_decode: bool,
+    current_frame: u64,
+    exhausted: bool,
+}
+
+#[cfg(feature = "ffmpeg")]
+impl FfmpegMonoSource {
+    /// Open a mono source. `software_decode` forces the software
+    /// decoder (the `--cpu` path).
+    pub fn open(
+        input: &crate::stitch_job::InputPath,
+        software_decode: bool,
+    ) -> Result<Self, SourceError> {
+        let probe_path = input.first_path();
+        reco_core::source::validate_input_path(probe_path)?;
+        let probe =
+            ffmpeg::decoder::VideoDecoder::open(probe_path).map_err(|e| SourceError::Init {
+                path: probe_path.display().to_string(),
+                reason: format!("{e}"),
+            })?;
+        let fps_r = probe.frame_rate();
+        let fps = probe.fps();
+        let total_frames = input_duration_secs(input).map(|dur| (dur * fps) as u64);
+        let info = SourceInfo {
+            width: probe.width(),
+            height: probe.height(),
+            fps,
+            fps_rational: Some((fps_r.0, fps_r.1)),
+            total_frames,
+        };
+        drop(probe);
+
+        let rx =
+            FfmpegFileSource::spawn_single_decoder_at(input.clone(), "mono", None, software_decode);
+        Ok(Self {
+            rx,
+            info,
+            input: input.clone(),
+            software_decode,
+            current_frame: 0,
+            exhausted: false,
+        })
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+impl reco_core::source::FrameSource for FfmpegMonoSource {
+    fn info(&self) -> SourceInfo {
+        self.info.clone()
+    }
+
+    fn next_frame(&mut self) -> Result<Option<StereoFrame>, SourceError> {
+        if self.exhausted {
+            return Ok(None);
+        }
+        match self.rx.recv() {
+            Ok(yuv) => {
+                self.current_frame += 1;
+                Ok(Some(StereoFrame::Mono(yuv)))
+            }
+            Err(_) => {
+                self.exhausted = true;
+                Ok(None)
+            }
+        }
+    }
+
+    fn total_frames(&self) -> Option<u64> {
+        self.info.total_frames
+    }
+
+    fn skip_frames(&mut self, count: u64) -> Result<u64, SourceError> {
+        self.seek(self.current_frame + count)?;
+        Ok(count)
+    }
+
+    fn seek(&mut self, frame: u64) -> Result<(), SourceError> {
+        // Same two strategies as `FfmpegFileSource::seek`: a short
+        // forward seek drains the already-running decoder; anything
+        // else respawns it at the target keyframe. Decode-and-discard
+        // for a large `start_time` would decode the entire prefix.
+        if frame >= self.current_frame {
+            let skip = frame - self.current_frame;
+            let max_forward = (self.info.fps * 10.0) as u64;
+            if skip <= max_forward {
+                for _ in 0..skip {
+                    match self.rx.recv() {
+                        Ok(_) => self.current_frame += 1,
+                        Err(_) => {
+                            self.exhausted = true;
+                            break;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        let secs = frame as f64 / self.info.fps;
+        log::debug!("mono seek to frame {frame} ({secs:.1}s)");
+        self.rx = FfmpegFileSource::spawn_single_decoder_at(
+            self.input.clone(),
+            "mono",
+            Some(secs),
+            self.software_decode,
+        );
+        self.current_frame = frame;
+        self.exhausted = false;
+        Ok(())
+    }
+}
+
 // -- FFmpeg File Encoder --
 
 /// File encoder backed by FFmpeg.

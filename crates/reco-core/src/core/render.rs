@@ -74,7 +74,7 @@ impl super::StitchCore {
             #[cfg(feature = "gpu")]
             Executor::Gpu(_) => unreachable!("routed from the CPU arm"),
         };
-        let rgba = cpu.stitch_yuv(left, right, pose.yaw, pose.pitch)?;
+        let rgba = cpu.stitch_yuv(&[*left, *right], pose.yaw, pose.pitch)?;
         Ok(self.deliver_cpu_frame(rgba, pose))
     }
 
@@ -320,7 +320,7 @@ impl super::StitchCore {
                     #[cfg(feature = "gpu")]
                     Executor::Gpu(_) => unreachable!("routed from the CPU arm"),
                 };
-                let rgba = cpu.stitch_nv12(left, right, pose.yaw, pose.pitch)?;
+                let rgba = cpu.stitch_nv12(&[*left, *right], pose.yaw, pose.pitch)?;
                 Ok(self.deliver_cpu_frame(rgba, pose))
             }
             #[cfg(feature = "gpu")]
@@ -364,6 +364,51 @@ impl super::StitchCore {
             Some(bytes) => RenderOutcome::Rgba(bytes),
             None => RenderOutcome::Warmup,
         })
+    }
+
+    /// Submit a mono frame - a single pre-stitched panorama - and
+    /// render the current pose. The single-camera counterpart of
+    /// [`Self::submit_frame_yuv`] for mono topologies (the cylinder).
+    ///
+    /// Detection is not wired for mono topologies yet (the
+    /// detection-to-panorama mapping is L-shape-only); an attached
+    /// detector logs once and idles, and the panner runs without
+    /// detections. The stacked replay recorder (2-tile format) is
+    /// likewise skipped.
+    // TODO: wire mono detection + replay (Step 13 PR B).
+    pub fn submit_frame_mono_yuv(
+        &mut self,
+        frame: &YuvPlanes<'_>,
+    ) -> Result<RenderOutcome<'_>, StitchCoreError> {
+        self.anchor_session_start();
+
+        if self.detection_due(self.frame_count) && !self.mono_detection_warned {
+            self.mono_detection_warned = true;
+            log::warn!("detection is not supported on mono topologies yet; the detector idles");
+        }
+
+        let pose = self.resolve_current_pose(false);
+        match &self.executor {
+            Executor::Cpu(_) => {
+                // See submit_cpu_yuv for the wgpu-free lint note.
+                #[allow(clippy::infallible_destructuring_match)]
+                let cpu = match &self.executor {
+                    Executor::Cpu(cpu) => cpu,
+                    #[cfg(feature = "gpu")]
+                    Executor::Gpu(_) => unreachable!("routed from the CPU arm"),
+                };
+                let rgba = cpu.stitch_yuv(&[*frame], pose.yaw, pose.pitch)?;
+                Ok(self.deliver_cpu_frame(rgba, pose))
+            }
+            #[cfg(feature = "gpu")]
+            Executor::Gpu(_) => Err(StitchCoreError::Executor(
+                crate::stitch::StitchError::InvalidConfig(
+                    "the mono GPU pass is not wired yet; run mono topologies on the \
+                     CPU executor"
+                        .into(),
+                ),
+            )),
+        }
     }
 
     /// Store a CPU-stitched frame and hand out the borrowed outcome -
