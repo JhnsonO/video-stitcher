@@ -1103,6 +1103,11 @@ fn begin_file_dialog<T, F, B, A>(
         s.file_dialog_open = true;
         s.file_dialog_rx = Some(rx);
     }
+    // Mirror into Slint: raises the modal-guard overlay that blocks
+    // pointer input while the (unparented, non-modal) picker is up.
+    if let Some(app) = app_weak.upgrade() {
+        app.set_file_dialog_open(true);
+    }
 
     let task = build();
     std::thread::spawn(move || {
@@ -1137,6 +1142,11 @@ fn poll_file_dialog(state: &Rc<RefCell<AppState>>, app_weak: &slint::Weak<RecoAp
         }
     };
 
+    // Both delivery and disconnect end the dialog: drop the overlay
+    // before applying so the result lands on an interactive UI.
+    if let Some(app) = app_weak.upgrade() {
+        app.set_file_dialog_open(false);
+    }
     if let Some(action) = action {
         action.apply(state, app_weak);
     }

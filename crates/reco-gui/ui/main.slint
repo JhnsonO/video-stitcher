@@ -445,6 +445,11 @@ export component RecoApp inherits Window {
     // ── Theme colors ──
     in-out property <bool> dark-mode: true;
 
+    // True while a native file picker is open: the picker window is
+    // unparented (non-modal), so the modal-guard overlay below supplies
+    // the modal semantics by swallowing pointer input.
+    in-out property <bool> file-dialog-open: false;
+
     property <color> bg-base: dark-mode ? #121212 : #f5f5f5;
     property <color> bg-panel: dark-mode ? #1a1a1a : #eaeaea;
     property <color> bg-bar: dark-mode ? #1e1e1e : #e0e0e0;
@@ -2864,5 +2869,13 @@ export component RecoApp inherits Window {
         toasts: root.toasts;
         right-inset: root.controls-open ? root.right-panel-width : 0px;
         dismissed(id) => { root.toast-dismissed(id); }
+    }
+
+    // ── Modal guard (topmost) ──
+    // While a native file picker is open, dim the window and swallow
+    // every pointer event so no state can change under the dialog.
+    if root.file-dialog-open : Rectangle {
+        background: root.bg-scrim;
+        TouchArea {}
     }
 }
