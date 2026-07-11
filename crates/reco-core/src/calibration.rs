@@ -221,6 +221,17 @@ impl Lens {
             correction: 1.0,
         }
     }
+
+    /// Aspect ratio of this lens's calibration frame (width / height).
+    ///
+    /// Returns 1.0 if height is zero (degenerate, rejected by
+    /// validation) - mirrors `ViewportConfig::aspect_ratio`.
+    pub fn aspect(&self) -> f32 {
+        if self.height == 0 {
+            return 1.0;
+        }
+        self.width as f32 / self.height as f32
+    }
 }
 
 /// Scene geometry parameters: which shape the sources are painted on.

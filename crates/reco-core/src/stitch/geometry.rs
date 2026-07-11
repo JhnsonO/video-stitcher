@@ -180,15 +180,17 @@ pub(crate) fn l_shape_plane_maps(
     yaw: f32,
     pitch: f32,
 ) -> (PlaneMap, PlaneMap) {
-    // Both planes share the camera aspect (a stereo rig's two cameras match).
-    let plane_aspect = calib.lenses[0].width as f32 / calib.lenses[0].height as f32;
+    // Known limitation: both planes are sized with lens 0's aspect.
+    // Mixed-aspect rigs are valid calibrations; honoring each lens's
+    // own aspect lands when the L-shape derives its own scene.
+    let plane_aspect = calib.lenses[0].aspect();
     let topology = calib
         .topology
         .l_shape()
         .expect("l_shape_plane_maps requires the L-shape topology");
     let scene = SceneGeometry::new(topology, &calib.framing, plane_aspect);
 
-    let out_aspect = config.width as f32 / config.height as f32;
+    let out_aspect = config.aspect_ratio();
     let projection = opengl_to_wgpu_matrix()
         * Perspective3::new(
             out_aspect,
