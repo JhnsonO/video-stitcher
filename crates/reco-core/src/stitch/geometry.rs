@@ -13,7 +13,6 @@ use nalgebra::{Matrix3, Matrix4, Perspective3, Vector3};
 use crate::calibration::{Calibration, Lens};
 use crate::geometry::{FAR_PLANE, NEAR_PLANE, opengl_to_wgpu_matrix, view_matrix};
 use crate::lens::kb4;
-use crate::render::scene::SceneGeometry;
 use crate::render::viewport::ViewportConfig;
 
 use super::{SurfaceMap, SurfaceUv};
@@ -175,6 +174,7 @@ impl SurfaceMap for PlaneMap {
 /// the GPU stitch pass, so the CPU and GPU sample the identical source UV for
 /// every output pixel (up to f32/f64 precision).
 pub(crate) fn l_shape_plane_maps(
+    topology: &crate::projection::LShape,
     calib: &Calibration,
     config: &ViewportConfig,
     yaw: f32,
@@ -184,11 +184,7 @@ pub(crate) fn l_shape_plane_maps(
     // Mixed-aspect rigs are valid calibrations; honoring each lens's
     // own aspect lands when the L-shape derives its own scene.
     let plane_aspect = calib.lenses[0].aspect();
-    let topology = calib
-        .topology
-        .l_shape()
-        .expect("l_shape_plane_maps requires the L-shape topology");
-    let scene = SceneGeometry::new(topology, &calib.framing, plane_aspect);
+    let scene = topology.scene(&calib.framing, plane_aspect);
 
     let out_aspect = config.aspect_ratio();
     let projection = opengl_to_wgpu_matrix()
@@ -238,7 +234,9 @@ mod tests {
     #[test]
     fn covered_pixels_return_uv_in_range() {
         let cfg = ViewportConfig::default();
-        let (left, right) = l_shape_plane_maps(&calib(1920, 1080), &cfg, 0.0, 0.0);
+        let cal = calib(1920, 1080);
+        let topology = cal.topology.l_shape().unwrap();
+        let (left, right) = l_shape_plane_maps(topology, &cal, &cfg, 0.0, 0.0);
         // Across the output, every covered pixel must report a UV inside [0,1],
         // and at least one plane must cover a healthy fraction of the frame.
         let mut covered = 0usize;

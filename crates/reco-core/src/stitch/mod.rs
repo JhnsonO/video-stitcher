@@ -105,9 +105,10 @@ pub(crate) mod test_support {
     // either way so the fixtures stay in sync.
     #![cfg_attr(not(feature = "gpu"), allow(dead_code))]
 
-    use crate::calibration::{Calibration, Framing, LShapeTopology, Lens};
+    use crate::calibration::{Calibration, Framing, Lens};
     #[cfg(feature = "gpu")]
     use crate::gpu::{GpuContext, GpuError};
+    use crate::projection::LShape;
 
     /// Two-camera calibration (shared dims, mild fisheye, centred) for tests.
     pub fn calib(w: u32, h: u32) -> Calibration {
@@ -124,7 +125,7 @@ pub(crate) mod test_support {
         };
         Calibration::new(
             vec![cam(), cam()],
-            LShapeTopology {
+            LShape {
                 intersect: 0.5,
                 x_ty: 0.0,
                 x_rz: 0.0,
@@ -266,10 +267,6 @@ pub(crate) mod test_support {
 mod tests {
     #![cfg_attr(not(feature = "gpu"), allow(dead_code))]
 
-    use crate::projection::LShapeProjection;
-    #[cfg(feature = "gpu")]
-    use crate::projection::Projection;
-
     use super::cpu::stitch_rgba;
     #[cfg(feature = "gpu")]
     use super::cpu::stitch_rgba_yuv420p;
@@ -298,7 +295,7 @@ mod tests {
         let right = Nv12Planes { y: &ry, uv: &ruv };
 
         let out = stitch_rgba(
-            &LShapeProjection,
+            calib.topology.projection(),
             &[left, right],
             (w, h),
             &calib,
@@ -328,7 +325,7 @@ mod tests {
         let right = Nv12Planes { y: &ry, uv: &ruv };
 
         let a = stitch_rgba(
-            &LShapeProjection,
+            calib.topology.projection(),
             &[left, right],
             (w, h),
             &calib,
@@ -339,7 +336,7 @@ mod tests {
         )
         .unwrap();
         let b = stitch_rgba(
-            &LShapeProjection,
+            calib.topology.projection(),
             &[left, right],
             (w, h),
             &calib,
@@ -393,7 +390,7 @@ mod tests {
         // render the same frame three times to drain one result.
         let pipeline = crate::render::pipeline::StitchPipeline::with_gpu(
             gpu,
-            &crate::projection::LShapeProjection.gpu_program(),
+            &calib.topology.projection().gpu_program(),
             calib.clone(),
             config.clone(),
             cam_w,
@@ -422,7 +419,7 @@ mod tests {
 
         // CPU reference on the same inputs (limited range, matching the GPU default).
         let cpu_rgba = stitch_rgba(
-            &LShapeProjection,
+            calib.topology.projection(),
             &[left, right],
             (cam_w, cam_h),
             &calib,
@@ -488,7 +485,7 @@ mod tests {
 
         let pipeline = crate::render::pipeline::StitchPipeline::with_gpu(
             gpu,
-            &crate::projection::LShapeProjection.gpu_program(),
+            &calib.topology.projection().gpu_program(),
             calib.clone(),
             config.clone(),
             cam_w,
@@ -516,7 +513,7 @@ mod tests {
         let gpu_rgba = gpu_rgba.expect("gpu should produce a frame after 3 renders");
 
         let cpu_rgba = stitch_rgba_yuv420p(
-            &LShapeProjection,
+            calib.topology.projection(),
             &[left, right],
             (cam_w, cam_h),
             &calib,
@@ -594,7 +591,7 @@ mod tests {
         let (cam_w, cam_h) = cam;
         let mut pipeline = crate::render::pipeline::StitchPipeline::with_gpu(
             gpu,
-            &crate::projection::LShapeProjection.gpu_program(),
+            &calib.topology.projection().gpu_program(),
             calib.clone(),
             config.clone(),
             cam_w,
@@ -625,7 +622,7 @@ mod tests {
         }
         let gpu_rgba = gpu_rgba.expect("gpu frame");
         let cpu_rgba = stitch_rgba(
-            &LShapeProjection,
+            calib.topology.projection(),
             &[*left, *right],
             cam,
             calib,
@@ -937,7 +934,7 @@ mod tests {
 
         // ~1px of output (fov 75 over 192px ~= 0.007 rad/px); 0.01 rad is decisive.
         let perturbed = stitch_rgba(
-            &LShapeProjection,
+            cal.topology.projection(),
             &[left, right],
             (cam_w, cam_h),
             &cal,

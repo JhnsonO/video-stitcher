@@ -14,21 +14,25 @@
 //! ```
 
 mod coverage;
+pub(crate) mod cylinder;
 mod geometry;
+pub(crate) mod l_shape;
 
 // Re-export coverage types so external code can still use
 // `crate::projection::CoverageBoundary` etc.
 pub use coverage::{ClampedPosition, CoverageBoundary, PanoramaExtent};
+pub use cylinder::Cylinder;
+pub use l_shape::{DEFAULT_BLEND_WIDTH, LShape};
 
 // Re-export geometry utility.
 pub use geometry::point_in_polygon;
 
-use crate::calibration::{Calibration, Lens};
+use crate::calibration::{Calibration, Framing, Lens};
 use crate::geometry::CameraId;
 use crate::geometry::ViewportPosition;
 use crate::geometry::VirtualCamera;
-use crate::render::scene::SceneGeometry;
 use crate::stitch::{BlendRule, SurfaceMap};
+use l_shape::PlaneScene;
 
 use nalgebra::{Point3, Vector3};
 
@@ -43,6 +47,21 @@ use nalgebra::{Point3, Vector3};
 // projection-shader step, and the detection-side forward maps
 // (`camera_to_panorama`) fold in once their `CameraId`/`ViewportPosition`
 // currency moves out of the detect layer.
+
+/// One frame's geometry question, bundled: the document, the output
+/// viewport, and the pan state. FOV is deliberately absent - it is
+/// resolved into `viewport.fov_degrees` before any render call, so a
+/// second copy here could only disagree.
+pub struct ProjectionContext<'a> {
+    /// The calibration document (lenses, topology, framing).
+    pub calibration: &'a Calibration,
+    /// Output viewport (dimensions + resolved FOV).
+    pub viewport: &'a crate::render::viewport::ViewportConfig,
+    /// Horizontal pan in radians.
+    pub yaw: f32,
+    /// Vertical pan in radians.
+    pub pitch: f32,
+}
 
 /// A panoramic projection geometry.
 ///
@@ -63,19 +82,19 @@ pub trait Projection: Send + Sync {
 
     /// Number of input cameras this projection consumes. 1 for mono,
     /// 2 for today's L-shape stereo, N>2 for future panoramic rigs.
-    fn camera_count(&self) -> u8;
+    fn camera_count(&self) -> usize;
+
+    /// The virtual camera's position in world space - the eye every
+    /// view matrix and pose basis is built from. The one piece of
+    /// scene state every projection has, plane-backed or not (the
+    /// mono cylinder's camera sits at the `[0, 0, 1]` convention).
+    fn camera_position(&self, framing: &Framing) -> [f32; 3];
 
     /// The ordered surface list for one frame: each surface's inverse
     /// map paired with how it blends over the surfaces before it.
     /// Surface `i` samples source camera `i`; the first surface lays
     /// the base. The CPU composite drives these directly.
-    fn surface_maps(
-        &self,
-        calibration: &Calibration,
-        config: &crate::render::viewport::ViewportConfig,
-        yaw: f32,
-        pitch: f32,
-    ) -> Vec<(Box<dyn SurfaceMap>, BlendRule)>;
+    fn surface_maps(&self, ctx: &ProjectionContext) -> Vec<(Box<dyn SurfaceMap>, BlendRule)>;
 
     /// The GPU program this projection composites with. The render
     /// pipeline compiles and binds exactly what the descriptor says -
@@ -86,172 +105,11 @@ pub trait Projection: Send + Sync {
 
     /// Build the coverage boundary for this projection's panorama.
     ///
-    /// Representation and clamp are one coupled unit: the default is the
-    /// sampled-slice model (bounded, non-wrapping - today's L-shape). A
-    /// projection that cannot reuse it overrides with its own at the
-    /// topology step.
-    fn coverage(&self, calibration: &Calibration, scene: &SceneGeometry) -> CoverageBoundary {
-        CoverageBoundary::from_calibration(calibration, scene)
-    }
-}
-
-/// Today's 2-plane L-shape stereo projection.
-///
-/// The plane placement is documented in
-/// [`scene::SceneGeometry`](crate::render::scene::SceneGeometry); the
-/// per-plane inverse maps come from the stitch geometry module. The
-/// struct carries no state - the calibration document parameterizes it.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LShapeProjection;
-
-impl Projection for LShapeProjection {
-    fn name(&self) -> &'static str {
-        "l-shape-stereo-2camera"
-    }
-
-    fn camera_count(&self) -> u8 {
-        2
-    }
-
-    fn surface_maps(
-        &self,
-        calibration: &Calibration,
-        config: &crate::render::viewport::ViewportConfig,
-        yaw: f32,
-        pitch: f32,
-    ) -> Vec<(Box<dyn SurfaceMap>, BlendRule)> {
-        let (left, right) =
-            crate::stitch::geometry::l_shape_plane_maps(calibration, config, yaw, pitch);
-        vec![
-            (Box::new(left), BlendRule::Opaque),
-            (
-                Box::new(right),
-                BlendRule::Smoothstep(calibration.topology.blend_width() as f64),
-            ),
-        ]
-    }
-
-    #[cfg(feature = "gpu")]
-    fn gpu_program(&self) -> crate::render::GpuProgram {
-        crate::render::GpuProgram {
-            wgsl: include_str!("../shaders/fisheye.wgsl"),
-            vs_entry: "vs_main",
-            fs_entry: "fs_main",
-            // Seam transition: the right plane's smoothstep alpha blends
-            // over the opaque left base (matches BlendRule ordering).
-            blend: wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::SrcAlpha,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent::OVER,
-            },
-            vertex_layout: crate::render::renderer::Vertex::LAYOUT,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Cylindrical single-input projection.
-// ---------------------------------------------------------------------------
-
-/// Single-input cylindrical projection.
-///
-/// Consumes one camera (`camera_count() == 1`) and renders it as if
-/// painted on the inside of a cylinder; the virtual camera sits on the
-/// cylinder axis. The parameters live in the calibration document's
-/// [`CylinderTopology`](crate::calibration::CylinderTopology) - like
-/// the L-shape, the struct itself carries no state. This is the
-/// standard projection for pre-stitched 180-degree footage.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct CylindricalProjection;
-
-impl Projection for CylindricalProjection {
-    fn name(&self) -> &'static str {
-        "cylindrical-mono-1camera"
-    }
-
-    fn camera_count(&self) -> u8 {
-        1
-    }
-
-    fn surface_maps(
-        &self,
-        calibration: &Calibration,
-        config: &crate::render::viewport::ViewportConfig,
-        yaw: f32,
-        pitch: f32,
-    ) -> Vec<(Box<dyn SurfaceMap>, BlendRule)> {
-        let topology = calibration
-            .topology
-            .cylinder()
-            .expect("the cylindrical projection requires the cylinder topology");
-        vec![(
-            Box::new(crate::stitch::cylinder::CylinderMap::new(
-                topology,
-                &calibration.framing,
-                f64::from(calibration.lenses[0].height),
-                config,
-                yaw,
-                pitch,
-            )),
-            // Single surface: nothing underneath to blend with.
-            BlendRule::Opaque,
-        )]
-    }
-
-    #[cfg(feature = "gpu")]
-    fn gpu_program(&self) -> crate::render::GpuProgram {
-        crate::render::GpuProgram {
-            wgsl: include_str!("../shaders/cylindrical_mono.wgsl"),
-            vs_entry: "vs_fullscreen",
-            fs_entry: "fs_cylindrical_mono",
-            // Mono: single surface, nothing to blend over.
-            blend: wgpu::BlendState::REPLACE,
-            // TODO: placeholder until the mono GPU pass is wired
-            // (Step 13 PR B): its composite is a fullscreen pass with
-            // its own bind layout.
-            vertex_layout: crate::render::renderer::Vertex::LAYOUT,
-        }
-    }
-
-    /// The cylinder's panorama is exactly rectangular in (yaw, pitch):
-    /// yaw spans the angular sweep, pitch spans what the painted
-    /// height subtends at the radius.
-    fn coverage(&self, calibration: &Calibration, _scene: &SceneGeometry) -> CoverageBoundary {
-        let t = calibration
-            .topology
-            .cylinder()
-            .expect("the cylindrical projection requires the cylinder topology");
-        let yaw_half = (t.sweep_deg.to_radians() * 0.5) as f32;
-        let height = t
-            .video_height
-            .unwrap_or(f64::from(calibration.lenses[0].height));
-        let pitch_half = (((height * 0.5) / t.focal_length).atan()) as f32;
-        // The painted band is world-fixed; rig tilt/roll shape how
-        // panning traverses it, not where it is - the clamp's rotated
-        // viewport margining (the same mechanism a tilted L-shape
-        // uses) accounts for the edge roll.
-        CoverageBoundary::rectangular(
-            -yaw_half,
-            yaw_half,
-            -pitch_half,
-            pitch_half,
-            calibration.framing.tilt as f32,
-            calibration.framing.roll as f32,
-        )
-    }
-}
-
-/// The projection a calibration document calls for: the topology
-/// variant picks it. Consumers with a custom projection can still
-/// inject their own at executor construction.
-pub fn for_topology(topology: &crate::calibration::Topology) -> Box<dyn Projection> {
-    match topology {
-        crate::calibration::Topology::LShape(_) => Box::new(LShapeProjection),
-        crate::calibration::Topology::Cylinder(_) => Box::new(CylindricalProjection),
-    }
+    /// No default on purpose: representation and clamp are one coupled
+    /// unit each projection must own (the L-shape samples its plane
+    /// edges; the cylinder is analytic). A defaulted implementation
+    /// would silently hand a new projection another one's boundary.
+    fn coverage(&self, calibration: &Calibration) -> CoverageBoundary;
 }
 
 /// Maximum Newton-Raphson iterations for KB4 inverse distortion.
@@ -268,17 +126,19 @@ const CONVERGENCE_EPS: f64 = 1e-10;
 /// Returns `None` if the inverse distortion fails to converge (rare,
 /// indicates an extreme point far outside the valid lens area).
 ///
+/// Returns `None` for plane-less topologies: the forward map inverts
+/// the L-shape's plane rasterization, and mono detection mapping is
+/// its own follow-up.
+///
 /// # Example
 ///
 /// ```rust
 /// use reco_core::projection::camera_to_panorama;
 /// use reco_core::geometry::CameraId;
 /// use reco_core::calibration::Calibration;
-/// use reco_core::render::scene::SceneGeometry;
 ///
 /// # fn example(cal: &Calibration) {
-/// let scene = SceneGeometry::for_calibration(cal);
-/// if let Some(pos) = camera_to_panorama(CameraId::Left, 0.5, 0.5, cal, &scene) {
+/// if let Some(pos) = camera_to_panorama(CameraId::Left, 0.5, 0.5, cal) {
 ///     println!("Center of left camera maps to yaw={:.3}, pitch={:.3}", pos.yaw, pos.pitch);
 /// }
 /// # }
@@ -288,7 +148,20 @@ pub fn camera_to_panorama(
     norm_x: f32,
     norm_y: f32,
     calibration: &Calibration,
-    scene: &SceneGeometry,
+) -> Option<ViewportPosition> {
+    let topology = calibration.topology.l_shape()?;
+    let scene = topology.scene(&calibration.framing, calibration.lenses[0].aspect());
+    camera_to_panorama_in_scene(camera, norm_x, norm_y, calibration, &scene)
+}
+
+/// [`camera_to_panorama`] against an already-derived plane scene - the
+/// coverage sampler maps thousands of edge points against one scene.
+pub(crate) fn camera_to_panorama_in_scene(
+    camera: CameraId,
+    norm_x: f32,
+    norm_y: f32,
+    calibration: &Calibration,
+    scene: &PlaneScene,
 ) -> Option<ViewportPosition> {
     let params = match camera {
         CameraId::Left => &calibration.lenses[0],
@@ -408,7 +281,7 @@ fn inverse_fisheye(dist_x: f64, dist_y: f64, params: &Lens) -> Option<(f64, f64)
 }
 
 /// Convert a plane UV (in extended shader space) to a 3D world point.
-fn plane_uv_to_world(uv: (f64, f64), camera: CameraId, scene: &SceneGeometry) -> Point3<f32> {
+fn plane_uv_to_world(uv: (f64, f64), camera: CameraId, scene: &PlaneScene) -> Point3<f32> {
     // Extended UV -> texture UV [0,1]
     let tex_u = ((uv.0 + 0.5) / 2.0) as f32;
     let tex_v = ((uv.1 + 0.5) / 2.0) as f32;
@@ -454,10 +327,14 @@ pub(crate) fn yaw_pitch_to_direction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibration::{Calibration, Framing, LShapeTopology, Lens};
+    use crate::calibration::{Calibration, Framing, Lens};
+    use crate::projection::LShape;
 
-    fn test_scene(cal: &Calibration) -> SceneGeometry {
-        SceneGeometry::for_calibration(cal)
+    fn test_scene(cal: &Calibration) -> PlaneScene {
+        cal.topology
+            .l_shape()
+            .unwrap()
+            .scene(&cal.framing, cal.lenses[0].aspect())
     }
 
     fn test_calibration() -> Calibration {
@@ -474,7 +351,7 @@ mod tests {
         };
         Calibration::new(
             vec![cam(), cam()],
-            LShapeTopology {
+            LShape {
                 intersect: 0.5446,
                 x_ty: 0.00476,
                 x_rz: 0.00753,
@@ -494,13 +371,12 @@ mod tests {
     #[test]
     fn optical_center_maps_to_known_position() {
         let cal = test_calibration();
-        let scene = test_scene(&cal);
 
         // Optical center of the left camera (cx/w, cy/h)
         let cx = cal.lenses[0].cx as f32 / cal.lenses[0].width as f32;
         let cy = cal.lenses[0].cy as f32 / cal.lenses[0].height as f32;
 
-        let pos = camera_to_panorama(CameraId::Left, cx, cy, &cal, &scene);
+        let pos = camera_to_panorama(CameraId::Left, cx, cy, &cal);
         assert!(pos.is_some(), "optical center should map successfully");
         let pos = pos.unwrap();
         // The optical center should produce a valid yaw/pitch (no NaN)
@@ -511,10 +387,9 @@ mod tests {
     #[test]
     fn left_camera_left_edge_yaw_differs_from_center() {
         let cal = test_calibration();
-        let scene = test_scene(&cal);
 
-        let center = camera_to_panorama(CameraId::Left, 0.5, 0.5, &cal, &scene).unwrap();
-        let left_edge = camera_to_panorama(CameraId::Left, 0.1, 0.5, &cal, &scene).unwrap();
+        let center = camera_to_panorama(CameraId::Left, 0.5, 0.5, &cal).unwrap();
+        let left_edge = camera_to_panorama(CameraId::Left, 0.1, 0.5, &cal).unwrap();
 
         // The left edge of the left camera image maps to a different
         // part of the panorama than the center; this test just
@@ -533,10 +408,9 @@ mod tests {
     #[test]
     fn right_camera_produces_different_yaw_than_left() {
         let cal = test_calibration();
-        let scene = test_scene(&cal);
 
-        let left_center = camera_to_panorama(CameraId::Left, 0.5, 0.5, &cal, &scene).unwrap();
-        let right_center = camera_to_panorama(CameraId::Right, 0.5, 0.5, &cal, &scene).unwrap();
+        let left_center = camera_to_panorama(CameraId::Left, 0.5, 0.5, &cal).unwrap();
+        let right_center = camera_to_panorama(CameraId::Right, 0.5, 0.5, &cal).unwrap();
 
         // The two cameras face different directions, so their centers
         // should map to different yaw values
@@ -739,7 +613,7 @@ mod tests {
     fn coverage_yaw_and_pitch_ranges_match_internal_state() {
         let cal = test_calibration();
         let scene = test_scene(&cal);
-        let coverage = CoverageBoundary::from_calibration(&cal, &scene);
+        let coverage = CoverageBoundary::from_l_shape(&cal, &scene);
 
         let (yaw_min, yaw_max) = coverage.yaw_range();
         assert!(yaw_min < yaw_max, "yaw range must be non-empty");
@@ -756,7 +630,7 @@ mod tests {
         // sample, since it's the envelope over all pitch slices.
         let cal = test_calibration();
         let scene = test_scene(&cal);
-        let coverage = CoverageBoundary::from_calibration(&cal, &scene);
+        let coverage = CoverageBoundary::from_l_shape(&cal, &scene);
 
         let (y_lo_global, y_hi_global) = coverage.yaw_range();
         let (p_lo, p_hi) = coverage.pitch_range();
@@ -820,7 +694,7 @@ mod tests {
     fn safe_clamp_rejects_nan_yaw() {
         let cal = test_calibration();
         let scene = test_scene(&cal);
-        let coverage = CoverageBoundary::from_calibration(&cal, &scene);
+        let coverage = CoverageBoundary::from_l_shape(&cal, &scene);
         let out = coverage.safe_clamp(f32::NAN, 0.0, 75.0, 16.0 / 9.0);
         assert!(out.yaw.is_finite(), "yaw must be finite, got {}", out.yaw);
         assert!(
@@ -834,7 +708,7 @@ mod tests {
     fn safe_clamp_rejects_nan_pitch() {
         let cal = test_calibration();
         let scene = test_scene(&cal);
-        let coverage = CoverageBoundary::from_calibration(&cal, &scene);
+        let coverage = CoverageBoundary::from_l_shape(&cal, &scene);
         let out = coverage.safe_clamp(0.0, f32::NAN, 75.0, 16.0 / 9.0);
         assert!(out.yaw.is_finite());
         assert!(out.pitch.is_finite());
@@ -844,7 +718,7 @@ mod tests {
     fn safe_clamp_rejects_nan_fov() {
         let cal = test_calibration();
         let scene = test_scene(&cal);
-        let coverage = CoverageBoundary::from_calibration(&cal, &scene);
+        let coverage = CoverageBoundary::from_l_shape(&cal, &scene);
         let out = coverage.safe_clamp(0.0, 0.0, f32::NAN, 16.0 / 9.0);
         assert!(out.yaw.is_finite());
         assert!(out.pitch.is_finite());
@@ -854,7 +728,7 @@ mod tests {
     fn safe_clamp_rejects_infinite_inputs() {
         let cal = test_calibration();
         let scene = test_scene(&cal);
-        let coverage = CoverageBoundary::from_calibration(&cal, &scene);
+        let coverage = CoverageBoundary::from_l_shape(&cal, &scene);
         let out = coverage.safe_clamp(f32::INFINITY, 0.0, 75.0, 16.0 / 9.0);
         assert!(out.yaw.is_finite());
         assert!(out.pitch.is_finite());
@@ -867,20 +741,23 @@ mod tests {
 
     #[test]
     fn l_shape_projection_identifies_itself() {
-        let p = LShapeProjection;
+        let cal = test_calibration();
+        let p = cal.topology.projection();
         assert_eq!(p.name(), "l-shape-stereo-2camera");
         assert_eq!(p.camera_count(), 2);
     }
 
     #[test]
     fn projection_is_dyn_compatible() {
-        // Core invariant: StitchCore will hold `Box<dyn Projection>`.
-        // Verify the trait bounds allow that today and that Send+Sync
-        // both hold.
-        let projections: Vec<Box<dyn Projection>> = vec![Box::new(LShapeProjection)];
+        // Core invariant: the engine reads `&dyn Projection` straight
+        // out of the document (zero-copy), and injected overrides ride
+        // as `Box<dyn Projection>`. Verify the trait bounds allow both
+        // and that Send+Sync hold.
+        let cal = test_calibration();
+        let p: &dyn Projection = cal.topology.projection();
         fn assert_send_sync<T: Send + Sync + ?Sized>() {}
         assert_send_sync::<dyn Projection>();
-        assert_eq!(projections[0].camera_count(), 2);
+        assert_eq!(p.camera_count(), 2);
     }
 
     #[test]
@@ -889,21 +766,27 @@ mod tests {
         // then the right fading in with the calibration's seam width.
         let cal = test_calibration();
         let config = crate::render::viewport::ViewportConfig::default();
-        let surfaces = LShapeProjection.surface_maps(&cal, &config, 0.0, 0.0);
+        let surfaces = cal.topology.projection().surface_maps(&ProjectionContext {
+            calibration: &cal,
+            viewport: &config,
+            yaw: 0.0,
+            pitch: 0.0,
+        });
         assert_eq!(surfaces.len(), 2);
         assert_eq!(surfaces[0].1, crate::stitch::BlendRule::Opaque);
+        let seam = cal.topology.l_shape().unwrap().blend_width;
         assert_eq!(
             surfaces[1].1,
-            crate::stitch::BlendRule::Smoothstep(cal.topology.blend_width() as f64)
+            crate::stitch::BlendRule::Smoothstep(seam as f64)
         );
     }
 
-    // ---- CylindricalProjection ---------------------------------------------
+    // ---- Cylinder projection ----------------------------------------------
 
     fn cylinder_cal() -> Calibration {
         Calibration::new(
             vec![Lens::flat(3840, 1080)],
-            crate::calibration::CylinderTopology::default(),
+            crate::projection::Cylinder::default(),
             Framing {
                 axis_offset: 0.0,
                 tilt: 0.0,
@@ -914,7 +797,8 @@ mod tests {
 
     #[test]
     fn cylindrical_projection_reports_mono() {
-        let p = CylindricalProjection;
+        let cal = cylinder_cal();
+        let p = cal.topology.projection();
         assert_eq!(p.name(), "cylindrical-mono-1camera");
         assert_eq!(
             p.camera_count(),
@@ -927,7 +811,12 @@ mod tests {
     fn cylindrical_surface_maps_emit_one_opaque_surface() {
         let cal = cylinder_cal();
         let config = crate::render::viewport::ViewportConfig::default();
-        let surfaces = CylindricalProjection.surface_maps(&cal, &config, 0.0, 0.0);
+        let surfaces = cal.topology.projection().surface_maps(&ProjectionContext {
+            calibration: &cal,
+            viewport: &config,
+            yaw: 0.0,
+            pitch: 0.0,
+        });
         assert_eq!(surfaces.len(), 1);
         assert_eq!(surfaces[0].1, crate::stitch::BlendRule::Opaque);
         assert!(
@@ -942,8 +831,7 @@ mod tests {
     #[test]
     fn cylindrical_coverage_is_the_analytic_rectangle() {
         let cal = cylinder_cal();
-        let scene = SceneGeometry::for_calibration(&cal);
-        let coverage = CylindricalProjection.coverage(&cal, &scene);
+        let coverage = cal.topology.projection().coverage(&cal);
         let (y_lo, y_hi) = coverage.yaw_range();
         assert!(
             (y_lo + std::f32::consts::FRAC_PI_2).abs() < 1e-5,
@@ -961,30 +849,34 @@ mod tests {
     }
 
     #[test]
-    fn for_topology_resolves_the_matching_projection() {
-        let l = for_topology(&test_calibration().topology);
-        assert_eq!(l.camera_count(), 2);
-        let c = for_topology(&cylinder_cal().topology);
-        assert_eq!(c.camera_count(), 1);
+    fn topology_projection_resolves_the_matching_variant() {
+        let l = test_calibration();
+        assert_eq!(l.topology.projection().camera_count(), 2);
+        let c = cylinder_cal();
+        assert_eq!(c.topology.projection().camera_count(), 1);
     }
 
     #[test]
     fn projection_dyn_dispatch_round_trip_with_mixed_camera_counts() {
         // Compile-time: the trait is object-safe, so one collection
         // holds impls with different `camera_count()` results - what
-        // lets `for_topology` pick the projection at calibration-load
-        // time. The assertions pin the per-projection counts and that
-        // the diagnostic names stay distinct.
-        let projections: Vec<Box<dyn Projection>> =
-            vec![Box::new(LShapeProjection), Box::new(CylindricalProjection)];
+        // lets an injected `Box<dyn Projection>` override the document.
+        // The assertions pin the per-projection counts and that the
+        // diagnostic names stay distinct.
+        let l = test_calibration().topology.l_shape().unwrap().clone();
+        let projections: Vec<Box<dyn Projection>> = vec![
+            Box::new(l),
+            Box::new(crate::projection::Cylinder::default()),
+        ];
         assert_eq!(projections[0].camera_count(), 2);
         assert_eq!(projections[1].camera_count(), 1);
         assert_ne!(projections[0].name(), projections[1].name());
     }
 
     #[test]
-    fn cylindrical_projection_is_send_sync() {
+    fn projection_params_are_send_sync() {
         fn assert_send_sync<T: Send + Sync + 'static>() {}
-        assert_send_sync::<CylindricalProjection>();
+        assert_send_sync::<LShape>();
+        assert_send_sync::<crate::projection::Cylinder>();
     }
 }

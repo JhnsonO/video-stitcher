@@ -121,7 +121,7 @@ pub(crate) fn stitch_rgba_yuv420p(
 /// The number of input frames must match what the projection consumes;
 /// a mismatch would silently sample the wrong camera.
 fn check_camera_count(projection: &dyn Projection, planes: usize) -> Result<(), StitchError> {
-    if planes != usize::from(projection.camera_count()) {
+    if planes != projection.camera_count() {
         return Err(StitchError::InvalidConfig(format!(
             "projection '{}' consumes {} camera(s) but {planes} frame(s) were supplied",
             projection.name(),
@@ -145,7 +145,13 @@ fn stitch_with(
     pitch: f32,
     samplers: &[impl Fn(f64, f64) -> [f64; 3]],
 ) -> Vec<u8> {
-    let surfaces = projection.surface_maps(calib, config, yaw, pitch);
+    let ctx = crate::projection::ProjectionContext {
+        calibration: calib,
+        viewport: config,
+        yaw,
+        pitch,
+    };
+    let surfaces = projection.surface_maps(&ctx);
     let sampler_refs: Vec<&dyn Fn(f64, f64) -> [f64; 3]> = samplers
         .iter()
         .map(|s| s as &dyn Fn(f64, f64) -> [f64; 3])

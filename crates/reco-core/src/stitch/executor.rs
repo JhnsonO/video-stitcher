@@ -8,7 +8,7 @@
 //! [`GpuExecutor`], reached through [`crate::core::StitchCore`], which owns
 //! one executor as its render substrate.
 //!
-//! - [`CpuExecutor`] binds a [`Projection`] and drives the pure-Rust gather.
+//! - [`CpuExecutor`] reads the document's [`Projection`] and drives the pure-Rust gather.
 //! - [`GpuExecutor`] owns the wgpu `StitchPipeline` (there is no other
 //!   owner) plus a private blocking-readback ring for the synchronous
 //!   contract.
@@ -27,7 +27,7 @@ use crate::render::pipeline::{PipelineError, StitchPipeline};
 use crate::render::planes::{Nv12Planes, YuvPlanes};
 #[cfg(feature = "gpu")]
 use crate::render::renderer::InputFormat;
-use crate::render::scene::SceneGeometry;
+
 use crate::render::viewport::ViewportConfig;
 
 use crate::projection::Projection;
@@ -86,23 +86,18 @@ pub trait StitchExecutor {
 
 /// CPU software backend - pure Rust, no GPU. The portable / GPU-less path.
 pub struct CpuExecutor {
-    /// The bound projection: dispatches the per-frame surface maps.
-    pub(crate) projection: Box<dyn Projection>,
     pub(crate) calib: Calibration,
     pub(crate) config: ViewportConfig,
     pub(crate) cam: (u32, u32),
     pub(crate) full_range: bool,
-    /// Plane-placement geometry derived from `calib`, cached for the
-    /// engine's coverage construction (the stitch kernel re-derives its
-    /// own per call). Rebuilt by the [`Executor`] mutation methods.
-    pub(crate) scene: SceneGeometry,
 }
 
 impl CpuExecutor {
-    /// Configure a CPU executor: bind a projection to a fixed source size
-    /// and output viewport.
+    /// Configure a CPU executor for a fixed source size and output
+    /// viewport. The projection is the calibration document's topology
+    /// (zero-copy: the document is the engine), so a document edit
+    /// switches the projection automatically.
     pub fn new(
-        projection: Box<dyn Projection>,
         calib: Calibration,
         config: ViewportConfig,
         cam_w: u32,
@@ -113,28 +108,27 @@ impl CpuExecutor {
             .validate()
             .map_err(|e| StitchError::InvalidConfig(e.to_string()))?;
         config.validate().map_err(StitchError::InvalidConfig)?;
-        if usize::from(projection.camera_count()) != calib.lenses.len() {
-            return Err(StitchError::InvalidConfig(format!(
-                "projection '{}' consumes {} cameras but the calibration has {} lenses",
-                projection.name(),
-                projection.camera_count(),
-                calib.lenses.len()
-            )));
-        }
         if cam_w < 2 || cam_h < 2 {
             return Err(StitchError::InvalidConfig(format!(
                 "source dimensions must be >= 2, got {cam_w}x{cam_h}"
             )));
         }
-        let scene = derive_scene(&calib);
+        log::debug!(
+            "CpuExecutor: projection '{}' from the calibration topology",
+            calib.topology.projection().name()
+        );
+
         Ok(Self {
-            projection,
             calib,
             config,
             cam: (cam_w, cam_h),
             full_range,
-            scene,
         })
+    }
+
+    /// The projection in effect: a borrow of the document's topology.
+    pub(crate) fn projection(&self) -> &dyn Projection {
+        self.calib.topology.projection()
     }
 
     /// Stitch one NV12 frame pair to RGBA at the configured output
@@ -148,7 +142,7 @@ impl CpuExecutor {
         pitch: f32,
     ) -> Result<Vec<u8>, StitchError> {
         stitch_rgba(
-            self.projection.as_ref(),
+            self.projection(),
             planes,
             self.cam,
             &self.calib,
@@ -171,7 +165,7 @@ impl CpuExecutor {
         pitch: f32,
     ) -> Result<Vec<u8>, StitchError> {
         super::cpu::stitch_rgba_yuv420p(
-            self.projection.as_ref(),
+            self.projection(),
             planes,
             self.cam,
             &self.calib,
@@ -181,14 +175,6 @@ impl CpuExecutor {
             self.full_range,
         )
     }
-}
-
-/// Plane-placement geometry for a calibration document (both stereo
-/// cameras share the lens aspect). One derivation, shared by the CPU
-/// executor's cache and its mutation paths - mirrors what
-/// `StitchPipeline::update_calibration` does on the GPU side.
-fn derive_scene(calib: &Calibration) -> SceneGeometry {
-    SceneGeometry::for_calibration(calib)
 }
 
 impl StitchExecutor for CpuExecutor {
@@ -284,9 +270,11 @@ impl GpuExecutorConfig {
 #[cfg(feature = "gpu")]
 pub struct GpuExecutor {
     pub(crate) pipeline: StitchPipeline,
-    /// The bound projection: supplied the pipeline's GPU program at
-    /// construction and dispatches coverage construction for the engine.
-    pub(crate) projection: Box<dyn Projection>,
+    /// Out-of-tree projection override, when one was injected through
+    /// [`GpuExecutorConfig::projection`]. `None` = the projection is
+    /// the calibration document's topology (zero-copy), read through
+    /// [`Self::projection`].
+    pub(crate) injected: Option<Box<dyn Projection>>,
     /// Resident-frame machinery: shared decode textures, the VRAM
     /// lookahead pool, decode backpressure. Populated lazily by the
     /// configure/stage methods; empty for pure CPU-frame consumers.
@@ -309,30 +297,40 @@ impl GpuExecutor {
     /// pull an async runtime into non-test code; callers create it via
     /// [`GpuContext::new`].
     pub fn new(gpu: GpuContext, config: GpuExecutorConfig) -> Result<Self, StitchError> {
-        let projection: Box<dyn Projection> = config.projection.unwrap_or_else(|| {
-            let p = crate::projection::for_topology(&config.calibration.topology);
-            log::debug!(
-                "no projection injected; resolved '{}' from the calibration topology",
-                p.name()
-            );
-            p
-        });
-        if usize::from(projection.camera_count()) != config.calibration.lenses.len() {
-            return Err(StitchError::InvalidConfig(format!(
-                "projection '{}' consumes {} cameras but the calibration has {} lenses",
+        let injected = config.projection;
+        {
+            let projection: &dyn Projection = injected
+                .as_deref()
+                .unwrap_or_else(|| config.calibration.topology.projection());
+            // The document's own projection always matches its lens
+            // count (validate() gates it); only an injected override
+            // can disagree, so the check is really for that case.
+            if projection.camera_count() != config.calibration.lenses.len() {
+                return Err(StitchError::InvalidConfig(format!(
+                    "projection '{}' consumes {} cameras but the calibration has {} lenses",
+                    projection.name(),
+                    projection.camera_count(),
+                    config.calibration.lenses.len()
+                )));
+            }
+            log::info!(
+                "GpuExecutor: projection '{}' ({}) supplies the GPU program and coverage",
                 projection.name(),
-                projection.camera_count(),
-                config.calibration.lenses.len()
-            )));
+                if injected.is_some() {
+                    "injected override"
+                } else {
+                    "from the calibration topology"
+                }
+            );
         }
-        log::info!(
-            "GpuExecutor: projection '{}' supplies the GPU program and coverage",
-            projection.name()
-        );
+        let program = injected
+            .as_deref()
+            .unwrap_or_else(|| config.calibration.topology.projection())
+            .gpu_program();
         // Calibration validation happens once, inside with_gpu.
         let mut pipeline = StitchPipeline::with_gpu(
             gpu,
-            &projection.gpu_program(),
+            &program,
             config.calibration,
             config.viewport,
             config.input_width,
@@ -343,7 +341,7 @@ impl GpuExecutor {
         pipeline.set_full_range(config.full_range);
         Ok(Self {
             pipeline,
-            projection,
+            injected,
             residency: super::residency::Residency::default(),
             sync_readback: None,
             nv12: None,
@@ -425,7 +423,7 @@ impl GpuExecutor {
         })?;
         Ok(self
             .pipeline
-            .render_gpu_frame(bind_groups, left_slot, right_slot, yaw, pitch))
+            .render_gpu_frame(bind_groups, left_slot, right_slot, yaw, pitch)?)
     }
 
     /// Render from a VRAM lookahead pool slot (buffered path).
@@ -434,18 +432,18 @@ impl GpuExecutor {
         slot: usize,
         yaw: f32,
         pitch: f32,
-    ) -> wgpu::CommandBuffer {
+    ) -> Result<wgpu::CommandBuffer, StitchError> {
         let pool = self
             .residency
             .pool
             .as_ref()
             .expect("render_pool_slot requires the lookahead pool");
-        self.pipeline.render_with_bind_groups(
+        Ok(self.pipeline.render_with_bind_groups(
             pool.left_bind_group(slot),
             pool.right_bind_group(slot),
             yaw,
             pitch,
-        )
+        )?)
     }
 
     /// Copy the shared decode slots into a pool slot so the decode
@@ -808,7 +806,7 @@ impl GpuExecutor {
             pool.uv_view(right_slot),
             yaw,
             pitch,
-        ))
+        )?)
     }
 
     /// Y/UV detection views over two staged slots, Arc-cloned so
@@ -1035,21 +1033,16 @@ impl Executor {
         }
     }
 
-    /// The derived plane-placement geometry for the active calibration.
-    pub fn scene(&self) -> &SceneGeometry {
-        match self {
-            Executor::Cpu(c) => &c.scene,
-            #[cfg(feature = "gpu")]
-            Executor::Gpu(g) => &g.pipeline.scene,
-        }
-    }
-
-    /// The bound projection.
+    /// The projection in effect: the calibration document's topology,
+    /// unless the GPU arm carries an injected override.
     pub fn projection(&self) -> &dyn Projection {
         match self {
-            Executor::Cpu(c) => c.projection.as_ref(),
+            Executor::Cpu(c) => c.projection(),
             #[cfg(feature = "gpu")]
-            Executor::Gpu(g) => g.projection.as_ref(),
+            Executor::Gpu(g) => g
+                .injected
+                .as_deref()
+                .unwrap_or_else(|| g.pipeline.calibration.topology.projection()),
         }
     }
 
@@ -1165,7 +1158,6 @@ impl Executor {
     pub fn update_calibration(&mut self, calibration: Calibration) {
         match self {
             Executor::Cpu(c) => {
-                c.scene = derive_scene(&calibration);
                 c.calib = calibration;
             }
             #[cfg(feature = "gpu")]
@@ -1178,7 +1170,6 @@ impl Executor {
         match self {
             Executor::Cpu(c) => {
                 c.calib.topology = topology;
-                c.scene = derive_scene(&c.calib);
             }
             #[cfg(feature = "gpu")]
             Executor::Gpu(g) => g.pipeline.update_topology(topology),
@@ -1190,7 +1181,6 @@ impl Executor {
         match self {
             Executor::Cpu(c) => {
                 c.calib.framing = framing;
-                c.scene = derive_scene(&c.calib);
             }
             #[cfg(feature = "gpu")]
             Executor::Gpu(g) => g.pipeline.update_framing(framing),
@@ -1207,7 +1197,6 @@ impl Executor {
                 if let Some(r) = right {
                     c.calib.lenses[1] = r;
                 }
-                c.scene = derive_scene(&c.calib);
             }
             #[cfg(feature = "gpu")]
             Executor::Gpu(g) => g.pipeline.update_camera_params(left, right),
@@ -1268,8 +1257,6 @@ mod tests {
     fn clamped_poses_render_no_black_edges() {
         use crate::geometry::VirtualCamera;
         use crate::geometry::resolve_render_pose;
-        use crate::projection::CoverageBoundary;
-        use crate::render::scene::SceneGeometry;
 
         let (cam_w, cam_h) = (256u32, 144u32);
         let (out_w, out_h) = (192u32, 108u32);
@@ -1301,24 +1288,16 @@ mod tests {
             let mut cal = calib(cam_w, cam_h);
             cal.framing.tilt = tilt;
             cal.framing.roll = roll;
-            let scene = SceneGeometry::for_calibration(&cal);
-            let coverage = CoverageBoundary::from_calibration(&cal, &scene);
-            let cam = VirtualCamera::new(&scene.camera_position);
+            let coverage = cal.topology.projection().coverage(&cal);
+            let cam = VirtualCamera::new(&cal.topology.projection().camera_position(&cal.framing));
             let fov = (coverage.max_fov_degrees() * fov_factor).min(60.0);
             let config = ViewportConfig {
                 width: out_w,
                 height: out_h,
                 fov_degrees: fov,
             };
-            let mut backend = CpuExecutor::new(
-                Box::new(crate::projection::LShapeProjection),
-                cal.clone(),
-                config,
-                cam_w,
-                cam_h,
-                false,
-            )
-            .expect("cpu");
+            let mut backend =
+                CpuExecutor::new(cal.clone(), config, cam_w, cam_h, false).expect("cpu");
 
             for &(wy, wp) in &[
                 (0.0f32, 0.0f32),
@@ -1356,7 +1335,6 @@ mod tests {
     fn cpu_backend_reports_dims_and_name() {
         let (w, h) = (64u32, 36u32);
         let backend = CpuExecutor::new(
-            Box::new(crate::projection::LShapeProjection),
             calib(w, h),
             ViewportConfig {
                 width: w,
@@ -1376,7 +1354,6 @@ mod tests {
     fn cpu_backend_rejects_undersized_planes() {
         let (w, h) = (64u32, 36u32);
         let mut backend = CpuExecutor::new(
-            Box::new(crate::projection::LShapeProjection),
             calib(w, h),
             ViewportConfig {
                 width: w,
@@ -1419,15 +1396,8 @@ mod tests {
         let right = Nv12Planes { y: &ry, uv: &ruv };
         let (yaw, pitch) = (0.08f32, -0.04f32);
 
-        let mut cpu = CpuExecutor::new(
-            Box::new(crate::projection::LShapeProjection),
-            calib.clone(),
-            config.clone(),
-            cam_w,
-            cam_h,
-            false,
-        )
-        .expect("cpu backend");
+        let mut cpu = CpuExecutor::new(calib.clone(), config.clone(), cam_w, cam_h, false)
+            .expect("cpu backend");
         let mut gpu = GpuExecutor::new(
             gpu,
             GpuExecutorConfig {
