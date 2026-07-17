@@ -30,7 +30,7 @@
 
 use reco_core::detect::panner::{PanContext, Panner};
 use reco_core::detect::tracker::{TrackState, TrackedEntity, WorldState};
-use reco_core::geometry::ViewportPosition;
+use reco_core::geometry::Pose;
 use serde::{Deserialize, Serialize};
 
 const LOG_INTERVAL: u64 = 30;
@@ -784,7 +784,7 @@ impl Default for FieldPanner {
 }
 
 impl Panner for FieldPanner {
-    fn decide(&mut self, world: &WorldState, ctx: &PanContext<'_>) -> ViewportPosition {
+    fn decide(&mut self, world: &WorldState, ctx: &PanContext<'_>) -> Pose {
         // No buffer: empty future, so the reactive (non-lookahead)
         // damping profile and no lead.
         self.decide_with_lookahead(world, &[], ctx)
@@ -795,7 +795,7 @@ impl Panner for FieldPanner {
         world: &WorldState,
         future: &[WorldState],
         _ctx: &PanContext<'_>,
-    ) -> ViewportPosition {
+    ) -> Pose {
         reco_core::profile_scope!("field_panner_decide");
 
         // Once a non-empty lookahead buffer is seen, stay in the
@@ -1020,10 +1020,10 @@ impl Panner for FieldPanner {
             );
         }
 
-        ViewportPosition {
+        Pose {
             yaw: self.yaw,
             pitch: self.pitch,
-            fov_degrees: Some(self.current_fov),
+            fov_degrees: self.current_fov,
         }
     }
 
@@ -1165,7 +1165,7 @@ mod tests {
         PanContext {
             frame_index,
             timestamp_ms: frame_index as f64 * (1000.0 / 30.0),
-            previous_position: ViewportPosition::default(),
+            previous_position: Pose::default(),
             calibration: cal,
         }
     }
@@ -1505,7 +1505,7 @@ mod tests {
         let mut p = FieldPanner::new(30.0);
         let cal = cal();
         let out = p.decide(&tight_world(), &ctx(0, &cal));
-        assert!(out.fov_degrees.is_some());
+        assert!(out.fov_degrees.is_finite() && out.fov_degrees > 0.0);
     }
 
     fn frame_all_config() -> FieldPannerConfig {

@@ -24,6 +24,7 @@ use std::time::Instant;
 use reco_control::pose_control::HotkeyIntent;
 use reco_control::{ControlIntent, PoseIntent};
 use reco_core::core::StitchCore;
+use reco_core::render::viewport::ViewportSize;
 use reco_core::sink::{OutputFrame, OutputSink, PixelFormat};
 use reco_core::source::{FrameSource, YuvData};
 use reco_core::stitch::{Executor, GpuExecutor, GpuExecutorConfig};
@@ -175,7 +176,7 @@ pub fn run_preview(
 
         pose: {
             use reco_control::pose_control::{PoseControl, PoseControlConfig};
-            use reco_core::geometry::ViewportPosition;
+            use reco_core::geometry::Pose;
             // Match preview's historical feel: 0.005 rad/px drag,
             // 0.05 rad arrow step, 3.0 deg scroll step, 0.3 smoothing.
             // `invert_drag_x = true` reproduces preview's "drag right
@@ -191,10 +192,10 @@ pub fn run_preview(
                 hotkey_yaw_step_rad: ARROW_PAN_STEP,
                 hotkey_pitch_step_rad: ARROW_PAN_STEP,
                 hotkey_fov_step_deg: FOV_KEY_STEP,
-                rest_pose: ViewportPosition {
+                rest_pose: Pose {
                     yaw: 0.0,
                     pitch: 0.0,
-                    fov_degrees: Some(initial_fov),
+                    fov_degrees: initial_fov,
                 },
             })
         },
@@ -362,13 +363,8 @@ impl App {
                 let mut cfg = *self.pose.config();
                 cfg.fov_max_degrees = self.max_fov;
                 self.pose.set_config(cfg);
-                self.pose.set_target_fov(
-                    self.pose
-                        .target_pose()
-                        .fov_degrees
-                        .unwrap_or(self.max_fov)
-                        .min(self.max_fov),
-                );
+                self.pose
+                    .set_target_fov(self.pose.target_pose().fov_degrees.min(self.max_fov));
             }
         }
         self.needs_redraw = true;
@@ -441,7 +437,7 @@ impl App {
         let after = self.pose.current_pose();
         let dy = (after.yaw - before.yaw).abs();
         let dp = (after.pitch - before.pitch).abs();
-        let df = after.fov_degrees.unwrap_or(0.0) - before.fov_degrees.unwrap_or(0.0);
+        let df = after.fov_degrees - before.fov_degrees;
         dy > EPSILON || dp > EPSILON || df.abs() > FOV_EPSILON
     }
 }
@@ -497,22 +493,20 @@ impl ApplicationHandler for App {
         // (Blend was already resolved onto self.cal at load.)
         self.cal.framing.tilt = self.rig_tilt as f64;
         self.cal.framing.roll = self.rig_roll as f64;
-        let viewport = reco_core::render::viewport::ViewportConfig {
+        let viewport_size = ViewportSize {
             width: self.width,
             height: self.height,
-            ..Default::default()
         };
 
         let executor = GpuExecutor::new(
             gpu,
             GpuExecutorConfig {
                 calibration: self.cal.clone(),
-                viewport,
+                viewport_size,
                 input_width: self.input_width,
                 input_height: self.input_height,
                 input_format: reco_core::render::renderer::InputFormat::Yuv420p,
                 output_format: reco_core::render::strip_srgb(surface_format),
-                projection: None,
                 full_range: false,
             },
         )
@@ -995,8 +989,7 @@ impl ApplicationHandler for App {
         let current = self.pose.current_pose();
         let smoothing_active = (target.yaw - current.yaw).abs() > 0.0001
             || (target.pitch - current.pitch).abs() > 0.0001
-            || (target.fov_degrees.unwrap_or(0.0) - current.fov_degrees.unwrap_or(0.0)).abs()
-                > 0.01;
+            || (target.fov_degrees - current.fov_degrees).abs() > 0.01;
 
         // Execute coalesced seek: rapid key presses accumulate into
         // pending_seek; only the final target runs here (one seek

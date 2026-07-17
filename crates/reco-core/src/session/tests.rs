@@ -17,9 +17,9 @@ use crate::detect::director::MappedDetection;
 use crate::detect::panner::{PanContext, Panner};
 use crate::detect::tracker::{TrackState, TrackedEntity, Tracker, WorldState};
 use crate::geometry::CameraId;
-use crate::geometry::ViewportPosition;
+use crate::geometry::Pose;
 use crate::projection::LShape;
-use crate::render::viewport::ViewportConfig;
+use crate::render::viewport::ViewportSize;
 use crate::sink::{OutputFrame, OutputSink, SinkError, SinkInput};
 use crate::source::{FramePair, FrameSource, SourceError, SourceInfo, StereoFrame, YuvData};
 
@@ -183,11 +183,11 @@ impl Tracker for MockTracker {
 
 /// Mock panner that returns a fixed position regardless of the world.
 struct MockPanner {
-    position: ViewportPosition,
+    position: Pose,
 }
 
 impl Panner for MockPanner {
-    fn decide(&mut self, _world: &WorldState, _ctx: &PanContext<'_>) -> ViewportPosition {
+    fn decide(&mut self, _world: &WorldState, _ctx: &PanContext<'_>) -> Pose {
         self.position
     }
 }
@@ -234,19 +234,19 @@ impl OutputSink for MockEncoder {
 /// frame. Two entry points driving one AI stack must produce
 /// identical logs.
 struct RecordingPanner {
-    log: Arc<Mutex<Vec<(u64, ViewportPosition)>>>,
+    log: Arc<Mutex<Vec<(u64, Pose)>>>,
 }
 
 impl Panner for RecordingPanner {
-    fn decide(&mut self, _world: &WorldState, ctx: &PanContext<'_>) -> ViewportPosition {
+    fn decide(&mut self, _world: &WorldState, ctx: &PanContext<'_>) -> Pose {
         self.log
             .lock()
             .unwrap()
             .push((ctx.frame_index, ctx.previous_position));
-        ViewportPosition {
+        Pose {
             yaw: 0.001 * ctx.frame_index as f32,
             pitch: -0.0005 * ctx.frame_index as f32,
-            fov_degrees: None,
+            ..Default::default()
         }
     }
 }
@@ -257,11 +257,11 @@ impl Panner for RecordingPanner {
 struct NanPanner;
 
 impl Panner for NanPanner {
-    fn decide(&mut self, _world: &WorldState, _ctx: &PanContext<'_>) -> ViewportPosition {
-        ViewportPosition {
+    fn decide(&mut self, _world: &WorldState, _ctx: &PanContext<'_>) -> Pose {
+        Pose {
             yaw: f32::NAN,
             pitch: f32::NAN,
-            fov_degrees: None,
+            ..Default::default()
         }
     }
 }
@@ -279,10 +279,9 @@ fn build_test_session(
     let mut builder = StitchSession::builder()
         .calibration(test_calibration())
         .input_dimensions(W, H)
-        .viewport(ViewportConfig {
+        .viewport_size(ViewportSize {
             width: 64,
             height: 64,
-            fov_degrees: 75.0,
         })
         .detection_interval(detection_interval);
 
@@ -360,7 +359,7 @@ fn tracker_receives_detections() {
         .expect("session build");
     session.set_ball_tracker(Box::new(tracker));
     session.set_panner(Box::new(MockPanner {
-        position: ViewportPosition::default(),
+        position: Pose::default(),
     }));
 
     let mut source = MockSource::new(3);
@@ -567,10 +566,9 @@ fn push_and_pull_share_one_ai_brain() {
     let executor = crate::stitch::GpuExecutor::new(
         gpu,
         crate::stitch::GpuExecutorConfig {
-            viewport: ViewportConfig {
+            viewport_size: ViewportSize {
                 width: 64,
                 height: 64,
-                fov_degrees: 75.0,
             },
             ..crate::stitch::GpuExecutorConfig::new(
                 test_calibration(),
@@ -631,10 +629,9 @@ fn push_and_pull_share_one_ai_brain() {
 fn build_cpu_session() -> StitchSession {
     let executor = crate::stitch::CpuExecutor::new(
         test_calibration(),
-        ViewportConfig {
+        ViewportSize {
             width: 64,
             height: 64,
-            fov_degrees: 75.0,
         },
         W,
         H,
@@ -808,10 +805,9 @@ fn mono_cylinder_session_runs_end_to_end_without_gpu() {
     );
     let executor = crate::stitch::CpuExecutor::new(
         cal,
-        ViewportConfig {
+        ViewportSize {
             width: 64,
             height: 64,
-            fov_degrees: 60.0,
         },
         W,
         H,

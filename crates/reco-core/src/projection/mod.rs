@@ -29,7 +29,7 @@ pub use geometry::point_in_polygon;
 
 use crate::calibration::{Calibration, Framing, Lens};
 use crate::geometry::CameraId;
-use crate::geometry::ViewportPosition;
+use crate::geometry::Pose;
 use crate::geometry::VirtualCamera;
 use crate::stitch::{BlendRule, SurfaceMap};
 use l_shape::PlaneScene;
@@ -40,27 +40,28 @@ use nalgebra::{Point3, Vector3};
 // The Projection trait: L1 geometry dispatch.
 // ---------------------------------------------------------------------------
 //
-// StitchCore holds a `Box<dyn Projection>` so alt-projections (the mono
-// cylinder next, N-camera later) are drop-in additions without reshaping
-// the core API. The trait dispatches the CPU surface maps and coverage
-// construction today; the GPU program descriptor joins at the
-// projection-shader step, and the detection-side forward maps
-// (`camera_to_panorama`) fold in once their `CameraId`/`ViewportPosition`
-// currency moves out of the detect layer.
+// The calibration document owns the projection: `Topology::projection()`
+// borrows the topology's parameter struct as `&dyn Projection`, so
+// alt-projections (the mono cylinder today, N-camera later) are drop-in
+// additions without reshaping the core API and without a second object
+// to keep in sync. The trait dispatches the CPU surface maps, the GPU
+// program descriptor, coverage construction and the virtual-camera
+// basis; the detection-side forward maps (`camera_to_panorama`) are
+// the next fold-in - their `CameraId`/`Pose` currency already lives in
+// the geometry leaf, so nothing blocks the move.
 
 /// One frame's geometry question, bundled: the document, the output
-/// viewport, and the pan state. FOV is deliberately absent - it is
-/// resolved into `viewport.fov_degrees` before any render call, so a
-/// second copy here could only disagree.
+/// viewport, and the pose. The pose carries fov alongside yaw/pitch -
+/// [`ViewportSize`](crate::render::viewport::ViewportSize) is
+/// zoom-free, so there is exactly one fov per frame and a second,
+/// disagreeing copy is unrepresentable.
 pub struct ProjectionContext<'a> {
     /// The calibration document (lenses, topology, framing).
     pub calibration: &'a Calibration,
-    /// Output viewport (dimensions + resolved FOV).
-    pub viewport: &'a crate::render::viewport::ViewportConfig,
-    /// Horizontal pan in radians.
-    pub yaw: f32,
-    /// Vertical pan in radians.
-    pub pitch: f32,
+    /// Output viewport geometry (dimensions).
+    pub viewport_size: &'a crate::render::viewport::ViewportSize,
+    /// The render pose: yaw/pitch pan plus fov zoom, one bundle.
+    pub pose: Pose,
 }
 
 /// A panoramic projection geometry.
@@ -84,11 +85,12 @@ pub trait Projection: Send + Sync {
     /// 2 for today's L-shape stereo, N>2 for future panoramic rigs.
     fn camera_count(&self) -> usize;
 
-    /// The virtual camera's position in world space - the eye every
-    /// view matrix and pose basis is built from. The one piece of
-    /// scene state every projection has, plane-backed or not (the
-    /// mono cylinder's camera sits at the `[0, 0, 1]` convention).
-    fn camera_position(&self, framing: &Framing) -> [f32; 3];
+    /// The virtual camera basis - the eye position plus the yaw/pitch
+    /// decomposition axes every view matrix and pose conversion is
+    /// built from. The one piece of scene state every projection has,
+    /// plane-backed or not (the mono cylinder's camera sits at the
+    /// `[0, 0, 1]` convention).
+    fn virtual_camera(&self, framing: &Framing) -> VirtualCamera;
 
     /// The ordered surface list for one frame: each surface's inverse
     /// map paired with how it blends over the surfaces before it.
@@ -96,12 +98,18 @@ pub trait Projection: Send + Sync {
     /// the base. The CPU composite drives these directly.
     fn surface_maps(&self, ctx: &ProjectionContext) -> Vec<(Box<dyn SurfaceMap>, BlendRule)>;
 
-    /// The GPU program this projection composites with. The render
-    /// pipeline compiles and binds exactly what the descriptor says -
-    /// the GPU dual of [`surface_maps`](Self::surface_maps), gated by
-    /// the same CPU/GPU agreement oracle.
+    /// The GPU program this projection composites with, or `None` when
+    /// the projection has no GPU pass yet (CPU-only). `None` fails
+    /// [`GpuExecutor`](crate::stitch::GpuExecutor) construction with a
+    /// typed error instead of binding a placeholder that renders
+    /// garbage.
+    ///
+    /// The GPU dual of [`surface_maps`](Self::surface_maps). CPU/GPU
+    /// agreement is pinned by the stitch oracle, whose fixtures are
+    /// L-shape-only today: a projection growing a GPU program must
+    /// bring its own agreement test with it.
     #[cfg(feature = "gpu")]
-    fn gpu_program(&self) -> crate::render::GpuProgram;
+    fn gpu_program(&self) -> Option<crate::render::GpuProgram>;
 
     /// Build the coverage boundary for this projection's panorama.
     ///
@@ -148,7 +156,7 @@ pub fn camera_to_panorama(
     norm_x: f32,
     norm_y: f32,
     calibration: &Calibration,
-) -> Option<ViewportPosition> {
+) -> Option<Pose> {
     let topology = calibration.topology.l_shape()?;
     let scene = topology.scene(&calibration.framing, calibration.lenses[0].aspect());
     camera_to_panorama_in_scene(camera, norm_x, norm_y, calibration, &scene)
@@ -162,7 +170,7 @@ pub(crate) fn camera_to_panorama_in_scene(
     norm_y: f32,
     calibration: &Calibration,
     scene: &PlaneScene,
-) -> Option<ViewportPosition> {
+) -> Option<Pose> {
     let params = match camera {
         CameraId::Left => &calibration.lenses[0],
         CameraId::Right => &calibration.lenses[1],
@@ -306,10 +314,7 @@ fn plane_uv_to_world(uv: (f64, f64), camera: CameraId, scene: &PlaneScene) -> Po
 /// for the existing call sites until they carry a `VirtualCamera`
 /// directly. Panners, directors, and the render loop all share the
 /// same basis through this path.
-pub(crate) fn direction_to_yaw_pitch(
-    dir: &Vector3<f32>,
-    camera_position: &[f32; 3],
-) -> ViewportPosition {
+pub(crate) fn direction_to_yaw_pitch(dir: &Vector3<f32>, camera_position: &[f32; 3]) -> Pose {
     VirtualCamera::new(camera_position).direction_to_yaw_pitch(dir)
 }
 
@@ -427,9 +432,9 @@ mod tests {
         // Step 1a: the two helpers must form an exact bijection on the
         // (yaw, pitch) grid used by panners and directors. All
         // shipping scenes set `camera_position = [d, 0, d]` (see
-        // SceneGeometry::new), so eye.y = 0 is
-        // the real invariant; test positions honor that. Pitch stays
-        // clear of +-pi/2 where yaw is undefined.
+        // LShape::virtual_camera), so eye.y = 0 is the real invariant;
+        // test positions honor that. Pitch stays clear of +-pi/2 where
+        // yaw is undefined.
         let camera_positions: [[f32; 3]; 3] = [[0.24, 0.0, 0.24], [0.3, 0.0, 0.2], [0.1, 0.0, 0.5]];
 
         let yaw_steps = [-1.2_f32, -0.6, -0.2, 0.0, 0.2, 0.6, 1.2];
@@ -765,12 +770,11 @@ mod tests {
         // The L-shape emits exactly two surfaces: the opaque left base,
         // then the right fading in with the calibration's seam width.
         let cal = test_calibration();
-        let config = crate::render::viewport::ViewportConfig::default();
+        let config = crate::render::viewport::ViewportSize::default();
         let surfaces = cal.topology.projection().surface_maps(&ProjectionContext {
             calibration: &cal,
-            viewport: &config,
-            yaw: 0.0,
-            pitch: 0.0,
+            viewport_size: &config,
+            pose: Pose::default(),
         });
         assert_eq!(surfaces.len(), 2);
         assert_eq!(surfaces[0].1, crate::stitch::BlendRule::Opaque);
@@ -810,12 +814,11 @@ mod tests {
     #[test]
     fn cylindrical_surface_maps_emit_one_opaque_surface() {
         let cal = cylinder_cal();
-        let config = crate::render::viewport::ViewportConfig::default();
+        let config = crate::render::viewport::ViewportSize::default();
         let surfaces = cal.topology.projection().surface_maps(&ProjectionContext {
             calibration: &cal,
-            viewport: &config,
-            yaw: 0.0,
-            pitch: 0.0,
+            viewport_size: &config,
+            pose: Pose::default(),
         });
         assert_eq!(surfaces.len(), 1);
         assert_eq!(surfaces[0].1, crate::stitch::BlendRule::Opaque);

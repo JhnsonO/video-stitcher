@@ -3,6 +3,7 @@
 //! The `run` / `run_immediate` frame loop, source configuration, and
 //! GPU zero-copy frame stepping live here.
 
+use crate::geometry::Pose;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::StitchSession;
@@ -23,28 +24,24 @@ use crate::source::FrameSource;
 /// boundary regime. This is acceptable (no future data exists past EOF);
 /// it is documented so the boundary behavior is not mistaken for a bug.
 fn centered_smooth(
-    raw_pose: crate::geometry::ViewportPosition,
-    ahead: impl Iterator<Item = crate::geometry::ViewportPosition>,
-    past: impl Iterator<Item = crate::geometry::ViewportPosition>,
-) -> crate::geometry::ViewportPosition {
+    raw_pose: Pose,
+    ahead: impl Iterator<Item = Pose>,
+    past: impl Iterator<Item = Pose>,
+) -> Pose {
     let mut sum_yaw = raw_pose.yaw;
     let mut sum_pitch = raw_pose.pitch;
-    let mut sum_fov = raw_pose.fov_degrees.unwrap_or(0.0);
-    let mut fov_n = u32::from(raw_pose.fov_degrees.is_some());
+    let mut sum_fov = raw_pose.fov_degrees;
     let mut n = 1u32;
     for p in ahead.chain(past) {
         sum_yaw += p.yaw;
         sum_pitch += p.pitch;
-        if let Some(f) = p.fov_degrees {
-            sum_fov += f;
-            fov_n += 1;
-        }
+        sum_fov += p.fov_degrees;
         n += 1;
     }
-    crate::geometry::ViewportPosition {
+    Pose {
         yaw: sum_yaw / n as f32,
         pitch: sum_pitch / n as f32,
-        fov_degrees: (fov_n > 0).then(|| sum_fov / fov_n as f32),
+        fov_degrees: sum_fov / n as f32,
     }
 }
 
@@ -156,7 +153,7 @@ impl StitchSession {
     fn render_buffered_frame(
         &mut self,
         oldest: super::frame_buffer::BufferedFrame,
-        smoothed_pose: crate::geometry::ViewportPosition,
+        smoothed_pose: crate::geometry::Pose,
         start: std::time::Instant,
         ctx: &crate::session::types::FrameLoopContext,
         on_progress: &mut Option<ProgressCallback>,
@@ -382,11 +379,9 @@ impl StitchSession {
         // Queue of (frame, raw_pose) pairs. The panner fills this
         // ahead of rendering. Rendering consumes from the front,
         // using the centered average of past + current + future poses.
-        let mut pose_queue: std::collections::VecDeque<(
-            BufferedFrame,
-            crate::geometry::ViewportPosition,
-        )> = std::collections::VecDeque::new();
-        let mut past_poses: std::collections::VecDeque<crate::geometry::ViewportPosition> =
+        let mut pose_queue: std::collections::VecDeque<(BufferedFrame, crate::geometry::Pose)> =
+            std::collections::VecDeque::new();
+        let mut past_poses: std::collections::VecDeque<crate::geometry::Pose> =
             std::collections::VecDeque::new();
         let mut panner_frame_idx: u64 = 0;
 
@@ -397,7 +392,7 @@ impl StitchSession {
                                buffer: &mut FrameBuffer,
                                pose_queue: &mut std::collections::VecDeque<(
             BufferedFrame,
-            crate::geometry::ViewportPosition,
+            crate::geometry::Pose,
         )>,
                                panner_frame_idx: &mut u64| {
             if let Some(frame) = buffer.pop() {
@@ -562,11 +557,11 @@ impl StitchSession {
             );
         }
         let (nv12_w, nv12_h) = self.nv12_delivery_dims();
-        let render_w = self.core.executor.viewport().width;
+        let render_w = self.core.executor.viewport_size().width;
         log::info!(
             "CPU stitch loop: software render at {}x{}, NV12 delivery {nv12_w}x{nv12_h}",
             render_w,
-            self.core.executor.viewport().height
+            self.core.executor.viewport_size().height
         );
 
         let mut nv12 = Vec::new();

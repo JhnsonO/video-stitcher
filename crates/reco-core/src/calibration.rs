@@ -11,15 +11,11 @@
 //! - [`Topology`] - 3D placement of the source planes plus the overlap seam.
 //! - [`Framing`] - the virtual camera's calibrated coordinate frame; panning
 //!   (yaw/pitch) and output framing (fov/size) are runtime, NOT stored here.
-//!
-//! The distortion model is `fisheye_kb4` (Kannala-Brandt 4-coefficient):
-//! `θ_d = θ × (1 + k₁θ² + k₂θ⁴ + k₃θ⁶ + k₄θ⁸)`.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::precision::VALIDATION_EPSILON;
-use crate::projection::{Cylinder, LShape, Projection};
+use crate::projection::{self, Projection};
 
 /// Maximum allowed dimension (width or height) in pixels.
 ///
@@ -82,31 +78,16 @@ pub enum CalibrationError {
         value: String,
     },
 
-    /// A focal length is too small, which would cause division-by-zero.
+    /// A value is too small for the math downstream, which divides by
+    /// it or normalizes a vector built from it.
     #[error("field '{field}' must be > {epsilon}, got {value}")]
-    FocalLengthTooSmall {
-        /// Field path.
+    ValueTooSmall {
+        /// Field path, e.g. `lens[0].fx`.
         field: String,
         /// The offending value.
         value: f64,
         /// The minimum threshold.
         epsilon: f64,
-    },
-
-    /// `framing.axis_offset` is too small, which would cause zero-vector normalization.
-    #[error("framing.axis_offset must be > {epsilon}, got {value}")]
-    AxisOffsetTooSmall {
-        /// The offending value.
-        value: f64,
-        /// The minimum threshold.
-        epsilon: f64,
-    },
-
-    /// `topology.intersect` is outside the valid `[0.0, 1.0]` range.
-    #[error("topology.intersect must be in [0.0, 1.0], got {value}")]
-    IntersectOutOfRange {
-        /// The offending value.
-        value: f64,
     },
 
     /// The calibration has no lenses.
@@ -145,7 +126,118 @@ pub enum CalibrationError {
 /// Maximum realistic sync_offset in frames (~28 minutes at 60fps).
 const MAX_SYNC_OFFSET_FRAMES: i64 = 100_000;
 
+/// Reject a non-finite (NaN or infinite) float.
+pub(crate) fn expect_finite(field: &str, value: f64) -> Result<(), CalibrationError> {
+    if !value.is_finite() {
+        return Err(CalibrationError::NonFiniteFloat {
+            field: field.to_owned(),
+            value: format!("{value}"),
+        });
+    }
+    Ok(())
+}
+
+/// Reject a value outside the inclusive `[min, max]` range.
+pub(crate) fn expect_in_range(
+    field: &str,
+    value: f64,
+    min: f64,
+    max: f64,
+) -> Result<(), CalibrationError> {
+    if !(min..=max).contains(&value) {
+        return Err(CalibrationError::OutOfRange {
+            field: field.to_owned(),
+            value,
+            min,
+            max,
+        });
+    }
+    Ok(())
+}
+
+/// Minimum positive value accepted for focal lengths and camera
+/// offsets - anything the geometry divides by or normalizes with.
+///
+/// Too loose and a near-zero value reaches the geometry, dividing by
+/// ~zero or normalizing a ~zero vector into NaN poses. Too tight and
+/// legitimate hand-edited calibrations start failing validation for
+/// values that render fine.
+const VALIDATION_EPSILON: f64 = 1e-6;
+
+/// Reject a value that is not meaningfully positive: at or below
+/// [`VALIDATION_EPSILON`]. For any field the math downstream divides
+/// by, normalizes with, or that is nonsensical at ~zero. The strict
+/// bound is the point: "equal to the threshold" is as degenerate as
+/// "below it". Owning the epsilon here keeps the tolerance policy out
+/// of projection code.
+pub(crate) fn expect_positive(field: &str, value: f64) -> Result<(), CalibrationError> {
+    if value <= VALIDATION_EPSILON {
+        return Err(CalibrationError::ValueTooSmall {
+            field: field.to_owned(),
+            value,
+            epsilon: VALIDATION_EPSILON,
+        });
+    }
+    Ok(())
+}
+/// Validate one lens's intrinsics.
+fn validate_lens(lens: &Lens, index: usize) -> Result<(), CalibrationError> {
+    for (field, value) in [("width", lens.width), ("height", lens.height)] {
+        if value == 0 {
+            return Err(CalibrationError::ZeroDimension {
+                index,
+                field,
+                value,
+            });
+        }
+        if value > MAX_DIM {
+            return Err(CalibrationError::DimensionTooLarge {
+                index,
+                field,
+                value,
+                max: MAX_DIM,
+            });
+        }
+    }
+
+    for (name, val) in [("fx", lens.fx), ("fy", lens.fy)] {
+        let field = format!("lens[{index}].{name}");
+        expect_finite(&field, val)?;
+        expect_positive(&field, val)?;
+    }
+
+    for (name, val) in [("cx", lens.cx), ("cy", lens.cy)] {
+        expect_finite(&format!("lens[{index}].{name}"), val)?;
+    }
+
+    for (i, coeff) in lens.distortion.iter().enumerate() {
+        expect_finite(&format!("lens[{index}].distortion[{i}]"), *coeff)?;
+    }
+
+    let correction = format!("lens[{index}].correction");
+    expect_finite(&correction, f64::from(lens.correction))?;
+    // The shader interprets negative correction as its raw-bypass debug
+    // mode and the CPU path would extrapolate the KB4 lerp - reject
+    // anything outside the documented [0, 1] blend range.
+    expect_in_range(&correction, f64::from(lens.correction), 0.0, 1.0)?;
+
+    Ok(())
+}
+
+/// Validate the topology-independent framing parameters. Rules a
+/// topology imposes on the framing (the L-shape's minimum axis offset)
+/// live in that topology's own validate.
+fn validate_framing(f: &Framing) -> Result<(), CalibrationError> {
+    expect_finite("framing.axis_offset", f.axis_offset)?;
+    expect_finite("framing.tilt", f.tilt)?;
+    expect_finite("framing.roll", f.roll)?;
+    Ok(())
+}
+
 /// One source's optical model: intrinsics + KB4 distortion.
+///
+/// The distortion model is `fisheye_kb4` (Kannala-Brandt 4-coefficient):
+/// `θ_d = θ × (1 + k₁θ² + k₂θ⁴ + k₃θ⁶ + k₄θ⁸)`.
 ///
 /// It is the CPU/GPU-independent record both executors derive their runtime
 /// form from. Two cameras of the same model share the same `Lens` content.
@@ -222,7 +314,7 @@ impl Lens {
     /// Aspect ratio of this lens's calibration frame (width / height).
     ///
     /// Returns 1.0 if height is zero (degenerate, rejected by
-    /// validation) - mirrors `ViewportConfig::aspect_ratio`.
+    /// validation) - mirrors `ViewportSize::aspect_ratio`.
     pub fn aspect(&self) -> f32 {
         if self.height == 0 {
             return 1.0;
@@ -241,14 +333,14 @@ impl Lens {
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Topology {
     /// Two fisheye cameras on perpendicular planes (the stereo rig).
-    LShape(LShape),
+    LShape(projection::LShape),
     /// One pre-stitched panorama painted on the inside of a cylinder.
-    Cylinder(Cylinder),
+    Cylinder(projection::Cylinder),
 }
 
 impl Topology {
     /// L-shape parameters, when this is the L-shape topology.
-    pub fn l_shape(&self) -> Option<&LShape> {
+    pub fn l_shape(&self) -> Option<&projection::LShape> {
         match self {
             Topology::LShape(t) => Some(t),
             Topology::Cylinder(_) => None,
@@ -256,7 +348,7 @@ impl Topology {
     }
 
     /// Mutable [`Self::l_shape`].
-    pub fn l_shape_mut(&mut self) -> Option<&mut LShape> {
+    pub fn l_shape_mut(&mut self) -> Option<&mut projection::LShape> {
         match self {
             Topology::LShape(t) => Some(t),
             Topology::Cylinder(_) => None,
@@ -264,7 +356,7 @@ impl Topology {
     }
 
     /// Cylinder parameters, when this is the cylinder topology.
-    pub fn cylinder(&self) -> Option<&Cylinder> {
+    pub fn cylinder(&self) -> Option<&projection::Cylinder> {
         match self {
             Topology::LShape(_) => None,
             Topology::Cylinder(t) => Some(t),
@@ -297,14 +389,14 @@ impl Topology {
     }
 }
 
-impl From<LShape> for Topology {
-    fn from(t: LShape) -> Self {
+impl From<projection::LShape> for Topology {
+    fn from(t: projection::LShape) -> Self {
         Topology::LShape(t)
     }
 }
 
-impl From<Cylinder> for Topology {
-    fn from(t: Cylinder) -> Self {
+impl From<projection::Cylinder> for Topology {
+    fn from(t: projection::Cylinder) -> Self {
         Topology::Cylinder(t)
     }
 }
@@ -558,101 +650,6 @@ pub enum CalibrationLoadError {
     Invalid(#[from] CalibrationError),
 }
 
-/// Validate one lens's intrinsics.
-fn validate_lens(lens: &Lens, index: usize) -> Result<(), CalibrationError> {
-    for (field, value) in [("width", lens.width), ("height", lens.height)] {
-        if value == 0 {
-            return Err(CalibrationError::ZeroDimension {
-                index,
-                field,
-                value,
-            });
-        }
-        if value > MAX_DIM {
-            return Err(CalibrationError::DimensionTooLarge {
-                index,
-                field,
-                value,
-                max: MAX_DIM,
-            });
-        }
-    }
-
-    for (name, val) in [("fx", lens.fx), ("fy", lens.fy)] {
-        if !val.is_finite() {
-            return Err(CalibrationError::NonFiniteFloat {
-                field: format!("lens[{index}].{name}"),
-                value: format!("{val}"),
-            });
-        }
-        if val <= VALIDATION_EPSILON {
-            return Err(CalibrationError::FocalLengthTooSmall {
-                field: format!("lens[{index}].{name}"),
-                value: val,
-                epsilon: VALIDATION_EPSILON,
-            });
-        }
-    }
-
-    for (name, val) in [("cx", lens.cx), ("cy", lens.cy)] {
-        if !val.is_finite() {
-            return Err(CalibrationError::NonFiniteFloat {
-                field: format!("lens[{index}].{name}"),
-                value: format!("{val}"),
-            });
-        }
-    }
-
-    for (i, coeff) in lens.distortion.iter().enumerate() {
-        if !coeff.is_finite() {
-            return Err(CalibrationError::NonFiniteFloat {
-                field: format!("lens[{index}].distortion[{i}]"),
-                value: format!("{coeff}"),
-            });
-        }
-    }
-
-    if !lens.correction.is_finite() {
-        return Err(CalibrationError::NonFiniteFloat {
-            field: format!("lens[{index}].correction"),
-            value: format!("{}", lens.correction),
-        });
-    }
-    // The shader interprets negative correction as its raw-bypass debug
-    // mode and the CPU path would extrapolate the KB4 lerp - reject
-    // anything outside the documented [0, 1] blend range.
-    if !(0.0..=1.0).contains(&lens.correction) {
-        return Err(CalibrationError::OutOfRange {
-            field: format!("lens[{index}].correction"),
-            value: lens.correction as f64,
-            min: 0.0,
-            max: 1.0,
-        });
-    }
-
-    Ok(())
-}
-
-/// Validate the topology-independent framing parameters. Rules a
-/// topology imposes on the framing (the L-shape's minimum axis offset)
-/// live in that topology's own validate.
-fn validate_framing(f: &Framing) -> Result<(), CalibrationError> {
-    for (name, val) in [
-        ("framing.axis_offset", f.axis_offset),
-        ("framing.tilt", f.tilt),
-        ("framing.roll", f.roll),
-    ] {
-        if !val.is_finite() {
-            return Err(CalibrationError::NonFiniteFloat {
-                field: name.to_owned(),
-                value: format!("{val}"),
-            });
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,7 +741,7 @@ mod tests {
         Calibration {
             schema_version: SCHEMA_VERSION,
             lenses: vec![lens(), lens()],
-            topology: Topology::LShape(LShape {
+            topology: Topology::LShape(projection::LShape {
                 intersect: 0.5,
                 x_ty: 0.0,
                 x_rz: 0.0,
@@ -782,7 +779,7 @@ mod tests {
     fn tagged_cylinder_document_round_trips() {
         let cal = Calibration::new(
             vec![Lens::flat(3840, 1080)],
-            Cylinder::default(),
+            projection::Cylinder::default(),
             Framing {
                 axis_offset: 0.0,
                 tilt: 0.0,
@@ -805,7 +802,7 @@ mod tests {
     #[test]
     fn cylinder_lens_count_is_enforced() {
         let mut cal = valid_cal();
-        cal.topology = Topology::Cylinder(Cylinder::default());
+        cal.topology = Topology::Cylinder(projection::Cylinder::default());
         assert!(
             matches!(
                 cal.validate(),
@@ -821,8 +818,8 @@ mod tests {
 
     #[test]
     fn cylinder_parameters_are_validated() {
-        let bad = |f: fn(&mut Cylinder)| {
-            let mut t = Cylinder::default();
+        let bad = |f: fn(&mut projection::Cylinder)| {
+            let mut t = projection::Cylinder::default();
             f(&mut t);
             let cal = Calibration::new(
                 vec![Lens::flat(3840, 1080)],
@@ -836,9 +833,15 @@ mod tests {
             cal.validate()
         };
         assert!(bad(|t| t.focal_length = 0.0).is_err());
-        assert!(bad(|t| t.sweep_deg = 361.0).is_err());
-        assert!(bad(|t| t.sweep_deg = 0.0).is_err());
         assert!(bad(|t| t.video_height = Some(f64::NAN)).is_err());
+
+        // The messages must state the documented (0, 360] sweep bounds
+        // and the validation epsilon, not float internals like
+        // MIN_POSITIVE.
+        let msg = bad(|t| t.sweep_deg = 361.0).unwrap_err().to_string();
+        assert!(msg.contains("[0, 360]"), "{msg}");
+        let msg = bad(|t| t.sweep_deg = 0.0).unwrap_err().to_string();
+        assert!(msg.contains("> 0.000001,"), "{msg}");
     }
 
     #[test]
@@ -867,7 +870,7 @@ mod tests {
         c.lenses[0].fx = 0.0;
         assert!(matches!(
             c.validate(),
-            Err(CalibrationError::FocalLengthTooSmall { .. })
+            Err(CalibrationError::ValueTooSmall { ref field, .. }) if field == "lens[0].fx"
         ));
     }
 
@@ -887,7 +890,7 @@ mod tests {
         c.framing.axis_offset = 0.0;
         assert!(matches!(
             c.validate(),
-            Err(CalibrationError::AxisOffsetTooSmall { .. })
+            Err(CalibrationError::ValueTooSmall { ref field, .. }) if field == "framing.axis_offset"
         ));
     }
 
@@ -897,7 +900,7 @@ mod tests {
         c.topology.l_shape_mut().unwrap().intersect = 1.5;
         assert!(matches!(
             c.validate(),
-            Err(CalibrationError::IntersectOutOfRange { .. })
+            Err(CalibrationError::OutOfRange { ref field, .. }) if field == "topology.intersect"
         ));
     }
 

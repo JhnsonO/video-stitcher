@@ -24,6 +24,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::output::{AudioMode, Bitrate, Codec, Format, Quality};
+use reco_core::render::viewport::ViewportSize;
 use reco_core::session::StitchSession;
 use reco_core::session::types::FrameProgress;
 use reco_core::source::FrameSource;
@@ -687,10 +688,9 @@ impl StitchJob {
                 );
             }
         }
-        let viewport = reco_core::render::viewport::ViewportConfig {
+        let viewport_size = ViewportSize {
             width: out_w,
             height: out_h,
-            ..Default::default()
         };
         let gpu_name;
         let mut session = match gpu {
@@ -705,7 +705,7 @@ impl StitchJob {
                 };
                 let session_config = reco_core::session::types::SessionConfig {
                     calibration: cal,
-                    viewport,
+                    viewport_size,
                     input_width: info.width,
                     input_height: info.height,
                     output_format: reco_core::gpu::OutputFormat::Rgba8Unorm,
@@ -719,7 +719,7 @@ impl StitchJob {
                 gpu_name = "software (CPU)".to_string();
                 let executor = reco_core::stitch::CpuExecutor::new(
                     cal,
-                    viewport,
+                    viewport_size,
                     info.width,
                     info.height,
                     false,

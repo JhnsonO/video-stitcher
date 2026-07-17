@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use reco_core::render::viewport::ViewportSize;
 use reco_core::source::FrameSource;
 
 use crate::helpers;
@@ -78,11 +79,7 @@ pub fn run_libcamera(
         }
     }
 
-    let viewport = reco_core::render::viewport::ViewportConfig {
-        width,
-        height,
-        ..Default::default()
-    };
+    let viewport_size = ViewportSize { width, height };
 
     let gpu = reco_core::gpu::GpuContext::new_blocking()?;
 
@@ -91,7 +88,7 @@ pub fn run_libcamera(
 
     let session_config = reco_core::session::types::SessionConfig {
         calibration: cal,
-        viewport,
+        viewport_size,
         input_width: capture_width,
         input_height: capture_height,
         output_format: reco_core::gpu::OutputFormat::Rgba8Unorm,
@@ -178,7 +175,7 @@ pub fn run_libcamera(
             log::warn!("detection failed on this frame: {e}");
         }
         let pos = session.director_position();
-        session.process_frame(&frame, pos.yaw, pos.pitch)?;
+        session.process_frame(&frame, pos)?;
         println!("Warmup complete, starting capture...");
     }
 
@@ -197,7 +194,7 @@ pub fn run_libcamera(
             log::warn!("detection failed on this frame: {e}");
         }
         let pos = session.director_position();
-        session.process_frame(&frame, pos.yaw, pos.pitch)?;
+        session.process_frame(&frame, pos)?;
         frame_count += 1;
         progress.report(frame_count);
     }
