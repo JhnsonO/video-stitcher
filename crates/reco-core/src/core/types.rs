@@ -49,8 +49,8 @@ pub enum StitchCoreError {
     StackedPacker(#[from] PackerError),
 }
 
-/// Returned from every [`super::StitchCore::submit_frame_yuv`] /
-/// [`super::StitchCore::submit_frame_bgra`] call.
+/// Returned from every [`super::StitchCore::submit_frame`] /
+/// `submit_frame_*_at_pose` call.
 ///
 /// On the GPU executor, readback is triple-buffered: the first two
 /// calls produce [`RenderOutcome::Warmup`] while the staging ring
@@ -99,7 +99,7 @@ pub struct ReplayFrame {
 /// # Semantics
 ///
 /// - `record_yuv` fires after every successful YUV submit via
-///   [`super::StitchCore::submit_frame_yuv`] and
+///   [`super::StitchCore::submit_frame`] and
 ///   [`super::StitchCore::submit_frame_yuv_at_pose`]. It sees the tight
 ///   (no-stride) YUV420P planes the render consumed, so the
 ///   recorded replay exactly matches what the stitch pipeline saw.
