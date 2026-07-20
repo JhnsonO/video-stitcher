@@ -642,6 +642,27 @@ impl StitchJob {
             }
         }
 
+        // All inputs must share one frame rate: the session clock, trim
+        // math, and encoder run on the first input's rate, so a mismatched
+        // camera silently drifts out of sync over a match (#315). 0.5 fps
+        // tolerance absorbs probe rounding (30000/1001 vs 30/1) without
+        // letting 25-vs-30 or 30-vs-60 setups through.
+        if info.fps > 0.0
+            && let Ok((n, d)) =
+                crate::adapters::FfmpegFileSource::frame_rate(self.right.first_path())
+            && d != 0
+        {
+            let right_fps = n as f64 / d as f64;
+            if (right_fps - info.fps).abs() > 0.5 {
+                return Err(StitchError::Other(format!(
+                    "frame rate mismatch: right input is {right_fps:.2} fps but the left \
+                     input is {:.2} fps; record all cameras at the same frame rate (mixed \
+                     rates are not supported yet)",
+                    info.fps,
+                )));
+            }
+        }
+
         // Create encoder with optional audio passthrough.
         let fps_rational = info.fps_rational.unwrap_or_else(|| {
             log::warn!("FPS not available from source metadata, defaulting to 30fps");
