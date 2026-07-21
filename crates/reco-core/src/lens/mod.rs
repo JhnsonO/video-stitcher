@@ -11,12 +11,11 @@
 //! calibration pipeline, which needs to match features in rectilinear
 //! (undistorted) space.
 
-#[cfg(feature = "gpu")]
 pub mod preview;
-#[cfg(feature = "gpu")]
+pub mod rig_correction;
 pub mod undistort;
 
-use crate::calibration::Lens;
+use crate::calibration::CameraParams;
 
 pub(crate) use kb4::kb4_forward_scale;
 
@@ -67,20 +66,6 @@ pub(crate) mod kb4 {
         }
         theta_d(r.atan(), d) / r
     }
-
-    /// Forward scale blended between the pinhole projection and full KB4
-    /// by `correction` in `[0, 1]` - the CPU dual of the shader's
-    /// `mix(theta, theta_d, correction)` per-pixel lerp (SYNC_WITH
-    /// `fisheye.wgsl`). `0` = pure pinhole, `1` = full KB4.
-    #[inline]
-    pub fn kb4_forward_scale_with_correction(r: f64, d: &[f64; 4], correction: f64) -> f64 {
-        if r < 1e-10 {
-            return 1.0;
-        }
-        let pinhole = r.atan() / r;
-        let full = kb4_forward_scale(r, d);
-        pinhole + (full - pinhole) * correction
-    }
 }
 
 /// Undistort a grayscale frame using the KB4 fisheye model.
@@ -102,7 +87,7 @@ pub(crate) mod kb4 {
 ///
 /// # Returns
 /// A new pixel buffer of the same dimensions with the undistorted image.
-pub fn undistort_gray(data: &[u8], width: u32, height: u32, params: &Lens) -> Vec<u8> {
+pub fn undistort_gray(data: &[u8], width: u32, height: u32, params: &CameraParams) -> Vec<u8> {
     let w = width as f64;
     let h = height as f64;
 
@@ -140,7 +125,7 @@ pub fn undistort_gray(data: &[u8], width: u32, height: u32, params: &Lens) -> Ve
             let y = (out_y as f64 - out_cy) / out_fy;
             let r = (x * x + y * y).sqrt();
 
-            let scale = kb4_forward_scale(r, &params.distortion);
+            let scale = kb4_forward_scale(r, &params.d);
 
             // Source pixel in the distorted image using original intrinsics
             let src_x = fx * x * scale + cx;
@@ -174,7 +159,7 @@ pub fn undistorted_to_distorted(
     out_y: f64,
     width: u32,
     height: u32,
-    params: &Lens,
+    params: &CameraParams,
 ) -> (f64, f64) {
     let w = width as f64;
     let h = height as f64;
@@ -198,7 +183,7 @@ pub fn undistorted_to_distorted(
     let y = (out_y - out_cy) / out_fy;
     let r = (x * x + y * y).sqrt();
 
-    let scale = kb4_forward_scale(r, &params.distortion);
+    let scale = kb4_forward_scale(r, &params.d);
 
     // Source pixel in the distorted image
     (fx * x * scale + cx, fy * y * scale + cy)
@@ -255,7 +240,6 @@ mod tests {
     // will pull both behind a single `reco_core::lens::kb4` module
     // so the duplication collapses.
     #[test]
-    #[cfg(feature = "gpu")]
     fn wgsl_kb4_matches_rust_kb4_on_theta_grid() {
         use wgpu::util::DeviceExt;
 
@@ -469,7 +453,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // With plane-fitted intrinsics, out_cx = (w + 2*cx) / 4.
         // For cx = w/2 this gives out_cx = w/2 (exact integer with even dims).
         // At the output center, ray = (0,0), scale = 1, src = (cx, cy).
-        let params = Lens::fisheye(100, 100, 50.0, 50.0, 50.0, 50.0, [0.1, 0.05, -0.03, 0.01]);
+        let params = CameraParams {
+            width: 100,
+            height: 100,
+            fx: 50.0,
+            fy: 50.0,
+            cx: 50.0,
+            cy: 50.0,
+            d: [0.1, 0.05, -0.03, 0.01],
+        };
 
         let mut data = vec![0u8; 100 * 100];
         data[50 * 100 + 50] = 255; // bright pixel at optical center

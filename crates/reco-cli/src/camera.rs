@@ -12,8 +12,6 @@ use reco_core::source::StereoFrame;
 use reco_io::gstreamer::camera::CameraConfig;
 
 use crate::helpers;
-#[cfg(feature = "snapshot")]
-use crate::snapshot::SnapshotWriter;
 
 /// Run live camera stitching.
 ///
@@ -30,7 +28,7 @@ pub struct CameraRunConfig<'a> {
     pub output: &'a str,
     pub width: u32,
     pub height: u32,
-    pub blend: Option<f32>,
+    pub blend: f32,
     pub encoder_name: Option<String>,
     pub codec: &'a str,
     pub quality: &'a str,
@@ -39,17 +37,6 @@ pub struct CameraRunConfig<'a> {
     pub capture_fps: u32,
     pub model_path: Option<&'a str>,
     pub detection_interval: u64,
-    /// Directory for periodic JPEG snapshots of the stitched output
-    /// (live preview). `snapshot` build feature only.
-    #[cfg(feature = "snapshot")]
-    pub snapshot_dir: Option<&'a str>,
-    /// Write a snapshot every N frames (only with `snapshot_dir`).
-    #[cfg(feature = "snapshot")]
-    pub snapshot_interval: u64,
-    /// Lookahead buffer in seconds. The panner leads by this window and
-    /// the loop centered-smooths past+future poses. 0 disables it.
-    /// Only effective with AI tracking (a model + non-sweep mode).
-    pub lookahead: f64,
     pub quality_value: Option<u8>,
     pub preset: Option<String>,
     /// Output container (`mp4` / `fmp4` / `mkv`). None -> `mp4`.
@@ -100,11 +87,6 @@ pub fn run_camera(
         capture_fps,
         model_path,
         detection_interval,
-        #[cfg(feature = "snapshot")]
-        snapshot_dir,
-        #[cfg(feature = "snapshot")]
-        snapshot_interval,
-        lookahead,
         quality_value,
         preset,
         container,
@@ -124,19 +106,15 @@ pub fn run_camera(
         "Output path looks like a network URL ({output}). Only local file paths are supported.",
     );
 
-    let mut cal = reco_core::calibration::Calibration::from_file(Path::new(calibration))?;
-    if let Some(b) = blend {
-        eprintln!(
-            "Seam blend: --blend {b} overrides the calibration's {}",
-            cal.topology.blend_width
-        );
-        cal.topology.blend_width = b;
-    }
+    let cal = reco_core::calibration::MatchCalibration::from_file(Path::new(calibration))?;
     let field_roi = cal.field_roi.clone();
 
     let viewport = reco_core::render::viewport::ViewportConfig {
         width,
         height,
+        blend_width: blend,
+        rig_tilt: cal.rig_tilt as f32,
+        rig_roll: cal.rig_roll as f32,
         ..Default::default()
     };
 
@@ -225,25 +203,6 @@ pub fn run_camera(
         log::warn!("--model specified but autocam feature is disabled");
     }
 
-    // Lookahead buffer (same semantics as `reco stitch --lookahead`): the
-    // panner leads by this window and the loop centered-smooths past +
-    // future poses. It only helps when an AI panner drives the camera, so
-    // gate it on a model + non-sweep tracking mode. Converts seconds ->
-    // frames using the capture rate, then routes the live path through the
-    // session's buffered loop (`run_buffered`).
-    let ai_tracking = model_path.is_some() && tracking != "sweep";
-    if lookahead > 0.0 {
-        if ai_tracking {
-            let frames = (lookahead * capture_fps as f64).round() as usize;
-            session.set_lookahead(frames);
-            println!("Lookahead: {lookahead:.2}s buffer ({frames} frames @ {capture_fps} fps)");
-        } else {
-            log::debug!(
-                "Lookahead {lookahead:.2}s ignored: no AI tracking (needs --model, non-sweep)"
-            );
-        }
-    }
-
     let mode_str = if v4l2_direct {
         "Bayer RGGB (V4L2 direct)"
     } else if use_nvmm {
@@ -309,7 +268,7 @@ pub fn run_camera(
         // non-Jetson the same default applies per session discussion
         // (NVENC + NV12 pack shader combo deferred to #271).
         let encoder_config = reco_io::stacked_video::encoder::StackedEncoderConfig {
-            fps: (capture_fps as i32, 1),
+            fps: Some((capture_fps as i32, 1)),
             ..Default::default()
         };
         let recorder = reco_io::stacked_video::replay::session_gpu_recorder(
@@ -388,20 +347,6 @@ pub fn run_camera(
     println!("Encoder: {}", encoder.encoder_name());
 
     session.set_encoder(Box::new(encoder), 2);
-
-    // Snapshot writer for live preview (gameday panel). Taps the NV12
-    // readback after each frame and writes a JPEG every N frames on a
-    // background thread; held alive until the function returns. Gated
-    // behind the `snapshot` build feature.
-    #[cfg(feature = "snapshot")]
-    let mut _snapshot_writer: Option<SnapshotWriter> = None;
-    #[cfg(feature = "snapshot")]
-    if let Some(dir) = snapshot_dir {
-        let (writer, tap) = SnapshotWriter::new(Path::new(dir), snapshot_interval)?;
-        session.set_nv12_tap(tap);
-        println!("Snapshots: {dir}/snapshot.jpg (every {snapshot_interval} frames)");
-        _snapshot_writer = Some(writer);
-    }
 
     let frame_limit =
         reco_core::session::types::compute_frame_limit(end_time, max_frames, capture_fps as f64);
@@ -553,51 +498,148 @@ pub fn run_camera(
     } else if use_nvmm {
         // NVMM zero-copy path: DMA-buf Vulkan import for rendering,
         // NvBufSurfTransform for detection. No CPU copies at all.
-        //
-        // Driven by the session's unified frame loop (`run` / `run_buffered`)
-        // through the `FrameSource` + `StereoFrame::NvmmResident` path - the
-        // same machinery the file-stitch path uses. So lookahead, centered
-        // smoothing, and the VRAM pool all work here for free; the per-frame
-        // import + NvBufSurfTransform happen inside the session's produce
-        // step (see `copy_nvmm_to_vram_pool` / `nvmm_run_detection`).
         #[cfg(target_os = "linux")]
         {
+            use reco_core::interop::dmabuf::DmaBufTextureCache;
+            use reco_core::nvbuf_transform::NvBufDetectionSurface;
             use reco_io::gstreamer::camera::GstreamerNvmmCameraSource;
 
             let mut source = GstreamerNvmmCameraSource::open(&cam_config)?;
 
-            // Allocate the NvBufSurfTransform detection surfaces. The model
-            // input is square; all shipped yolo26 engines use 1280x1280.
-            // Skipped when there is no detector (sweep / no model) - the
-            // detection arm then no-ops and the director still advances.
-            if ai_tracking {
-                let model_size = 1280u32;
-                session
-                    .setup_nvmm_detection(model_size, capture_width, capture_height)
-                    .map_err(|e| anyhow::anyhow!("NVMM detection setup: {e}"))?;
+            // Detection surface size must match the TRT engine's input dims.
+            // All shipped yolo26 engines use 1280x1280.
+            let model_size = 1280u32;
+            log::info!("NVMM detection surface size: {model_size}x{model_size}");
+            let mut det_left =
+                NvBufDetectionSurface::new(model_size, capture_width, capture_height)
+                    .map_err(|e| anyhow::anyhow!("left detection surface: {e}"))?;
+            let mut det_right =
+                NvBufDetectionSurface::new(model_size, capture_width, capture_height)
+                    .map_err(|e| anyhow::anyhow!("right detection surface: {e}"))?;
+
+            let det_surface_mb =
+                (det_left.pitch as f64 * model_size as f64 * 2.0) / 1024.0 / 1024.0;
+            let tensor_mb =
+                (model_size as f64 * model_size as f64 * 3.0 * 4.0 * 2.0) / 1024.0 / 1024.0;
+            let nvmm_buf_mb =
+                (capture_width as f64 * capture_height as f64 * 1.5 * 8.0) / 1024.0 / 1024.0;
+            log::info!(
+                "NVMM detection surfaces: {}x{} RGBA, letterbox scale={:.4}, pitch={}",
+                model_size,
+                model_size,
+                det_left.scale,
+                det_left.pitch,
+            );
+            log::info!(
+                "Memory budget: det_surfaces={:.1}MB, trt_tensors={:.1}MB, nvmm_bufs={:.1}MB",
+                det_surface_mb,
+                tensor_mb,
+                nvmm_buf_mb,
+            );
+
+            let mut dmabuf_cache = DmaBufTextureCache::new();
+
+            // Warmup: pull first pair to initialize ISP + Argus
+            let warmup = source
+                .next_pair()?
+                .ok_or_else(|| anyhow::anyhow!("NVMM source returned no frames"))?;
+            source.release_previous();
+            log::info!(
+                "NVMM warmup: {}x{} NV12, fd_left={}, fd_right={}",
+                warmup.left.width,
+                warmup.left.height,
+                warmup.left.dmabuf_fd,
+                warmup.right.dmabuf_fd,
+            );
+            log::info!("Warmup complete, starting NVMM capture");
+
+            let progress = helpers::ProgressReporter::new(30);
+
+            while frame_count < frame_limit && !interrupted.load(Ordering::Relaxed) {
+                let pair = {
+                    reco_core::profile_scope!("wait_capture");
+                    match source.next_pair()? {
+                        Some(p) => p,
+                        None => break,
+                    }
+                };
+
+                // Detection: NvBufSurfTransform on the raw NVMM surface pointers
+                if session.detection_should_run() {
+                    reco_core::profile_scope!("nvbuf_detect");
+                    unsafe {
+                        det_left
+                            .transform_from_nvmm(pair.left.surface_ptr)
+                            .map_err(|e| anyhow::anyhow!("left transform: {e}"))?;
+                        det_right
+                            .transform_from_nvmm(pair.right.surface_ptr)
+                            .map_err(|e| anyhow::anyhow!("right transform: {e}"))?;
+                    }
+                    session.detect_and_update_director_preletterboxed(
+                        det_left.data_ptr,
+                        det_right.data_ptr,
+                        capture_width,
+                        capture_height,
+                        start.elapsed(),
+                    )?;
+                } else {
+                    session.update_director(start.elapsed())?;
+                }
+
+                // Rendering: ensure DMA-buf textures are cached, then borrow both
+                {
+                    reco_core::profile_scope!("dmabuf_ensure_cached");
+                    dmabuf_cache
+                        .ensure_imported(
+                            session.gpu(),
+                            pair.left.dmabuf_fd,
+                            pair.left.width,
+                            pair.left.height,
+                            pair.left.y_offset,
+                            pair.left.uv_offset,
+                            pair.left.total_size,
+                        )
+                        .map_err(|e| anyhow::anyhow!("left DMA-buf import: {e}"))?;
+                    dmabuf_cache
+                        .ensure_imported(
+                            session.gpu(),
+                            pair.right.dmabuf_fd,
+                            pair.right.width,
+                            pair.right.height,
+                            pair.right.y_offset,
+                            pair.right.uv_offset,
+                            pair.right.total_size,
+                        )
+                        .map_err(|e| anyhow::anyhow!("right DMA-buf import: {e}"))?;
+                }
+                let left_textures = dmabuf_cache.get(pair.left.dmabuf_fd);
+                let right_textures = dmabuf_cache.get(pair.right.dmabuf_fd);
+
+                let pos = session.director_position();
+                {
+                    reco_core::profile_scope!("stitch_and_encode");
+                    session.process_frame_imported_nv12(
+                        &left_textures.y_texture,
+                        &left_textures.uv_texture,
+                        &right_textures.y_texture,
+                        &right_textures.uv_texture,
+                        pos.yaw,
+                        pos.pitch,
+                    )?;
+                }
+
+                source.release_previous();
+
+                frame_count += 1;
+                progress.report(frame_count);
             }
-
-            // Periodic "Processed N frames (… fps)" lines (parsed by gameday.py).
-            let reporter = helpers::ProgressReporter::new(30);
-            let on_progress: reco_core::session::types::ProgressCallback =
-                Box::new(move |p: &reco_core::session::types::FrameProgress| {
-                    reporter.report_with_elapsed(p.frames_completed, p.elapsed);
-                });
-
-            println!("Starting NVMM capture...");
-            frame_count = session.run(&mut source, frame_limit, interrupted, Some(on_progress))?;
 
             source.stop();
             #[cfg(feature = "replay")]
             session.clear_stacked_gpu_recorder();
             session.finish()?;
 
-            // Finish summary (matches `ProgressReporter::finish` formatting).
-            let secs = start.elapsed().as_secs_f64().max(1e-9);
-            println!(
-                "\n\nDone: {frame_count} frames in {secs:.1}s ({:.1} fps) \u{2192} {output}",
-                frame_count as f64 / secs
-            );
+            progress.finish(frame_count, output);
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -751,51 +793,44 @@ pub fn run_live_calibrate(
     right_profile: Option<&str>,
     interrupted: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    use reco_core::calibration::Lens;
+    use reco_core::calibration::CameraParams;
 
     eprintln!(
         "Live calibration: capturing {num_pairs} frame pairs at {capture_width}x{capture_height}",
     );
 
-    // One loader for every profile shape (current flat, legacy flat with
-    // `d`, gyroflow) - the lens database owns format detection. A broken
-    // profile file is a hard error: silently calibrating with the wrong
-    // lens is worse than aborting.
-    let load = |p: &str| -> anyhow::Result<Lens> {
-        let json = std::fs::read_to_string(p)
-            .map_err(|e| anyhow::anyhow!("cannot read lens profile '{p}': {e}"))?;
-        let lens = reco_calibrate::lens_database::load_from_json(&json, p)
-            .map_err(|e| anyhow::anyhow!("cannot parse lens profile '{p}': {e}"))?;
-        eprintln!("Lens profile: {p}");
-        Ok(lens)
-    };
-    let load_or_default = |path: Option<&str>, w: u32, h: u32| -> anyhow::Result<Lens> {
+    let load_or_default = |path: Option<&str>, w: u32, h: u32| -> anyhow::Result<CameraParams> {
         if let Some(p) = path {
-            return load(p);
+            let json = std::fs::read_to_string(p)?;
+            let params: CameraParams = serde_json::from_str(&json)?;
+            eprintln!("Lens profile: {p}");
+            return Ok(params);
         }
         if let Ok(home) = std::env::var("HOME") {
             let convention = std::path::PathBuf::from(home).join("imx477_profile.json");
             if convention.exists() {
-                let lens = load(&convention.display().to_string())?;
-                eprintln!("  (auto-detected convention profile)");
-                return Ok(lens);
+                let json = std::fs::read_to_string(&convention)?;
+                let params: CameraParams = serde_json::from_str(&json)?;
+                eprintln!("Lens profile (auto): {}", convention.display());
+                return Ok(params);
             }
         }
         eprintln!("No lens profile found, using synthetic default (wide-angle)");
         let fw = w as f64;
         let fh = h as f64;
-        Ok(Lens::fisheye(
-            w,
-            h,
-            fw * 0.5,
-            fw * 0.5,
-            fw * 0.5,
-            fh * 0.5,
-            [0.0; 4],
-        ))
+        Ok(CameraParams {
+            width: w,
+            height: h,
+            fx: fw * 0.5,
+            fy: fw * 0.5,
+            cx: fw * 0.5,
+            cy: fh * 0.5,
+            d: [0.0; 4],
+        })
     };
     let left_params = load_or_default(left_profile, capture_width, capture_height)?;
-    let right_params = load_or_default(right_profile, capture_width, capture_height)?;
+    let right_params = load_or_default(right_profile, capture_width, capture_height)
+        .unwrap_or_else(|_| left_params.clone());
 
     let gpu = reco_core::gpu::GpuContext::new_blocking()?;
     eprintln!("GPU: {}", gpu.gpu_name());
@@ -844,45 +879,25 @@ pub fn run_live_calibrate(
         );
     }
 
-    // Preserve field_roi and rig tilt/roll from any existing calibration
-    // file at the output path - current or legacy 'match' shape alike.
-    // Re-calibrating must never silently discard hand-tuned framing, so
-    // the extraction goes through a raw Value (schema-agnostic) and an
-    // unreadable file warns loudly instead of being skipped.
+    // Preserve field_roi and rig_tilt from existing calibration file
     let mut cal = result.calibration;
-    if let Ok(existing) = std::fs::read_to_string(output_path) {
-        match serde_json::from_str::<serde_json::Value>(&existing) {
-            Ok(prev) => {
-                if let Some(roi) = prev.get("field_roi").filter(|r| !r.is_null()) {
-                    match serde_json::from_value(roi.clone()) {
-                        Ok(roi) => {
-                            cal.field_roi = Some(roi);
-                            eprintln!("Preserved existing field_roi");
-                        }
-                        Err(e) => eprintln!("WARNING: existing field_roi NOT preserved: {e}"),
-                    }
-                }
-                // Current shape stores tilt/roll under framing; the legacy
-                // 'match' shape kept rig_tilt/rig_roll at the top level.
-                let angle = |ptr: &str, legacy: &str| {
-                    prev.pointer(ptr)
-                        .or_else(|| prev.get(legacy))
-                        .and_then(serde_json::Value::as_f64)
-                        .filter(|v| v.abs() > 1e-6)
-                };
-                if let Some(tilt) = angle("/framing/tilt", "rig_tilt") {
-                    cal.framing.tilt = tilt;
-                    eprintln!("Preserved existing rig tilt ({:.1} deg)", tilt.to_degrees());
-                }
-                if let Some(roll) = angle("/framing/roll", "rig_roll") {
-                    cal.framing.roll = roll;
-                    eprintln!("Preserved existing rig roll ({:.1} deg)", roll.to_degrees());
-                }
-            }
-            Err(e) => eprintln!(
-                "WARNING: existing calibration at {output_path} is unreadable ({e}); \
-                 its field_roi and rig tilt/roll are NOT preserved"
-            ),
+    if let Ok(existing) = std::fs::read_to_string(output_path)
+        && let Ok(prev) =
+            serde_json::from_str::<reco_core::calibration::MatchCalibration>(&existing)
+    {
+        if prev.field_roi.is_some() {
+            cal.field_roi = prev.field_roi;
+            eprintln!("Preserved existing field_roi");
+        }
+        if prev.rig_tilt.abs() > 1e-6 {
+            cal.rig_tilt = prev.rig_tilt;
+            eprintln!(
+                "Preserved existing rig_tilt ({:.1} deg)",
+                prev.rig_tilt.to_degrees()
+            );
+        }
+        if prev.rig_roll.abs() > 1e-6 {
+            cal.rig_roll = prev.rig_roll;
         }
     }
     let json = serde_json::to_string_pretty(&cal)?;

@@ -4,7 +4,7 @@
 //! the `StitchSession` implementation. Import types from
 //! `reco_core::session::types` (e.g. `reco_core::session::types::SessionConfig`).
 
-use crate::calibration::Calibration;
+use crate::calibration::MatchCalibration;
 use crate::core::types::StitchCoreError;
 use crate::encoder::{EncodeError, Encoder};
 use crate::gpu::nv12_converter::Nv12Error;
@@ -35,7 +35,7 @@ pub fn compute_frame_limit(duration_secs: Option<f64>, max_frames: Option<u64>, 
 #[derive(Debug)]
 pub struct SessionConfig {
     /// Camera calibration data.
-    pub calibration: Calibration,
+    pub calibration: MatchCalibration,
     /// Output viewport (dimensions, blend width, FOV).
     pub viewport: ViewportConfig,
     /// Input frame width in pixels.
@@ -193,7 +193,7 @@ const _: fn() = || {
 ///     .build()?;
 /// ```
 pub struct StitchSessionBuilder {
-    pub(super) calibration: Option<Calibration>,
+    pub(super) calibration: Option<MatchCalibration>,
     pub(super) viewport: Option<ViewportConfig>,
     pub(super) input_width: Option<u32>,
     pub(super) input_height: Option<u32>,
@@ -207,7 +207,7 @@ pub struct StitchSessionBuilder {
 
 impl StitchSessionBuilder {
     /// Set the camera calibration (required).
-    pub fn calibration(mut self, cal: Calibration) -> Self {
+    pub fn calibration(mut self, cal: MatchCalibration) -> Self {
         self.calibration = Some(cal);
         self
     }
@@ -294,6 +294,7 @@ impl StitchSessionBuilder {
         let viewport = self.viewport.unwrap_or(ViewportConfig {
             width: 1920,
             height: 1080,
+            blend_width: 0.15,
             ..Default::default()
         });
 
@@ -314,7 +315,9 @@ impl StitchSessionBuilder {
         };
 
         let mut session = super::StitchSession::with_gpu(gpu, config)?;
-        session.set_detection_interval(self.detection_interval);
+        session
+            .detection
+            .set_detection_interval(self.detection_interval);
 
         if let Some((enc, buf_count)) = self.encoder {
             session.set_encoder(enc, buf_count);

@@ -842,12 +842,15 @@ impl VideoEncoder {
         );
         // B-frames cause negative initial PTS offsets and frame reordering
         // in the encoded output. For real-time stitching they add latency
-        // with no visual benefit, so default to 0. RECO_X264_BFRAMES
-        // overrides for offline encodes that can tolerate the reordering.
-        let bf = std::env::var("RECO_X264_BFRAMES").unwrap_or_else(|_| "0".to_string());
-        opts.set("bf", &bf);
+        // with no visual benefit, so disable unconditionally.
+        opts.set("bf", "0");
         let encoder = enc.open_with(opts)?;
         ost.set_parameters(&encoder);
+        // Stamp both stream rates so our own outputs re-probe cleanly on
+        // every consumer path (Matroska and fragmented MP4 don't derive
+        // them from sample timing the way plain mov does).
+        ost.set_rate(fps);
+        ost.set_avg_frame_rate(fps);
 
         // Note: write_header is called by the caller (new()) after optional
         // audio stream setup. output_time_base is read after write_header.
@@ -1850,12 +1853,8 @@ fn build_encoder_opts(
                     .unwrap_or_default()
                     .contains("nvidia,tegra")
             {
-                let threads = std::env::var("RECO_X264_THREADS")
-                    .ok()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .unwrap_or(4);
-                log::info!("Tegra platform detected, limiting libx264 to {threads} threads");
-                opts.set("threads", &threads.to_string());
+                log::info!("Tegra platform detected, limiting libx264 to 4 threads");
+                opts.set("threads", "4");
             }
         }
         _ => {

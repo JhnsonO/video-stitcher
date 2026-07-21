@@ -1,21 +1,22 @@
 [package]
 publish = false
 name = "reco-control"
-version = "0.5.3-beta.2"
+version = "0.5.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Operator pose-control state machine and intent dispatch for Reco"
+description = "Transport-agnostic control vocabulary for Reco (keyboard, gamepad, GoPro USB, mobile app, WebSocket)"
 
 # ---------------------------------------------------------------------------
 # Features
 # ---------------------------------------------------------------------------
 #
-# `gopro` is an optional device helper (pulls in reqwest/tokio); off by
-# default so headless / embedded builds stay lean.
+# The crate ships with one trivial transport (`keyboard`) enabled by
+# default. Other transports are feature-gated so headless / embedded
 [features]
-default = []
+default = ["keyboard"]
+keyboard = []
 gopro = ["dep:reqwest", "dep:tokio"]
 
 [dependencies]

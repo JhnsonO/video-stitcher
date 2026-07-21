@@ -1,6 +1,6 @@
 //! Virtual camera basis for yaw/pitch decomposition.
 
-use crate::geometry::ViewportPosition;
+use crate::detect::director::ViewportPosition;
 
 use nalgebra::Vector3;
 
@@ -24,11 +24,10 @@ use nalgebra::Vector3;
 /// regression test locked that bug in; this type's yaw convention
 /// un-ignores it.
 ///
-/// Rig tilt and rig roll are NOT part of this type: `rig_frame` layers
-/// them on top, and `view_matrix` + `world_to_render_pose` both compose
-/// through that one construction.
+/// Rig tilt and rig roll are NOT part of this type. `view_matrix`
+/// layers them on top; Step 4 unifies them under `RigCorrection`.
 #[derive(Debug, Clone, Copy)]
-pub struct VirtualCamera {
+pub(crate) struct VirtualCamera {
     /// World-space camera eye position (copy of `camera_position`).
     pub eye: Vector3<f32>,
     /// Unit vector from eye toward the scene origin (the L-shape corner).

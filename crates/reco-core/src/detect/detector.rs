@@ -12,7 +12,23 @@
 //! they must run on the original camera frames before stitching.
 //! The slight wide-angle distortion is negligible for detection accuracy.
 
-use crate::geometry::CameraId;
+/// Which camera produced this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CameraId {
+    /// Left camera (plane in X-Z space).
+    Left,
+    /// Right camera (plane in X-Y space).
+    Right,
+}
+
+impl std::fmt::Display for CameraId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Left => f.write_str("L"),
+            Self::Right => f.write_str("R"),
+        }
+    }
+}
 
 /// Raw camera frame data for detection.
 ///
@@ -204,7 +220,7 @@ pub enum DetectorFrame<'a> {
     },
 
     /// CUDA device-pointer RGBA frame (zero-copy from Bayer demosaic).
-    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "gpu"))]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     CudaRgba {
         /// CUDA device pointer to packed RGBA data.
         ptr: crate::interop::cuda::CUdeviceptr,
@@ -222,7 +238,7 @@ pub enum DetectorFrame<'a> {
     /// conversion, and letterbox padding are done in a single hardware-
     /// accelerated operation. The detector skips NPP resize and only
     /// runs the normalize kernel + inference.
-    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "gpu"))]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     CudaRgbaLetterboxed {
         /// CUDA device pointer to letterboxed RGBA data at model size.
         ptr: crate::interop::cuda::CUdeviceptr,
@@ -249,7 +265,6 @@ pub enum DetectorFrame<'a> {
     /// `WgpuPreprocessor` that converts these views to float32 CHW
     /// via a compute shader, then delegates to the inner detector
     /// with `PreprocessedChw`.
-    #[cfg(feature = "gpu")]
     WgpuNv12 {
         /// Y plane view (R8Unorm, full resolution).
         y_view: &'a wgpu::TextureView,
@@ -273,15 +288,12 @@ impl DetectorFrame<'_> {
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             Self::Cuda(_) => "Cuda",
             #[cfg(any(target_os = "linux", target_os = "windows"))]
-            #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "gpu"))]
             Self::CudaRgba { .. } => "CudaRgba",
             #[cfg(any(target_os = "linux", target_os = "windows"))]
-            #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "gpu"))]
             Self::CudaRgbaLetterboxed { .. } => "CudaRgbaLetterboxed",
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             Self::Metal { .. } => "Metal",
             Self::PreprocessedChw { .. } => "PreprocessedChw",
-            #[cfg(feature = "gpu")]
             Self::WgpuNv12 { .. } => "WgpuNv12",
         }
     }

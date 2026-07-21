@@ -3,7 +3,6 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
-    target-branch: dev
     schedule:
       interval: weekly
     groups:
@@ -14,6 +13,5 @@ updates:
 
   - package-ecosystem: github-actions
     directory: /
-    target-branch: dev
     schedule:
       interval: weekly

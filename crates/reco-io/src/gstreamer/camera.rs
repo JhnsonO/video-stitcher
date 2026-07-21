@@ -107,11 +107,8 @@ fn build_pipeline_string(
         // Jetson: nvarguscamerasrc runs the full NVIDIA ISP
         // (debayer, AWB, AE, denoise). Output is NV12 in NVMM;
         // nvvidconv copies to system memory (and converts format if needed).
-        // RECO_NVARGUS_OPTS injects extra source properties (e.g. aelock,
-        // exposuretimerange, gainrange, wbmode) for seam-matched capture.
-        let nvargus_opts = std::env::var("RECO_NVARGUS_OPTS").unwrap_or_default();
         format!(
-            "nvarguscamerasrc sensor-id={device} {nvargus_opts} ! \
+            "nvarguscamerasrc sensor-id={device} ! \
              video/x-raw(memory:NVMM),width={width},height={height},format=NV12,framerate={fps}/1 ! \
              nvvidconv ! \
              video/x-raw,format={fmt_str} ! \
@@ -611,11 +608,8 @@ mod nvmm_source {
         }
 
         validate_device_string(device)?;
-        // RECO_NVARGUS_OPTS injects extra source properties (e.g. aelock,
-        // exposuretimerange, gainrange, wbmode) for seam-matched capture.
-        let nvargus_opts = std::env::var("RECO_NVARGUS_OPTS").unwrap_or_default();
         Ok(format!(
-            "nvarguscamerasrc sensor-id={device} {nvargus_opts} ! \
+            "nvarguscamerasrc sensor-id={device} ! \
              video/x-raw(memory:NVMM),width={width},height={height},format=NV12,framerate={fps}/1 ! \
              appsink name=sink emit-signals=false sync=false max-buffers=4 drop=true"
         ))
@@ -739,10 +733,6 @@ mod nvmm_source {
         right_release: mpsc::SyncSender<()>,
         info: SourceInfo,
         stop: Arc<AtomicBool>,
-        /// Whether a frame from the most recent `next_frame()` is still
-        /// holding its DMA-buf (must be released before pulling the next).
-        /// Drives the deferred release in the `FrameSource` impl.
-        outstanding: bool,
     }
 
     impl GstreamerNvmmCameraSource {
@@ -790,7 +780,6 @@ mod nvmm_source {
                 right_release,
                 info,
                 stop,
-                outstanding: false,
             })
         }
 
@@ -826,59 +815,6 @@ mod nvmm_source {
         /// Stop capture gracefully.
         pub fn stop(&self) {
             self.stop.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// Convert reco-io's `NvmmFrameInfo` into reco-core's `NvmmPlaneInfo`.
-    fn to_plane_info(info: &NvmmFrameInfo) -> reco_core::source::NvmmPlaneInfo {
-        reco_core::source::NvmmPlaneInfo {
-            dmabuf_fd: info.dmabuf_fd,
-            width: info.width,
-            height: info.height,
-            y_offset: info.y_offset,
-            uv_offset: info.uv_offset,
-            total_size: info.total_size,
-            surface_ptr: info.surface_ptr,
-        }
-    }
-
-    impl reco_core::source::FrameSource for GstreamerNvmmCameraSource {
-        fn info(&self) -> SourceInfo {
-            self.info.clone()
-        }
-
-        /// Pull the next NVMM stereo frame as [`StereoFrame::NvmmResident`].
-        ///
-        /// Releases the previous frame's DMA-buf first (deferred release):
-        /// the capture thread blocks until released, and the session has
-        /// finished importing + detecting the prior frame by the time this
-        /// is called again, so the buffer is safe to recycle. Exactly one
-        /// frame is ever unreleased.
-        fn next_frame(&mut self) -> Result<Option<StereoFrame>, SourceError> {
-            if self.outstanding {
-                self.release_previous();
-                self.outstanding = false;
-            }
-            match self.next_pair()? {
-                Some(pair) => {
-                    self.outstanding = true;
-                    Ok(Some(StereoFrame::NvmmResident {
-                        left: to_plane_info(&pair.left),
-                        right: to_plane_info(&pair.right),
-                    }))
-                }
-                None => Ok(None),
-            }
-        }
-
-        /// NVMM frames are GPU-resident (DMA-buf imported into Vulkan).
-        fn is_gpu_resident(&self) -> bool {
-            true
-        }
-
-        /// NVMM cameras deliver NV12 (NVIDIA ISP native format).
-        fn gpu_pixel_format(&self) -> reco_core::render::renderer::GpuPixelFormat {
-            reco_core::render::renderer::GpuPixelFormat::Nv12
         }
     }
 

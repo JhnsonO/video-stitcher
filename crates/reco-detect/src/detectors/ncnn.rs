@@ -20,9 +20,8 @@ use std::os::raw::c_char;
 use std::path::Path;
 
 use reco_core::detect::detector::{
-    ChromaFormat, Detection, DetectorError, DetectorFrame, RawFrame, UnifiedDetector,
+    CameraId, ChromaFormat, Detection, DetectorError, DetectorFrame, RawFrame, UnifiedDetector,
 };
-use reco_core::geometry::CameraId;
 
 // ── NCNN C API FFI ──────────────────────────────────────────────────
 

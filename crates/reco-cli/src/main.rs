@@ -11,8 +11,6 @@ mod helpers;
 #[cfg(feature = "libcamera")]
 mod libcamera_cmd;
 mod preview;
-#[cfg(feature = "snapshot")]
-mod snapshot;
 mod stitch;
 
 use clap::{Parser, Subcommand};
@@ -131,7 +129,7 @@ enum Commands {
         /// Path to the right camera video file.
         right: String,
 
-        /// Path to the calibration JSON file.
+        /// Path to the calibration JSON file (v1-compatible match format).
         #[arg(short, long)]
         calibration: String,
 
@@ -171,10 +169,10 @@ enum Commands {
         #[arg(long, default_value = "balanced")]
         quality: String,
 
-        /// Seam blend width (0.0–1.0). 0 = hard edge. Overrides the
-        /// calibration's saved value; when omitted, the calibration decides.
-        #[arg(long, value_parser = parse_blend)]
-        blend: Option<f32>,
+        /// Seam blend width (0.0–1.0). Controls how much the two camera views
+        /// are blended at the seam. 0 = hard edge, 0.15 = smooth transition.
+        #[arg(long, default_value_t = 0.15, value_parser = parse_blend)]
+        blend: f32,
 
         /// Frame offset for temporal sync between cameras.
         /// Positive: skip N right frames (right started first).
@@ -287,7 +285,7 @@ enum Commands {
         /// Path to the right camera video file.
         right: String,
 
-        /// Path to the calibration JSON file.
+        /// Path to the calibration JSON file (v1-compatible match format).
         #[arg(short, long)]
         calibration: String,
 
@@ -305,10 +303,9 @@ enum Commands {
         #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
         sync_offset: i64,
 
-        /// Seam blend width (0.0 = hard cut). Overrides the calibration's
-        /// saved value; when omitted, the calibration decides.
-        #[arg(long, value_parser = parse_blend)]
-        blend: Option<f32>,
+        /// Seam blend width (0.0 = hard cut, 0.15 = default smooth blend).
+        #[arg(long, default_value_t = 0.15)]
+        blend: f32,
 
         /// Rig tilt in degrees. Rotates the entire scene to compensate for
         /// a tilted camera rig, straightening vertical lines at the edges.
@@ -367,10 +364,9 @@ enum Commands {
         #[arg(long, default_value = "fast")]
         quality: String,
 
-        /// Seam blend width (0.0-1.0). Overrides the calibration's saved
-        /// value; when omitted, the calibration decides.
-        #[arg(long, value_parser = parse_blend)]
-        blend: Option<f32>,
+        /// Seam blend width (0.0-1.0).
+        #[arg(long, default_value_t = 0.15, value_parser = parse_blend)]
+        blend: f32,
 
         /// Maximum number of frames to capture.
         #[arg(long)]
@@ -387,28 +383,6 @@ enum Commands {
         /// Detection interval: run detection every N frames (default: 1).
         #[arg(long, default_value_t = 1)]
         detection_interval: u64,
-
-        /// Directory for periodic JPEG snapshots of the stitched output
-        /// (live preview for the gameday web panel). Requires the
-        /// `snapshot` build feature.
-        #[cfg(feature = "snapshot")]
-        #[arg(long)]
-        snapshot_dir: Option<String>,
-
-        /// Write a snapshot every N frames (default: 30). Only effective
-        /// when --snapshot-dir is set.
-        #[cfg(feature = "snapshot")]
-        #[arg(long, default_value_t = 30)]
-        snapshot_interval: u64,
-
-        /// Lookahead buffer in seconds for the live camera path. The panner
-        /// leads the play by this window and the loop centered-smooths the
-        /// pose lag-free, the same as `stitch --lookahead`. Adds ~this much
-        /// latency and a VRAM pool sized to the window, so the live default
-        /// is modest. Only engages with AI tracking (needs --model,
-        /// non-sweep). 0 = off (immediate render).
-        #[arg(long, default_value_t = 0.75)]
-        lookahead: f64,
 
         /// Encoder quality on a 0-100 scale (higher = better). Overrides the
         /// quality preset. See `stitch --help` for the full mapping table.
@@ -542,10 +516,9 @@ enum Commands {
         #[arg(long, default_value = "fast")]
         quality: String,
 
-        /// Seam blend width (0.0-1.0). Overrides the calibration's saved
-        /// value; when omitted, the calibration decides.
-        #[arg(long, value_parser = parse_blend)]
-        blend: Option<f32>,
+        /// Seam blend width (0.0-1.0).
+        #[arg(long, default_value_t = 0.15, value_parser = parse_blend)]
+        blend: f32,
 
         /// Maximum number of frames to capture.
         #[arg(long)]
@@ -889,11 +862,6 @@ fn main() -> anyhow::Result<()> {
             end_time,
             model,
             detection_interval,
-            #[cfg(feature = "snapshot")]
-            snapshot_dir,
-            #[cfg(feature = "snapshot")]
-            snapshot_interval,
-            lookahead,
             quality_value,
             preset,
             container,
@@ -958,11 +926,6 @@ fn main() -> anyhow::Result<()> {
                     capture_fps,
                     model_path: model.as_deref(),
                     detection_interval,
-                    #[cfg(feature = "snapshot")]
-                    snapshot_dir: snapshot_dir.as_deref(),
-                    #[cfg(feature = "snapshot")]
-                    snapshot_interval,
-                    lookahead,
                     quality_value,
                     preset,
                     container: container.as_deref(),

@@ -47,7 +47,7 @@ impl StitchSession {
     /// detector; backends return `UnsupportedFrameKind` for residencies
     /// they cannot handle and session logs+drops those at the boundary.
     pub fn set_detector(&mut self, detector: Box<dyn crate::detect::detector::UnifiedDetector>) {
-        self.core.set_detector(detector);
+        self.detection.set_detector(detector);
     }
 
     /// Set the detection interval (run detection every N frames).
@@ -56,7 +56,7 @@ impl StitchSession {
     /// at the cost of tracking responsiveness. The director still receives
     /// the last known tracked objects on skipped frames.
     pub fn set_detection_interval(&mut self, interval: u64) {
-        self.core.set_detection_interval(interval);
+        self.detection.set_detection_interval(interval);
     }
 
     /// Attach a pipeline event sink for structured observability.
@@ -82,7 +82,8 @@ impl StitchSession {
         &mut self,
         sink: Box<dyn crate::detect::pipeline_event::PipelineEventSink>,
     ) {
-        self.core.set_event_sink(sink);
+        log::info!("StitchSession: event sink attached");
+        self.event_sink = Some(sink);
     }
 
     /// Attach a singleton ball tracker. See
@@ -90,20 +91,29 @@ impl StitchSession {
     /// for semantics - the session mirrors the core's API so push
     /// and pull consumers stay symmetric.
     pub fn set_ball_tracker(&mut self, tracker: Box<dyn crate::detect::tracker::Tracker>) {
-        self.core.set_ball_tracker(tracker);
+        log::info!(
+            "StitchSession: ball tracker attached (class_id={})",
+            tracker.class_id()
+        );
+        self.ball_tracker = Some(tracker);
     }
 
     /// Attach a multi-entity player tracker. Mirror of
     /// [`StitchCore::set_player_tracker`](crate::core::StitchCore::set_player_tracker).
     pub fn set_player_tracker(&mut self, tracker: Box<dyn crate::detect::tracker::Tracker>) {
-        self.core.set_player_tracker(tracker);
+        log::info!(
+            "StitchSession: player tracker attached (class_id={})",
+            tracker.class_id()
+        );
+        self.player_tracker = Some(tracker);
     }
 
     /// Attach a panner. When set, the tracker/panner path owns
     /// pose resolution each frame; without a panner the pose stays at
     /// the pipeline default.
     pub fn set_panner(&mut self, panner: Box<dyn crate::detect::panner::Panner>) {
-        self.core.set_panner(panner);
+        log::info!("StitchSession: panner attached");
+        self.panner = Some(panner);
     }
 
     /// Set the lookahead buffer depth in frames.
@@ -216,22 +226,7 @@ impl StitchSession {
     /// tweaking during preview or live operation. Delegates to
     /// `StitchCore::update_calibration` which re-derives the coverage
     /// boundary in one call.
-    pub fn update_calibration(&mut self, calibration: crate::calibration::Calibration) {
+    pub fn update_calibration(&mut self, calibration: crate::calibration::MatchCalibration) {
         self.core.update_calibration(calibration);
-    }
-
-    /// Set an NV12 tap callback invoked after each frame's NV12 readback.
-    /// The callback receives `(nv12_data, width, height)`.
-    ///
-    /// Used by reco-cli's snapshot writer for periodic JPEG output. The
-    /// callback should return quickly (e.g. `try_send` on a channel) to
-    /// avoid blocking the frame loop.
-    pub fn set_nv12_tap(&mut self, tap: super::Nv12TapFn) {
-        self.nv12_tap = Some(tap);
-    }
-
-    /// Remove the NV12 tap callback.
-    pub fn clear_nv12_tap(&mut self) {
-        self.nv12_tap = None;
     }
 }

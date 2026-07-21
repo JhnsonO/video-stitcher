@@ -126,7 +126,8 @@ cargo build --release
 | `gstreamer` | reco-io | GStreamer camera ingest (Linux / Jetson CSI) |
 | `stacked-output` | reco-io | FFmpeg-backed stacked-video encoder / source |
 | `profiling` | workspace | `tracing` + `tracing-chrome` instrumentation, zero-cost when off |
-| `gopro` | reco-control | Optional OpenGoPro device helper (recording control) |
+| `keyboard` (default) | reco-control | Keyboard transport for operator intents |
+| `gopro` / `mobile` / `websocket` | reco-control | Placeholder transports for future work |
 
 Example combined build:
 

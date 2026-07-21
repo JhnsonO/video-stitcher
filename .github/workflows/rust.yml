@@ -59,12 +59,6 @@ jobs:
         run: cargo clippy -p reco-gui --all-targets --features automation -- -D warnings
       - name: Clippy (no default features)
         run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
-      # -p isolates reco-core from workspace feature unification, so this
-      # is the one lint lane where the gpu feature is genuinely OFF and
-      # the wgpu-free leaf (geometry, calibration, CPU stitch) is checked
-      # on its own.
-      - name: Clippy (reco-core wgpu-free)
-        run: cargo clippy -p reco-core --all-targets --no-default-features -- -D warnings
 
   # ===========================================================================
   # test — default features + profiling + all-features.
@@ -72,13 +66,6 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    # The GPU-execution tests (CPU-vs-GPU stitch agreement, KB4) run against a
-    # software Vulkan adapter (lavapipe) so they are actually exercised in CI
-    # instead of silently skipping on the GPU-less runner. RECO_REQUIRE_GPU
-    # turns "no adapter" into a hard failure, so a missing/broken adapter fails
-    # CI loudly rather than letting the agreement tests pass vacuously.
-    env:
-      RECO_REQUIRE_GPU: "1"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@stable
@@ -86,24 +73,10 @@ jobs:
       - uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
           packages: ${{ env.APT_PACKAGES }}
-      - name: Install software Vulkan (lavapipe) for GPU-execution tests
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
-          echo "--- vulkaninfo --summary ---"
-          vulkaninfo --summary 2>&1 | head -40 || true
       - name: Run tests (default)
         run: cargo test --workspace
       - name: Run tests (with profiling)
         run: cargo test --workspace --features profiling
-      # The wgpu-free build: -p bypasses workspace feature unification so
-      # reco-core really compiles without wgpu, proving the CPU stitch /
-      # geometry / calibration leaf stands alone (GPU-less targets).
-      # RECO_REQUIRE_GPU must not apply - there is no GPU path to require.
-      - name: Run tests (reco-core wgpu-free)
-        run: cargo test -p reco-core --no-default-features
-        env:
-          RECO_REQUIRE_GPU: ""
 
   # ===========================================================================
   # doc — full workspace docs, all features enabled, warnings-as-errors.
@@ -118,8 +91,8 @@ jobs:
       - uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
           packages: ${{ env.APT_PACKAGES }}
-      - name: Build docs (profiling + gstreamer + load-dynamic + stacked-output + gopro)
-        run: cargo doc --workspace --no-deps --features profiling,gstreamer,load-dynamic,stacked-output,gopro
+      - name: Build docs (profiling + gstreamer + load-dynamic + stacked-output + reco-control transports)
+        run: cargo doc --workspace --no-deps --features profiling,gstreamer,load-dynamic,stacked-output,keyboard,gopro
         env:
           RUSTDOCFLAGS: "-D warnings"
 
@@ -151,10 +124,6 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # quick-xml DoS advisories: transitive via the Linux GUI stack
-          # (zbus_xml / wayland-scanner), local-input only. Justified in
-          # deny.toml; keep the two lists in sync.
-          ignore: RUSTSEC-2026-0194, RUSTSEC-2026-0195
 
   # ===========================================================================
   # msrv — the Rust toolchain we officially support.

@@ -19,6 +19,8 @@
 /// Session type definitions, error types, and builder.
 pub mod types;
 
+/// Detection pipeline - also usable standalone without StitchSession.
+pub mod detection;
 /// Detection dispatch entry points (detect_and_update_director_* variants).
 mod detection_dispatch;
 /// Lookahead frame buffer for temporal-aware processing.
@@ -52,17 +54,16 @@ pub use zero_copy_linux::SharedTextureSet;
 
 use crate::async_encode::AsyncEncodeThread;
 use crate::core::StitchCore;
-use crate::core::types::StitchCoreError;
+use crate::core::types::StitchCoreConfig;
+use crate::detect::director::ViewportPosition;
 use crate::gpu::nv12_converter::Nv12Converter;
 use crate::gpu::{GpuContext, OutputFormat};
 use crate::render::pipeline::StitchPipeline;
 use crate::render::renderer::InputFormat;
-use crate::stitch::{Executor, GpuExecutor, GpuExecutorConfig};
-
-/// Callback type for the NV12 tap: receives `(nv12_data, width, height)`.
-pub type Nv12TapFn = Box<dyn FnMut(&[u8], u32, u32) + Send>;
 
 use types::{ErrorPolicy, SessionConfig, SessionError, SessionMetrics, StitchSessionBuilder};
+
+use detection::DetectionPipeline;
 
 /// A high-level stitching session that owns the GPU pipeline, NV12
 /// converter, and optionally an async encoder.
@@ -74,16 +75,35 @@ use types::{ErrorPolicy, SessionConfig, SessionError, SessionMetrics, StitchSess
 /// Call [`finish`](Self::finish) to flush the last frame and finalize
 /// encoding.
 pub struct StitchSession {
-    /// The canonical push-first engine. Owns the render substrate,
-    /// readback staging, coverage boundary, and the single AI stack
-    /// (detector, trackers, panner, event sink). The session is the
-    /// pull-loop orchestrator over it: frame buffering, encode
-    /// fan-out, telemetry, progress.
+    /// The canonical push-first core. Owns the `StitchPipeline`,
+    /// readback staging, coverage boundary, and director slot. The
+    /// session's director + legacy-detector path delegates pose +
+    /// coverage decisions to `self.core` during the plan-step-2
+    /// transition; later tranches will migrate the legacy
+    /// `DetectionPipeline` into the core too.
     pub(crate) core: StitchCore,
     pub(crate) nv12_converter: Nv12Converter,
     pub(crate) encoder: Option<AsyncEncodeThread>,
     /// Additional encoders for multi-output (stream + record).
     pub(crate) extra_encoders: Vec<AsyncEncodeThread>,
+    /// Detection backends, interval, callback, and cached detections.
+    pub(crate) detection: DetectionPipeline,
+    /// Tracker/panner pose resolution. When `panner` is set, it owns
+    /// pose resolution each frame; when unset the pose stays at the
+    /// pipeline default. Trackers are wired here rather than inside
+    /// the panner so multiple panners can share the same tracker
+    /// output (e.g. replay + live from the same WorldState).
+    pub(crate) ball_tracker: Option<Box<dyn crate::detect::tracker::Tracker>>,
+    pub(crate) player_tracker: Option<Box<dyn crate::detect::tracker::Tracker>>,
+    pub(crate) panner: Option<Box<dyn crate::detect::panner::Panner>>,
+    /// Previous frame's resolved pose (post-clamping), handed to the
+    /// panner via [`PanContext::previous_position`](crate::detect::panner::PanContext::previous_position).
+    pub(crate) previous_panner_pose: ViewportPosition,
+    /// Future WorldStates from the lookahead buffer, passed to the
+    /// panner via `decide_with_lookahead`. Empty when lookahead is off.
+    pub(crate) lookahead_world_states: Vec<crate::detect::tracker::WorldState>,
+    /// Last WorldState produced by dispatch, captured for the buffer.
+    pub(crate) last_world_state: crate::detect::tracker::WorldState,
     /// When true, `process_frame_any` skips detection (the produce phase
     /// already ran it and stored the WorldState in the buffer).
     pub(crate) skip_detection: bool,
@@ -96,6 +116,7 @@ pub struct StitchSession {
     pub(crate) error_policy: ErrorPolicy,
     /// Dropped frame counter (for metrics).
     frames_dropped: u64,
+    pub(crate) event_sink: Option<Box<dyn crate::detect::pipeline_event::PipelineEventSink>>,
     pub(crate) telemetry: crate::telemetry::TelemetryCollector,
     /// Sub-timing from the last `submit_render_output` call.
     /// Used by `process_frame_any` to split "stitch" into
@@ -149,19 +170,6 @@ pub struct StitchSession {
     #[cfg(target_os = "windows")]
     pub(crate) d3d11_staging_pool: Option<crate::interop::d3d11::D3d11StagingPool>,
 
-    /// DMA-buf -> Vulkan texture cache for the NVMM zero-copy render path
-    /// (Jetson). Keyed by DMA-buf fd; the ISP rotates a small fd pool so
-    /// each is imported once. Created lazily on the first NvmmResident frame.
-    #[cfg(target_os = "linux")]
-    pub(crate) nvmm_dmabuf_cache: Option<crate::interop::dmabuf::DmaBufTextureCache>,
-    /// Left-camera NvBufSurfTransform detection surface (Jetson NVMM path).
-    /// Allocated by [`setup_nvmm_detection`](Self::setup_nvmm_detection).
-    #[cfg(target_os = "linux")]
-    pub(crate) nvmm_det_left: Option<crate::nvbuf_transform::NvBufDetectionSurface>,
-    /// Right-camera NvBufSurfTransform detection surface (Jetson NVMM path).
-    #[cfg(target_os = "linux")]
-    pub(crate) nvmm_det_right: Option<crate::nvbuf_transform::NvBufDetectionSurface>,
-
     /// Camera rotation from stream metadata, populated by
     /// [`configure_from_source`](Self::configure_from_source).
     /// Used to tell the GPU detector to flip frames during preprocessing.
@@ -174,10 +182,6 @@ pub struct StitchSession {
     pub(crate) gpu_pixel_format: crate::render::renderer::GpuPixelFormat,
     /// Full-range YUV (0-255) vs limited range (16-235).
     pub(crate) is_full_range: bool,
-    /// Optional callback invoked with NV12 data after each frame.
-    /// Used by reco-cli's snapshot writer for periodic JPEG output.
-    /// The callback receives `(nv12_data, width, height)`.
-    pub(crate) nv12_tap: Option<Nv12TapFn>,
 }
 
 impl StitchSession {
@@ -212,36 +216,35 @@ impl StitchSession {
         let output_height = config.viewport.height;
 
         // Build a `StitchCore` as the session's rendering foundation.
-        // The executor owns the pipeline + projection; the core layers
-        // readback + coverage on top. The session layers on NV12
-        // conversion, async encoding, lookahead, and the legacy
-        // per-platform detection pipeline (until the unified-detector
-        // migration of the session body completes).
+        // Core owns the pipeline + readback + coverage + projection +
+        // camera_input. The session layers on NV12 conversion, async
+        // encoding, lookahead, and the legacy per-platform detection
+        // pipeline (until the unified-detector migration of the
+        // session body completes).
         //
         // Rotation is NOT applied here. It's handled by:
         // - CPU path: decoder reverses buffers in extract_yuv()
         // - GPU path: configure_from_source() sets shader UV flip in run()
         // SessionConfig.left_rotation/right_rotation are kept for Layer 1
         // consumers who call set_flip_180() manually.
-        let executor = GpuExecutor::new(
+        let core = StitchCore::new(
             gpu,
-            GpuExecutorConfig {
+            StitchCoreConfig {
                 calibration: config.calibration,
                 viewport: config.viewport,
                 input_width: config.input_width,
                 input_height: config.input_height,
-                input_format: config.input_format,
                 // `OutputFormat` -> `wgpu::TextureFormat` via the
                 // `From` impl in `crate::gpu`; covers all three
                 // session-facing variants (Rgba8Unorm, Rgba8UnormSrgb,
                 // Bgra8UnormSrgb).
                 output_format: config.output_format.into(),
+                input_format: config.input_format,
                 projection: None,
-                full_range: false,
+                camera_input: None,
+                replay_buffer_duration: None,
             },
-        )
-        .map_err(StitchCoreError::from)?;
-        let core = StitchCore::new(Executor::Gpu(Box::new(executor)))?;
+        )?;
 
         let nv12_converter = Nv12Converter::new(core.gpu(), output_width, output_height)?;
 
@@ -249,6 +252,13 @@ impl StitchSession {
             core,
             nv12_converter,
             encoder: None,
+            detection: DetectionPipeline::new(),
+            ball_tracker: None,
+            player_tracker: None,
+            panner: None,
+            previous_panner_pose: ViewportPosition::default(),
+            lookahead_world_states: Vec::new(),
+            last_world_state: crate::detect::tracker::WorldState::default(),
             skip_detection: false,
             lookahead_frames: 0,
             frame_count: 0,
@@ -256,6 +266,7 @@ impl StitchSession {
             session_start: None,
             error_policy: ErrorPolicy::default(),
             frames_dropped: 0,
+            event_sink: None,
             telemetry: crate::telemetry::TelemetryCollector::new(),
             last_readback_time: std::time::Duration::ZERO,
             last_submit_time: std::time::Duration::ZERO,
@@ -275,19 +286,12 @@ impl StitchSession {
             metal_texture_cache: None,
             #[cfg(target_os = "windows")]
             d3d11_staging_pool: None,
-            #[cfg(target_os = "linux")]
-            nvmm_dmabuf_cache: None,
-            #[cfg(target_os = "linux")]
-            nvmm_det_left: None,
-            #[cfg(target_os = "linux")]
-            nvmm_det_right: None,
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             left_rotation: 0,
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             right_rotation: 0,
             gpu_pixel_format: crate::render::renderer::GpuPixelFormat::Nv12,
             is_full_range: false,
-            nv12_tap: None,
         })
     }
 
@@ -442,10 +446,10 @@ impl crate::detect::DetectionTarget for StitchSession {
     fn set_panner(&mut self, panner: Box<dyn crate::detect::panner::Panner>) {
         self.set_panner(panner);
     }
-    fn source_info(&self) -> (u32, u32) {
-        self.core.source_info()
+    fn pipeline(&self) -> &crate::render::pipeline::StitchPipeline {
+        self.pipeline()
     }
-    fn gpu(&self) -> Option<&crate::gpu::GpuContext> {
-        Some(self.core.gpu())
+    fn gpu(&self) -> &crate::gpu::GpuContext {
+        self.gpu()
     }
 }

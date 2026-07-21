@@ -24,7 +24,7 @@ pub struct LibcameraRunConfig<'a> {
     pub output: &'a str,
     pub width: u32,
     pub height: u32,
-    pub blend: Option<f32>,
+    pub blend: f32,
     pub encoder_name: Option<String>,
     pub codec: &'a str,
     pub quality: &'a str,
@@ -64,18 +64,14 @@ pub fn run_libcamera(
         "Output path looks like a network URL ({output}). Only local file paths are supported.",
     );
 
-    let mut cal = reco_core::calibration::Calibration::from_file(Path::new(calibration))?;
-    if let Some(b) = blend {
-        eprintln!(
-            "Seam blend: --blend {b} overrides the calibration's {}",
-            cal.topology.blend_width
-        );
-        cal.topology.blend_width = b;
-    }
+    let cal = reco_core::calibration::MatchCalibration::from_file(Path::new(calibration))?;
 
     let viewport = reco_core::render::viewport::ViewportConfig {
         width,
         height,
+        blend_width: blend,
+        rig_tilt: cal.rig_tilt as f32,
+        rig_roll: cal.rig_roll as f32,
         ..Default::default()
     };
 

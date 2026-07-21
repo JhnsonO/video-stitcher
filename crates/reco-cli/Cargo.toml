@@ -1,7 +1,7 @@
 [package]
 publish = false
 name = "reco-cli"
-version = "0.5.3-beta.2"
+version = "0.5.3"
 edition.workspace = true
 rust-version.workspace = true
 description = "CLI tool for Reco panoramic video stitching"
@@ -36,10 +36,6 @@ tensorrt-native = ["autocam", "reco-autocam/tensorrt-native"]
 ncnn = ["autocam", "reco-autocam/ncnn"]
 gopro = ["reco-control/gopro"]
 gstreamer = ["reco-io/gstreamer"]
-# Periodic JPEG snapshots of the stitched output (live preview for the
-# gameday panel). Opt-in so it compiles out cleanly; implies gstreamer
-# since it's only wired into the camera path.
-snapshot = ["gstreamer"]
 v4l2 = ["reco-io/v4l2"]
 libcamera = ["reco-io/libcamera"]
 rpi = ["reco-io/rpi"]

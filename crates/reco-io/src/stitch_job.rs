@@ -53,9 +53,7 @@ pub struct StitchJob {
     end_time: Option<f64>,
     max_frames: Option<u64>,
     sync_offset: Option<i64>,
-    /// Seam blend override. `None` (default) respects the calibration
-    /// document's saved value - the single home for render params.
-    blend_width: Option<f32>,
+    blend_width: f32,
 
     // Callbacks
     on_progress: Option<ProgressCallback>,
@@ -114,7 +112,7 @@ enum CalibrationSource {
     /// Load from a JSON file path.
     File(PathBuf),
     /// Use an in-memory calibration (no file I/O).
-    Memory(Box<reco_core::calibration::Calibration>),
+    Memory(Box<reco_core::calibration::MatchCalibration>),
 }
 
 /// Input video file path(s), supporting chained/segmented recordings.
@@ -249,7 +247,7 @@ impl StitchJob {
             end_time: None,
             max_frames: None,
             sync_offset: None,
-            blend_width: None,
+            blend_width: 0.15,
             on_progress: None,
             on_finalizing: None,
             session_hooks: Vec::new(),
@@ -265,7 +263,7 @@ impl StitchJob {
     pub fn with_calibration(
         left: impl Into<InputPath>,
         right: impl Into<InputPath>,
-        calibration: reco_core::calibration::Calibration,
+        calibration: reco_core::calibration::MatchCalibration,
         output: impl AsRef<Path>,
     ) -> Self {
         let mut job = Self::new(left, right, Path::new(""), output);
@@ -367,10 +365,9 @@ impl StitchJob {
         self
     }
 
-    /// Override the calibration's saved seam blend width (0.0 - 1.0).
-    /// When not called, the calibration document's value is used.
+    /// Set the blend width for seam blending (0.0 - 1.0). Default: 0.15.
     pub fn blend_width(mut self, blend: f32) -> Self {
-        self.blend_width = Some(blend);
+        self.blend_width = blend;
         self
     }
 
@@ -549,9 +546,9 @@ impl StitchJob {
         let start = std::time::Instant::now();
 
         // Load calibration
-        let mut cal = match self.calibration {
+        let cal = match self.calibration {
             CalibrationSource::File(ref path) => {
-                reco_core::calibration::Calibration::from_file(path)
+                reco_core::calibration::MatchCalibration::from_file(path)
                     .map_err(|e| StitchError::Calibration(format!("{e}")))?
             }
             CalibrationSource::Memory(cal) => *cal,
@@ -586,23 +583,13 @@ impl StitchJob {
             reco_core::render::renderer::InputFormat::Yuv420p
         };
 
-        // Build session. Blend lives on the calibration; an explicit job
-        // override replaces it, otherwise the saved value renders as-is.
-        if let Some(blend) = self.blend_width {
-            log::info!(
-                "seam blend: overriding calibration value {} with {blend}",
-                cal.topology.blend_width
-            );
-            cal.topology.blend_width = blend;
-        } else {
-            log::info!(
-                "seam blend: using calibration value {}",
-                cal.topology.blend_width
-            );
-        }
+        // Build session
         let viewport = reco_core::render::viewport::ViewportConfig {
             width: out_w,
             height: out_h,
+            blend_width: self.blend_width,
+            rig_tilt: cal.rig_tilt as f32,
+            rig_roll: cal.rig_roll as f32,
             ..Default::default()
         };
         let session_config = reco_core::session::types::SessionConfig {
@@ -652,6 +639,27 @@ impl StitchJob {
                 Err(e) => {
                     log::warn!("Failed to open events file {}: {e}", events_path.display());
                 }
+            }
+        }
+
+        // All inputs must share one frame rate: the session clock, trim
+        // math, and encoder run on the first input's rate, so a mismatched
+        // camera silently drifts out of sync over a match (#315). 0.5 fps
+        // tolerance absorbs probe rounding (30000/1001 vs 30/1) without
+        // letting 25-vs-30 or 30-vs-60 setups through.
+        if info.fps > 0.0
+            && let Ok((n, d)) =
+                crate::adapters::FfmpegFileSource::frame_rate(self.right.first_path())
+            && d != 0
+        {
+            let right_fps = n as f64 / d as f64;
+            if (right_fps - info.fps).abs() > 0.5 {
+                return Err(StitchError::Other(format!(
+                    "frame rate mismatch: right input is {right_fps:.2} fps but the left \
+                     input is {:.2} fps; record all cameras at the same frame rate (mixed \
+                     rates are not supported yet)",
+                    info.fps,
+                )));
             }
         }
 
@@ -710,12 +718,20 @@ impl StitchJob {
         session.set_encoder(Box::new(encoder), 2);
 
         #[cfg(feature = "stacked-output")]
-        if let Some(ref mut cfg) = self.replay_recording
-            && cfg.encoder_config.inner.encoder_name.is_none()
-        {
-            cfg.encoder_config.inner.encoder_name =
-                crate::ffmpeg::encoder::VideoEncoder::replay_encoder_name(&enc_name)
-                    .map(String::from);
+        if let Some(ref mut cfg) = self.replay_recording {
+            if cfg.encoder_config.inner.encoder_name.is_none() {
+                cfg.encoder_config.inner.encoder_name =
+                    crate::ffmpeg::encoder::VideoEncoder::replay_encoder_name(&enc_name)
+                        .map(String::from);
+            }
+            if cfg.encoder_config.fps.is_none() {
+                cfg.encoder_config.fps = Some(fps_rational);
+                log::info!(
+                    "replay recording follows the source rate {}/{}",
+                    fps_rational.0,
+                    fps_rational.1
+                );
+            }
         }
 
         // Resolve processing window (start_time / end_time / max_frames).

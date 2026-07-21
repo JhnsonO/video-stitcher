@@ -258,42 +258,6 @@ pub struct Nv12FramePair {
     pub right: Nv12Data,
 }
 
-/// Per-camera metadata for an NVMM zero-copy frame (Jetson).
-///
-/// Carries the DMA-buf fd (Vulkan render import) and the raw
-/// `NvBufSurface*` pointer (NvBufSurfTransform detection preprocessing)
-/// for one camera, plus the plane geometry needed for the Vulkan import.
-/// This is the reco-core mirror of reco-io's `NvmmFrameInfo` - reco-core
-/// has no I/O deps, so the I/O backend constructs this from its own type.
-///
-/// Both the fd and the surface pointer are only valid while the source
-/// holds the underlying GStreamer sample alive (until the session has
-/// copied the frame into the VRAM pool and run detection on it).
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy)]
-pub struct NvmmPlaneInfo {
-    /// DMA-buf file descriptor for Vulkan import (render path).
-    pub dmabuf_fd: i32,
-    /// Frame width in pixels.
-    pub width: u32,
-    /// Frame height in pixels.
-    pub height: u32,
-    /// Y plane byte offset within the DMA-buf.
-    pub y_offset: u32,
-    /// UV plane byte offset within the DMA-buf.
-    pub uv_offset: u32,
-    /// Total allocation size (Vulkan memory import).
-    pub total_size: u32,
-    /// Raw `NvBufSurface*` pointer for `NvBufSurfTransform` (detection path).
-    pub surface_ptr: *mut std::ffi::c_void,
-}
-
-// SAFETY: the surface pointer is a stable kernel-managed NVMM pool address;
-// the source's capture thread keeps the GstSample alive until release. The
-// session that consumes this never moves it across threads.
-#[cfg(target_os = "linux")]
-unsafe impl Send for NvmmPlaneInfo {}
-
 /// A stereo frame in any supported format.
 ///
 /// Sources produce whichever format is most efficient for their backend:
@@ -301,7 +265,6 @@ unsafe impl Send for NvmmPlaneInfo {}
 /// - Jetson ISP / NVDEC NV12: `Nv12`
 /// - CUDA/Vulkan zero-copy shared textures: `GpuResident`
 /// - VideoToolbox/Metal zero-copy: `MetalResident`
-/// - Jetson NVMM zero-copy (DMA-buf + NvBufSurface): `NvmmResident`
 #[non_exhaustive]
 pub enum StereoFrame {
     /// CPU-resident YUV420P planes (3 planes per camera).
@@ -338,17 +301,6 @@ pub enum StereoFrame {
         right_texture: *mut std::ffi::c_void,
         /// Array slice index within the D3D11VA decode pool for right camera.
         right_slice: usize,
-    },
-    /// Jetson NVMM zero-copy: NV12 frames in NvBufSurface DMA-buf memory.
-    /// The session imports the DMA-buf as Vulkan textures for rendering
-    /// (copied into the VRAM pool) and runs `NvBufSurfTransform` on the
-    /// surface pointer for detection. Produced by the NVMM camera source.
-    #[cfg(target_os = "linux")]
-    NvmmResident {
-        /// Left camera NVMM plane metadata.
-        left: NvmmPlaneInfo,
-        /// Right camera NVMM plane metadata.
-        right: NvmmPlaneInfo,
     },
 }
 
@@ -423,7 +375,6 @@ pub trait FrameSource: Send {
     ///
     /// Only meaningful when [`is_gpu_resident`](Self::is_gpu_resident) returns `true`.
     /// Determines shared texture formats (R8Unorm for NV12, R16Unorm for P010).
-    #[cfg(feature = "gpu")]
     fn gpu_pixel_format(&self) -> crate::render::renderer::GpuPixelFormat {
         crate::render::renderer::GpuPixelFormat::Nv12
     }
@@ -509,6 +460,75 @@ pub trait FrameSource: Send {
     fn start_decoding(&mut self) {}
 }
 
+// ---------------------------------------------------------------------------
+// M3 foundation: CameraInput trait + placeholder impls.
+// ---------------------------------------------------------------------------
+//
+// Plan-execution §2.6: today's stack hardcodes N=2 stereo input
+// everywhere (StereoFrame, FramePair, submit_frame(left, right)).
+// Future 1-video mode (§8 table) and N-camera panoramic rigs need a
+// trait that expresses input cardinality independently of the frame
+// delivery path.
+//
+// CameraInput is the input-cardinality contract. It complements
+// Projection (output geometry) so StitchCore can enforce that input
+// and projection agree on camera_count at construction time. The
+// existing FrameSource trait stays in place as the concrete
+// stereo-only frame delivery interface; CameraInput is the more
+// general trait that N-camera work (and MonoCameraInput) will
+// implement in later tranches.
+
+/// Input-cardinality marker trait.
+///
+/// Concrete impls encode how many camera streams feed the stitch
+/// pipeline. Used by StitchCore (M3 refactor) to verify its
+/// [`Projection`](crate::projection::Projection) matches the input
+/// contract at construction time.
+///
+/// `Send` bound only (mobile-friendly per plan-execution §2.8). A
+/// concrete impl that needs to be shared across threads adds the
+/// `Sync` bound itself.
+pub trait CameraInput: Send {
+    /// Short human-readable name for logs + diagnostic bundles
+    /// (e.g. `"stereo-2camera"`, `"mono"`, `"panoramic-6camera"`).
+    fn name(&self) -> &'static str;
+
+    /// How many camera streams this input provides. Must equal the
+    /// paired [`Projection::camera_count`](crate::projection::Projection::camera_count).
+    fn camera_count(&self) -> u8;
+}
+
+/// Placeholder impl for today's 2-camera stereo input. Carries no
+/// state; matches the hardcoded N=2 assumption everywhere the
+/// existing code paths use.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StereoCameraInput;
+
+impl CameraInput for StereoCameraInput {
+    fn name(&self) -> &'static str {
+        "stereo-2camera"
+    }
+    fn camera_count(&self) -> u8 {
+        2
+    }
+}
+
+/// Reserved slot for future 1-video mode (single-lens undistort +
+/// viewport, no stitch). No impl ships today; the marker exists so
+/// MonoProjection work can land alongside its matching input type
+/// when the user picks the second-projection form (§7 decision 8).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MonoCameraInput;
+
+impl CameraInput for MonoCameraInput {
+    fn name(&self) -> &'static str {
+        "mono-1camera"
+    }
+    fn camera_count(&self) -> u8 {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,5 +581,41 @@ mod tests {
             }) => {}
             other => panic!("expected Empty, got {other:?}"),
         }
+    }
+
+    // ── M3 foundation: CameraInput trait tests ───────────────────────
+
+    #[test]
+    fn stereo_camera_input_is_two_camera() {
+        let s = StereoCameraInput;
+        assert_eq!(s.name(), "stereo-2camera");
+        assert_eq!(s.camera_count(), 2);
+    }
+
+    #[test]
+    fn mono_camera_input_is_one_camera() {
+        let m = MonoCameraInput;
+        assert_eq!(m.name(), "mono-1camera");
+        assert_eq!(m.camera_count(), 1);
+    }
+
+    #[test]
+    fn camera_input_is_dyn_compatible() {
+        // StitchCore (M3) will hold a `Box<dyn CameraInput>` slot.
+        // Verify the trait bounds support that today.
+        let inputs: Vec<Box<dyn CameraInput>> =
+            vec![Box::new(StereoCameraInput), Box::new(MonoCameraInput)];
+        assert_eq!(inputs[0].camera_count(), 2);
+        assert_eq!(inputs[1].camera_count(), 1);
+    }
+
+    #[test]
+    fn camera_count_matches_projection_contract() {
+        // Core invariant for StitchCore construction: the paired
+        // CameraInput and Projection must agree on camera_count.
+        use crate::projection::{LShapeProjection, Projection};
+        let input = StereoCameraInput;
+        let proj = LShapeProjection;
+        assert_eq!(input.camera_count(), proj.camera_count());
     }
 }

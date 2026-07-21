@@ -4,20 +4,74 @@
 //! convert to NV12, and fan out to attached encoders.
 
 use super::StitchSession;
-use crate::geometry::ViewportPosition;
+use crate::detect::director::ViewportPosition;
 use crate::session::types::{FrameLoopContext, SessionError};
 use crate::source::StereoFrame;
 
 impl StitchSession {
     /// Get the current viewport position from the director, or default.
     ///
-    /// The engine resolves it: the panner's latest world-space decision
-    /// through [`StitchCore::safe_clamp`](crate::core::StitchCore::safe_clamp)
-    /// (the single pose-resolution authority - FOV cap, coverage clamp,
-    /// roll-aware basis inversion), the `PosePresented` trace, and the
-    /// FOV write-back. Panners output unconstrained positions.
+    /// Clamps the panner's raw output to the coverage boundary (no-black
+    /// region) and applies FOV limits. This keeps all viewport
+    /// constraining in the session, so panners can output unconstrained
+    /// positions.
     pub fn director_position(&mut self) -> ViewportPosition {
-        self.core.presented_clamped_pose(self.frame_count)
+        // Source the raw pre-clamp pose from the panner's most recent
+        // decision. When no panner is attached the previous pose stays
+        // at its default (identity) value so the viewport centers.
+        let mut pos = self.previous_panner_pose;
+
+        // The panner outputs world-space coordinates (from detections
+        // mapped via camera_to_panorama). Clamp in world space, then
+        // convert to the user-space pitch the renderer expects (the
+        // view_matrix applies rig_tilt as a basis rotation, so the
+        // render-site pitch must compensate via rig_correction).
+        if let Some(coverage) = self.core.coverage() {
+            if let Some(ref mut fov) = pos.fov_degrees {
+                *fov = fov.min(coverage.max_fov_degrees());
+            }
+            let fov = pos
+                .fov_degrees
+                .unwrap_or_else(|| self.core.pipeline().fov());
+            let aspect = self.core.pipeline().viewport().aspect_ratio();
+            let rig_tilt = self.core.pipeline().viewport().rig_tilt;
+            // Clamp in world space (rig_tilt=0 so coverage stays in
+            // the panorama's native coordinate system).
+            let clamped = coverage.safe_clamp(pos.yaw, pos.pitch, fov, aspect, 0.0);
+            pos.yaw = clamped.yaw;
+            // Convert world (yaw, pitch) to render-space via exact
+            // quaternion inversion of view_matrix's tilt+roll basis.
+            // Accounts for roll coupling at non-zero yaw that the
+            // closed-form render_pitch misses.
+            let cam =
+                crate::projection::VirtualCamera::new(&self.core.pipeline().scene.camera_position);
+            let rig_roll = self.core.pipeline().viewport().rig_roll;
+            let (ry, rp) = crate::lens::rig_correction::world_to_render_pose(
+                &cam,
+                clamped.yaw,
+                clamped.pitch,
+                rig_tilt,
+                rig_roll,
+            );
+            pos.yaw = ry;
+            pos.pitch = rp;
+        }
+
+        // Trace: PosePresented. This is the pose the renderer will
+        // actually consume for this frame (post-clamp, post-FOV-cap).
+        if let Some(sink) = self.event_sink.as_deref_mut() {
+            sink.emit(
+                crate::detect::pipeline_event::PipelineEvent::PosePresented {
+                    frame_index: self.frame_count,
+                    pose: pos,
+                },
+            );
+        }
+
+        if let Some(fov) = pos.fov_degrees {
+            self.core.pipeline_mut().set_fov(fov);
+        }
+        pos
     }
 
     /// Full per-frame pipeline: detect, pose, render, replay, telemetry.
@@ -48,7 +102,8 @@ impl StitchSession {
         let (ran_detection, detect_time) = if self.skip_detection {
             (false, std::time::Duration::ZERO)
         } else {
-            let due = self.core.detection_due(self.frame_count);
+            let scheduled_detection =
+                self.detection.has_detector() && self.detection.should_detect(self.frame_count);
             let detect_t0 = std::time::Instant::now();
             let ran_detection = match frame {
                 #[cfg(target_os = "linux")]
@@ -56,7 +111,7 @@ impl StitchSession {
                     left_slot,
                     right_slot,
                 } => {
-                    if self.core.detector_needs_cuda_frames() {
+                    if self.detection.needs_cuda_frames() {
                         if self.frame_count == 0 {
                             log::info!("GpuResident detection: CUDA path (TensorRT/ORT-CUDA)");
                         }
@@ -68,7 +123,7 @@ impl StitchSession {
                                 *right_slot,
                                 elapsed,
                             )?;
-                            due
+                            scheduled_detection
                         } else {
                             if self.frame_count == 0 {
                                 log::warn!(
@@ -87,23 +142,24 @@ impl StitchSession {
                         }
                         let ls = *left_slot as usize;
                         let rs = *right_slot as usize;
-                        if due {
-                            crate::profile_scope!("detect_wgpu_nv12");
-                            let (w, h) = self.core.source_info();
-                            let frames = super::detection_dispatch::wgpu_nv12_frames(
+                        let (w, h) = self.core.pipeline().source_info();
+                        let lr = self.left_rotation;
+                        let rr = self.right_rotation;
+                        if scheduled_detection {
+                            let detections = self.detection.run_detection_wgpu_nv12(
                                 &views[ls * 2],
                                 &views[ls * 2 + 1],
                                 &views[4 + rs * 2],
                                 &views[4 + rs * 2 + 1],
                                 w,
                                 h,
-                                self.left_rotation,
-                                self.right_rotation,
+                                lr,
+                                rr,
                             );
-                            self.core.run_detection_frames(&frames);
+                            self.detection.last_detections = self.map_detections(detections);
                         }
-                        self.fire_sink_and_update_director(elapsed, due)?;
-                        due
+                        self.fire_sink_and_update_director(elapsed, scheduled_detection)?;
+                        scheduled_detection
                     } else {
                         if self.frame_count == 0 {
                             log::warn!(
@@ -114,20 +170,6 @@ impl StitchSession {
                         false
                     }
                 }
-                #[cfg(target_os = "linux")]
-                StereoFrame::NvmmResident { left, right } => {
-                    // Immediate (non-lookahead) NVMM detection: letterbox via
-                    // NvBufSurfTransform, then detect. (The buffered path runs
-                    // detection during produce and skips this whole step.)
-                    if due {
-                        crate::profile_scope!("detect_preletterboxed_total");
-                        if let Some(frames) = self.nvmm_detector_frames(left, right) {
-                            self.core.run_detection_frames(&frames);
-                        }
-                    }
-                    self.fire_sink_and_update_director(elapsed, due)?;
-                    due
-                }
                 #[cfg(any(target_os = "macos", target_os = "ios"))]
                 StereoFrame::MetalResident { left, right } => {
                     self.detect_and_update_director_metal(
@@ -137,31 +179,34 @@ impl StitchSession {
                         left.height(),
                         elapsed,
                     )?;
-                    due
+                    scheduled_detection
                 }
                 #[cfg(target_os = "windows")]
                 StereoFrame::D3d11Resident { .. } => {
                     if self.d3d11_staging_pool.is_some() {
                         let left_slot = self.frame_count as usize % 2;
                         let right_slot = left_slot + 2;
-                        if due {
-                            crate::profile_scope!("detect_wgpu_nv12");
-                            let (w, h) = self.core.source_info();
+                        let (w, h) = self.core.pipeline().source_info();
+                        let lr = self.left_rotation;
+                        let rr = self.right_rotation;
+                        let should_detect = self.detection.has_detector()
+                            && self.detection.should_detect(self.frame_count);
+                        if should_detect {
                             let pool = self.d3d11_staging_pool.as_ref().unwrap();
-                            let frames = super::detection_dispatch::wgpu_nv12_frames(
+                            let detections = self.detection.run_detection_wgpu_nv12(
                                 pool.y_view(left_slot),
                                 pool.uv_view(left_slot),
                                 pool.y_view(right_slot),
                                 pool.uv_view(right_slot),
                                 w,
                                 h,
-                                self.left_rotation,
-                                self.right_rotation,
+                                lr,
+                                rr,
                             );
-                            self.core.run_detection_frames(&frames);
+                            self.detection.last_detections = self.map_detections(detections);
                         }
-                        self.fire_sink_and_update_director(elapsed, due)?;
-                        due
+                        self.fire_sink_and_update_director(elapsed, should_detect)?;
+                        scheduled_detection
                     } else {
                         self.update_director(elapsed)?;
                         false
@@ -169,7 +214,7 @@ impl StitchSession {
                 }
                 _ => {
                     self.detect_and_update_director(frame, elapsed)?;
-                    due
+                    scheduled_detection
                 }
             };
             let detect_time = detect_t0.elapsed();
@@ -190,18 +235,6 @@ impl StitchSession {
                 right_slot,
             } => {
                 self.render_gpu_resident(*left_slot, *right_slot, pos.yaw, pos.pitch)?;
-            }
-            #[cfg(target_os = "linux")]
-            StereoFrame::NvmmResident { left, right } => {
-                if self.current_vram_slot.is_some() {
-                    // Buffered path: the frame was already imported + copied
-                    // into the pool slot during produce; render from it. The
-                    // slot args are ignored when current_vram_slot is set.
-                    self.render_gpu_resident(0, 0, pos.yaw, pos.pitch)?;
-                } else {
-                    // Immediate path: import the DMA-buf and render directly.
-                    self.render_nvmm_immediate(left, right, pos.yaw, pos.pitch)?;
-                }
             }
             #[cfg(target_os = "windows")]
             StereoFrame::D3d11Resident {
@@ -472,58 +505,6 @@ impl StitchSession {
         Ok(())
     }
 
-    /// Render an NVMM frame directly from imported DMA-buf textures
-    /// (immediate / non-lookahead path).
-    ///
-    /// Imports both cameras' DMA-bufs into Vulkan textures (cached by fd)
-    /// and renders via [`process_frame_imported_nv12`](Self::process_frame_imported_nv12).
-    /// The buffered (lookahead) path uses the VRAM pool instead; this is the
-    /// fallback when no pool exists (`lookahead == 0`).
-    #[cfg(target_os = "linux")]
-    fn render_nvmm_immediate(
-        &mut self,
-        left: &crate::source::NvmmPlaneInfo,
-        right: &crate::source::NvmmPlaneInfo,
-        yaw: f32,
-        pitch: f32,
-    ) -> Result<(), SessionError> {
-        if self.nvmm_dmabuf_cache.is_none() {
-            self.nvmm_dmabuf_cache = Some(crate::interop::dmabuf::DmaBufTextureCache::new());
-        }
-        let gpu = self.core.pipeline().gpu();
-        let cache = self.nvmm_dmabuf_cache.as_mut().unwrap();
-        cache
-            .ensure_imported(
-                gpu,
-                left.dmabuf_fd,
-                left.width,
-                left.height,
-                left.y_offset,
-                left.uv_offset,
-                left.total_size,
-            )
-            .map_err(|e| SessionError::ZeroCopy(format!("left NVMM DMA-buf import: {e}")))?;
-        cache
-            .ensure_imported(
-                gpu,
-                right.dmabuf_fd,
-                right.width,
-                right.height,
-                right.y_offset,
-                right.uv_offset,
-                right.total_size,
-            )
-            .map_err(|e| SessionError::ZeroCopy(format!("right NVMM DMA-buf import: {e}")))?;
-
-        // Clone the texture handles (cheap, Arc-backed) to drop the cache
-        // borrow before the &mut self render call.
-        let left_tex = cache.get(left.dmabuf_fd);
-        let right_tex = cache.get(right.dmabuf_fd);
-        let (ly, lu) = (left_tex.y_texture.clone(), left_tex.uv_texture.clone());
-        let (ry, ru) = (right_tex.y_texture.clone(), right_tex.uv_texture.clone());
-        self.process_frame_imported_nv12(&ly, &lu, &ry, &ru, yaw, pitch)
-    }
-
     /// Stage D3D11VA decoded frames into the shared staging pool.
     ///
     /// Lazily creates the pool on first call. Performs `CopySubresourceRegion`
@@ -540,8 +521,8 @@ impl StitchSession {
     ) -> Result<bool, SessionError> {
         let first_frame = self.d3d11_staging_pool.is_none();
         if first_frame {
-            let (w, h) = self.core.source_info();
-            let needs_cuda = self.core.detector_needs_cuda_frames();
+            let (w, h) = self.core.pipeline().source_info();
+            let needs_cuda = self.detection.needs_cuda_frames();
             // For lookahead, size slots to the max frames simultaneously
             // in flight (decoded but not yet rendered), x2 for left+right.
             // Peak occupancy is n + post_smooth_half + 1 (buffer hits n+1
@@ -658,10 +639,6 @@ impl StitchSession {
         &mut self,
         render_commands: wgpu::CommandBuffer,
     ) -> Result<(), SessionError> {
-        // Read NV12 dims up front (Copy) so the tap below can borrow `data`
-        // without re-borrowing self.nv12_converter.
-        let nv12_width = self.nv12_converter.width();
-        let nv12_height = self.nv12_converter.height();
         let readback_t0 = std::time::Instant::now();
         let nv12_data = self.nv12_converter.convert_and_readback(
             self.core.gpu(),
@@ -679,12 +656,6 @@ impl StitchSession {
             }
             for enc in &self.extra_encoders {
                 enc.submit(data, self.frame_count as i64)?;
-            }
-            // NV12 tap for snapshot / preview hooks (reco-cli's periodic
-            // JPEG writer). Runs after encode submit; the callback is
-            // expected to be non-blocking (try_send on a channel).
-            if let Some(ref mut tap) = self.nv12_tap {
-                tap(data, nv12_width, nv12_height);
             }
         }
         self.last_submit_time = encode_t0.elapsed();
@@ -769,13 +740,6 @@ impl StitchSession {
         frame: &StereoFrame,
         _produce_index: u64,
     ) -> Result<Option<usize>, SessionError> {
-        // NVMM zero-copy: import the DMA-buf as Vulkan textures and copy
-        // them into a VRAM pool slot - the same import-then-copy pattern
-        // as the macOS Metal arm, just sourced from an NvBufSurface fd
-        // instead of a CVPixelBuffer.
-        if let StereoFrame::NvmmResident { left, right } = frame {
-            return self.copy_nvmm_to_vram_pool(left, right);
-        }
         let (ls, rs) = match frame {
             StereoFrame::GpuResident {
                 left_slot,
@@ -813,74 +777,6 @@ impl StitchSession {
             }
         }
         Ok(None)
-    }
-
-    /// Import a stereo NVMM frame's DMA-bufs and copy them into a VRAM
-    /// pool slot for buffered (lookahead) rendering.
-    ///
-    /// Mirrors the macOS Metal import path: the per-camera DMA-buf is
-    /// imported into Vulkan textures (cached by fd, since the ISP rotates a
-    /// small fd pool), then `copy_from_textures` blits both cameras' Y/UV
-    /// planes into a freshly acquired pool slot. The blit is awaited before
-    /// returning so the source may recycle the DMA-buf immediately after.
-    #[cfg(target_os = "linux")]
-    fn copy_nvmm_to_vram_pool(
-        &mut self,
-        left: &crate::source::NvmmPlaneInfo,
-        right: &crate::source::NvmmPlaneInfo,
-    ) -> Result<Option<usize>, SessionError> {
-        if self.vram_pool.is_none() {
-            return Ok(None);
-        }
-        if self.nvmm_dmabuf_cache.is_none() {
-            self.nvmm_dmabuf_cache = Some(crate::interop::dmabuf::DmaBufTextureCache::new());
-        }
-
-        let gpu = self.core.pipeline().gpu();
-        let cache = self.nvmm_dmabuf_cache.as_mut().unwrap();
-        cache
-            .ensure_imported(
-                gpu,
-                left.dmabuf_fd,
-                left.width,
-                left.height,
-                left.y_offset,
-                left.uv_offset,
-                left.total_size,
-            )
-            .map_err(|e| SessionError::ZeroCopy(format!("left NVMM DMA-buf import: {e}")))?;
-        cache
-            .ensure_imported(
-                gpu,
-                right.dmabuf_fd,
-                right.width,
-                right.height,
-                right.y_offset,
-                right.uv_offset,
-                right.total_size,
-            )
-            .map_err(|e| SessionError::ZeroCopy(format!("right NVMM DMA-buf import: {e}")))?;
-
-        let left_tex = cache.get(left.dmabuf_fd);
-        let right_tex = cache.get(right.dmabuf_fd);
-        let pool = self.vram_pool.as_mut().unwrap();
-        let slot = pool.acquire().ok_or_else(|| {
-            SessionError::Config(format!(
-                "VRAM pool exhausted ({} slots, {} available)",
-                pool.capacity(),
-                pool.available()
-            ))
-        })?;
-        pool.copy_from_textures(
-            gpu,
-            slot,
-            &left_tex.y_texture,
-            &left_tex.uv_texture,
-            &right_tex.y_texture,
-            &right_tex.uv_texture,
-        );
-        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
-        Ok(Some(slot))
     }
 
     #[cfg(target_os = "windows")]

@@ -39,11 +39,11 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use reco_core::calibration::Calibration;
+//! use reco_core::calibration::MatchCalibration;
 //!
-//! // Load calibration from a JSON file
+//! // Load calibration from a v1-compatible JSON file
 //! let json = std::fs::read_to_string("match.json").unwrap();
-//! let calibration: Calibration = serde_json::from_str(&json).unwrap();
+//! let calibration: MatchCalibration = serde_json::from_str(&json).unwrap();
 //! ```
 
 /// Create a tracing span guard (no-op when `profiling` feature is disabled).
@@ -71,37 +71,23 @@ macro_rules! profile_scope {
 ///
 /// Headless consumers (CLI encode, cloud workers) should not need this -
 /// use [`gpu::OutputFormat`] and the [`session`] API instead.
-#[cfg(feature = "gpu")]
 pub use wgpu;
 
-// The `gpu` feature (default-on) gates the wgpu render stack. What
-// remains without it is the wgpu-free leaf for GPU-less targets:
-// calibration, geometry, projection, the CPU stitch path, and the
-// pure value/trait modules (source, detect sans GPU frames, encoder,
-// telemetry).
-#[cfg(feature = "gpu")]
 pub(crate) mod async_encode;
-#[cfg(feature = "gpu")]
 pub mod bayer;
 pub mod calibration;
 /// M3 push-first `StitchCore` shell — the canonical entry point.
-/// See [`core::StitchCore`] for details. Engine orchestration is
-/// wgpu-free; only its GPU streaming surface is gated on `gpu`.
+/// See [`core::StitchCore`] for details.
 pub mod core;
 pub mod detect;
 pub mod encoder;
-pub mod geometry;
-#[cfg(feature = "gpu")]
 pub mod gpu;
-#[cfg(feature = "gpu")]
 pub mod interop;
 pub mod lens;
-#[cfg(all(target_os = "linux", feature = "gpu"))]
+#[cfg(target_os = "linux")]
 pub mod nvbuf_transform;
 pub mod projection;
 pub mod render;
-#[cfg(feature = "gpu")]
 pub mod session;
 pub mod source;
-pub mod stitch;
 pub mod telemetry;
