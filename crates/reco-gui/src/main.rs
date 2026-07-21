@@ -1794,6 +1794,10 @@ fn main() -> anyhow::Result<()> {
         if let Some(app) = app_weak.upgrade() {
             sync_recent_paths(&s.user_settings, &app);
         }
+        // try_init and the segment list read left_input, not left_path -
+        // without it a recent pick never loads and the UI keeps saying
+        // "No video selected" (#328).
+        s.left_input = Some(reco_io::stitch_job::InputPath::Single(path.clone()));
         s.left_path = Some(path);
         drop(s);
         try_init_and_update(&state_ref, &app_weak);
@@ -1819,6 +1823,7 @@ fn main() -> anyhow::Result<()> {
         if let Some(app) = app_weak.upgrade() {
             sync_recent_paths(&s.user_settings, &app);
         }
+        s.right_input = Some(reco_io::stitch_job::InputPath::Single(path.clone()));
         s.right_path = Some(path);
         drop(s);
         try_init_and_update(&state_ref, &app_weak);
