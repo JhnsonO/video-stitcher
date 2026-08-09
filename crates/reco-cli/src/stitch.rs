@@ -138,6 +138,10 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
         progress.report_with_elapsed(p.frames_completed, p.elapsed);
     });
 
+    if args.projection == "cylindrical-stereo" {
+        job = job.cylindrical_stereo();
+    }
+
     if let Some(t) = args.start_time {
         job = job.start_time(t);
     }

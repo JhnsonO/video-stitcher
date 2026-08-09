@@ -83,6 +83,11 @@ pub trait Projection: Send + Sync {
     fn wgsl_composite_source(&self) -> &str {
         ""
     }
+
+    /// Cylindrical-stereo parameters when this projection uses that renderer.
+    fn cylindrical_stereo_config(&self) -> Option<CylindricalStereoProjectionConfig> {
+        None
+    }
 }
 
 /// Marker type for today's 2-plane L-shape stereo projection.
@@ -267,6 +272,10 @@ impl Projection for CylindricalStereoProjection {
     }
     fn wgsl_composite_source(&self) -> &str {
         include_str!("../shaders/cylindrical_stereo.wgsl")
+    }
+
+    fn cylindrical_stereo_config(&self) -> Option<CylindricalStereoProjectionConfig> {
+        Some(self.config)
     }
 }
 

@@ -63,5 +63,6 @@ fn camera_uv(c:CameraUniforms, origin:vec3<f32>, dir:vec3<f32>) -> vec3<f32> {
     if lu.z>0.0 { lc=apply_color_transfer(sample_yuv(left_y,left_u,left_v,lu.xy,uniforms.left.flags).rgb,uniforms.left.color_scale.xyz,uniforms.left.color_offset.xyz); }
     if ru.z>0.0 { rc=apply_color_transfer(sample_yuv(right_y,right_u,right_v,ru.xy,uniforms.right.flags).rgb,uniforms.right.color_scale.xyz,uniforms.right.color_offset.xyz); }
     if lu.z==0.0 { return vec4(rc,1.0); } if ru.z==0.0 { return vec4(lc,1.0); }
-    return vec4(mix(lc,rc,smoothstep(0.0,uniforms.projection.w,ru.x)),1.0);
+    var weight = 1.0; if uniforms.projection.w > 0.0 { weight = smoothstep(0.0,uniforms.projection.w,ru.x); }
+    return vec4(mix(lc,rc,weight),1.0);
 }

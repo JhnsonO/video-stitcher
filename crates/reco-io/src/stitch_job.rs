@@ -54,6 +54,7 @@ pub struct StitchJob {
     max_frames: Option<u64>,
     sync_offset: Option<i64>,
     blend_width: f32,
+    cylindrical_stereo: bool,
 
     // Callbacks
     on_progress: Option<ProgressCallback>,
@@ -256,6 +257,7 @@ impl StitchJob {
             max_frames: None,
             sync_offset: None,
             blend_width: 0.15,
+            cylindrical_stereo: false,
             on_progress: None,
             on_finalizing: None,
             session_hooks: Vec::new(),
@@ -308,6 +310,15 @@ impl StitchJob {
     /// Set the output resolution. Default: match input resolution.
     pub fn resolution(mut self, width: u32, height: u32) -> Self {
         self.resolution = Some((width, height));
+        self
+    }
+
+    /// Render the calibrated stereo scene into a yaw-linear cylindrical panorama.
+    pub fn cylindrical_stereo(mut self) -> Self {
+        self.cylindrical_stereo = true;
+        // The cylindrical compositor currently consumes the renderer's uploaded
+        // planes; bypass zero-copy decode so those textures are populated.
+        self.force_cpu_decode = true;
         self
     }
 
@@ -610,7 +621,19 @@ impl StitchJob {
             left_rotation: source.left_rotation(),
             right_rotation: source.right_rotation(),
         };
-        let mut session = reco_core::session::StitchSession::with_gpu(gpu, session_config)?;
+        let projection = self.cylindrical_stereo.then(|| {
+            Box::new(reco_core::projection::CylindricalStereoProjection::new(
+                reco_core::projection::CylindricalStereoProjectionConfig {
+                    blend_width: self.blend_width,
+                    ..Default::default()
+                },
+            )) as Box<dyn reco_core::projection::Projection>
+        });
+        let mut session = reco_core::session::StitchSession::with_gpu_projection(
+            gpu,
+            session_config,
+            projection,
+        )?;
 
         session.telemetry_mut().set_gpu_name(gpu_name.clone());
         session.telemetry_mut().set_decode_mode(decode_mode.clone());
