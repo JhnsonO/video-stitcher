@@ -26,6 +26,9 @@ pub struct StitchArgs<'a> {
     pub blend: f32,
     /// Selected output projection.
     pub projection: &'a str,
+    pub yaw_span_rad: Option<f32>,
+    pub vertical_fov_rad: Option<f32>,
+    pub yaw_center_rad: Option<f32>,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
     pub max_frames: Option<u64>,
@@ -140,6 +143,15 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
 
     if args.projection == "cylindrical-stereo" {
         job = job.cylindrical_stereo();
+    }
+    if let Some(value) = args.yaw_span_rad {
+        job = job.yaw_span_rad(value);
+    }
+    if let Some(value) = args.vertical_fov_rad {
+        job = job.vertical_fov_rad(value);
+    }
+    if let Some(value) = args.yaw_center_rad {
+        job = job.yaw_center_rad(value);
     }
 
     if let Some(t) = args.start_time {

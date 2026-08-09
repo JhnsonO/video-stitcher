@@ -178,6 +178,18 @@ enum Commands {
         #[arg(long, default_value = "l-shape", value_parser = ["l-shape", "cylindrical-stereo"])]
         projection: String,
 
+        /// Cylindrical panorama horizontal yaw span in degrees.
+        #[arg(long)]
+        yaw_span_deg: Option<f32>,
+
+        /// Cylindrical panorama vertical field of view in degrees.
+        #[arg(long)]
+        vertical_fov_deg: Option<f32>,
+
+        /// Cylindrical panorama center yaw in degrees.
+        #[arg(long, allow_hyphen_values = true)]
+        yaw_center_deg: Option<f32>,
+
         /// Frame offset for temporal sync between cameras.
         /// Positive: skip N right frames (right started first).
         /// Negative: skip N left frames (left started first).
@@ -765,6 +777,9 @@ fn main() -> anyhow::Result<()> {
             quality,
             blend,
             projection,
+            yaw_span_deg,
+            vertical_fov_deg,
+            yaw_center_deg,
             sync_offset,
             model,
             detection_interval,
@@ -791,6 +806,9 @@ fn main() -> anyhow::Result<()> {
                 height,
                 blend,
                 projection: &projection,
+                yaw_span_rad: yaw_span_deg.map(f32::to_radians),
+                vertical_fov_rad: vertical_fov_deg.map(f32::to_radians),
+                yaw_center_rad: yaw_center_deg.map(f32::to_radians),
                 start_time,
                 end_time,
                 max_frames,

@@ -55,6 +55,9 @@ pub struct StitchJob {
     sync_offset: Option<i64>,
     blend_width: f32,
     cylindrical_stereo: bool,
+    yaw_span_rad: Option<f32>,
+    vertical_fov_rad: Option<f32>,
+    yaw_center_rad: Option<f32>,
 
     // Callbacks
     on_progress: Option<ProgressCallback>,
@@ -258,6 +261,9 @@ impl StitchJob {
             sync_offset: None,
             blend_width: 0.15,
             cylindrical_stereo: false,
+            yaw_span_rad: None,
+            vertical_fov_rad: None,
+            yaw_center_rad: None,
             on_progress: None,
             on_finalizing: None,
             session_hooks: Vec::new(),
@@ -320,6 +326,43 @@ impl StitchJob {
         // planes; bypass zero-copy decode so those textures are populated.
         self.force_cpu_decode = true;
         self
+    }
+
+    /// Override the cylindrical panorama's horizontal yaw span in radians.
+    pub fn yaw_span_rad(mut self, value: f32) -> Self {
+        self.yaw_span_rad = Some(value);
+        self
+    }
+
+    /// Override the cylindrical panorama's vertical field of view in radians.
+    pub fn vertical_fov_rad(mut self, value: f32) -> Self {
+        self.vertical_fov_rad = Some(value);
+        self
+    }
+
+    /// Override the cylindrical panorama's center yaw in radians.
+    pub fn yaw_center_rad(mut self, value: f32) -> Self {
+        self.yaw_center_rad = Some(value);
+        self
+    }
+
+    fn cylindrical_stereo_config(
+        &self,
+    ) -> reco_core::projection::CylindricalStereoProjectionConfig {
+        let mut config = reco_core::projection::CylindricalStereoProjectionConfig {
+            blend_width: self.blend_width,
+            ..Default::default()
+        };
+        if let Some(value) = self.yaw_span_rad {
+            config.yaw_span_rad = value;
+        }
+        if let Some(value) = self.vertical_fov_rad {
+            config.vertical_fov_rad = value;
+        }
+        if let Some(value) = self.yaw_center_rad {
+            config.yaw_center_rad = value;
+        }
+        config
     }
 
     /// Set the audio mode. Default: copy audio from the first input.
@@ -563,6 +606,7 @@ impl StitchJob {
     pub fn run(mut self, interrupted: &AtomicBool) -> Result<StitchResult, StitchError> {
         crate::init();
         let start = std::time::Instant::now();
+        let cylindrical_config = self.cylindrical_stereo_config();
 
         // Load calibration
         let cal = match self.calibration {
@@ -623,10 +667,7 @@ impl StitchJob {
         };
         let projection = self.cylindrical_stereo.then(|| {
             Box::new(reco_core::projection::CylindricalStereoProjection::new(
-                reco_core::projection::CylindricalStereoProjectionConfig {
-                    blend_width: self.blend_width,
-                    ..Default::default()
-                },
+                cylindrical_config,
             )) as Box<dyn reco_core::projection::Projection>
         });
         let mut session = reco_core::session::StitchSession::with_gpu_projection(
@@ -1079,5 +1120,27 @@ mod tests {
         assert_eq!(audio_sync_skip_frames(&AudioMode::CopyFrom(1), 15), 15);
         assert_eq!(audio_sync_skip_frames(&AudioMode::CopyFrom(0), 0), 0);
         assert_eq!(audio_sync_skip_frames(&AudioMode::Disabled, -15), 0);
+    }
+
+    #[test]
+    fn cylindrical_config_preserves_defaults_and_applies_overrides() {
+        let job = StitchJob::new("left.mp4", "right.mp4", "match.json", "out.mp4");
+        assert_eq!(
+            job.cylindrical_stereo_config(),
+            reco_core::projection::CylindricalStereoProjectionConfig::default()
+        );
+
+        let config = job
+            .yaw_span_rad(2.5)
+            .vertical_fov_rad(1.1)
+            .yaw_center_rad(-0.3)
+            .cylindrical_stereo_config();
+        assert_eq!(config.yaw_span_rad, 2.5);
+        assert_eq!(config.vertical_fov_rad, 1.1);
+        assert_eq!(config.yaw_center_rad, -0.3);
+        assert_eq!(
+            config.blend_width,
+            reco_core::projection::CylindricalStereoProjectionConfig::default().blend_width
+        );
     }
 }
