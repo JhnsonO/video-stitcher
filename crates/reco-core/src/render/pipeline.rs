@@ -22,6 +22,7 @@
 //! )?;
 //! ```
 
+use super::cylindrical_renderer::CylindricalRenderer;
 use super::renderer::{InputFormat, RenderError, Renderer};
 use super::scene::SceneGeometry;
 use super::viewport::{ResolvedViewport, ViewportConfig};
@@ -76,6 +77,7 @@ pub struct StitchPipeline {
     pub(crate) viewport: ViewportConfig,
     /// GPU renderer (textures, pipelines, bind groups).
     renderer: Renderer,
+    cylindrical_renderer: Option<CylindricalRenderer>,
     /// Input frame dimensions.
     input_width: u32,
     input_height: u32,
@@ -104,6 +106,29 @@ impl StitchPipeline {
         input_height: u32,
         output_format: impl Into<wgpu::TextureFormat>,
         input_format: InputFormat,
+    ) -> Result<Self, PipelineError> {
+        Self::with_gpu_projection(
+            gpu,
+            calibration,
+            viewport,
+            input_width,
+            input_height,
+            output_format,
+            input_format,
+            None,
+        )
+    }
+
+    /// Create a pipeline with an optional cylindrical stereo composite pass.
+    pub fn with_gpu_projection(
+        gpu: GpuContext,
+        calibration: MatchCalibration,
+        viewport: ViewportConfig,
+        input_width: u32,
+        input_height: u32,
+        output_format: impl Into<wgpu::TextureFormat>,
+        input_format: InputFormat,
+        cylindrical_config: Option<crate::projection::CylindricalStereoProjectionConfig>,
     ) -> Result<Self, PipelineError> {
         // Validate inputs before GPU resource creation.
         if let Err(e) = viewport.validate() {
@@ -136,6 +161,8 @@ impl StitchPipeline {
             input_format,
             &scene,
         );
+        let cylindrical_renderer = cylindrical_config
+            .map(|config| CylindricalRenderer::new(&gpu, output_format, input_format, config));
 
         log::info!(
             "Pipeline initialized: {}x{} output, GPU: {}",
@@ -150,6 +177,7 @@ impl StitchPipeline {
             calibration,
             viewport,
             renderer,
+            cylindrical_renderer,
             input_width,
             input_height,
         })
@@ -593,7 +621,7 @@ impl StitchPipeline {
             },
         };
 
-        Ok(self.renderer.render_to_target(
+        Ok(self.render_current_target(
             &self.gpu,
             &self.scene,
             &self.calibration,
@@ -631,7 +659,7 @@ impl StitchPipeline {
             },
         };
 
-        Ok(self.renderer.render_to_target(
+        Ok(self.render_current_target(
             &self.gpu,
             &self.scene,
             &self.calibration,
@@ -669,7 +697,7 @@ impl StitchPipeline {
             },
         };
 
-        Ok(self.renderer.render_to_target(
+        Ok(self.render_current_target(
             &self.gpu,
             &self.scene,
             &self.calibration,
@@ -732,7 +760,7 @@ impl StitchPipeline {
             },
         };
 
-        self.renderer.render_to_target(
+        self.render_current_target(
             &self.gpu,
             &self.scene,
             &self.calibration,
@@ -748,15 +776,46 @@ impl StitchPipeline {
     /// (e.g., DJI cameras with rotation=180 metadata).
     pub fn set_flip_180(&mut self, left: bool, right: bool) {
         self.renderer.set_flip_180(left, right);
+        if let Some(renderer) = self.cylindrical_renderer.as_mut() {
+            renderer.set_flip_180(left, right);
+        }
     }
 
     pub fn set_full_range(&mut self, full_range: bool) {
         self.renderer.set_full_range(full_range);
+        if let Some(renderer) = self.cylindrical_renderer.as_mut() {
+            renderer.set_full_range(full_range);
+        }
     }
 
     /// Access the rendered RGBA texture for NV12 conversion.
     pub fn render_target(&self) -> &wgpu::Texture {
         self.renderer.render_target()
+    }
+
+    fn render_current_target(
+        &self,
+        gpu: &GpuContext,
+        scene: &SceneGeometry,
+        calibration: &MatchCalibration,
+        viewport: &ResolvedViewport,
+        blend_width: f32,
+    ) -> wgpu::CommandBuffer {
+        if let Some(renderer) = &self.cylindrical_renderer {
+            renderer.render(
+                gpu,
+                scene,
+                calibration,
+                [
+                    self.renderer.left_plane_views(),
+                    self.renderer.right_plane_views(),
+                ],
+                self.renderer.render_target(),
+            )
+        } else {
+            self.renderer
+                .render_to_target(gpu, scene, calibration, viewport, blend_width)
+        }
     }
 }
 

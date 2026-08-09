@@ -212,6 +212,15 @@ impl StitchSession {
     /// Use this when the caller needs to control GPU selection (e.g.
     /// for zero-copy decode where the GPU must match the CUDA device).
     pub fn with_gpu(gpu: GpuContext, config: SessionConfig) -> Result<Self, SessionError> {
+        Self::with_gpu_projection(gpu, config, None)
+    }
+
+    /// Create a session with an explicitly selected projection.
+    pub fn with_gpu_projection(
+        gpu: GpuContext,
+        config: SessionConfig,
+        projection: Option<Box<dyn crate::projection::Projection>>,
+    ) -> Result<Self, SessionError> {
         let output_width = config.viewport.width;
         let output_height = config.viewport.height;
 
@@ -240,7 +249,7 @@ impl StitchSession {
                 // Bgra8UnormSrgb).
                 output_format: config.output_format.into(),
                 input_format: config.input_format,
-                projection: None,
+                projection,
                 camera_input: None,
                 replay_buffer_duration: None,
             },

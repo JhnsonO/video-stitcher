@@ -167,7 +167,12 @@ impl StitchCore {
         let output_width = config.viewport.width;
         let output_height = config.viewport.height;
 
-        let pipeline = StitchPipeline::with_gpu(
+        let projection: Box<dyn Projection> = config
+            .projection
+            .unwrap_or_else(|| Box::new(LShapeProjection));
+        let cylindrical_config = projection.cylindrical_stereo_config();
+
+        let pipeline = StitchPipeline::with_gpu_projection(
             gpu,
             config.calibration,
             config.viewport,
@@ -175,15 +180,13 @@ impl StitchCore {
             config.input_height,
             config.output_format,
             config.input_format,
+            cylindrical_config,
         )?;
 
         let readback = RgbaReadback::new(pipeline.gpu(), output_width, output_height)?;
 
         let coverage = CoverageBoundary::from_calibration(pipeline.calibration(), &pipeline.scene);
 
-        let projection: Box<dyn Projection> = config
-            .projection
-            .unwrap_or_else(|| Box::new(LShapeProjection));
         let camera_input: Box<dyn CameraInput> = config
             .camera_input
             .unwrap_or_else(|| Box::new(StereoCameraInput));

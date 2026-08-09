@@ -24,6 +24,8 @@ pub struct StitchArgs<'a> {
     pub width: u32,
     pub height: u32,
     pub blend: f32,
+    /// Selected output projection.
+    pub projection: &'a str,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
     pub max_frames: Option<u64>,
@@ -78,6 +80,11 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
         args.width,
         args.height,
     );
+    anyhow::ensure!(
+        matches!(args.projection, "l-shape" | "cylindrical-stereo"),
+        "unknown projection '{}' (expected l-shape or cylindrical-stereo)",
+        args.projection
+    );
 
     #[cfg(feature = "autocam")]
     if args.tracking_mode != "sweep"
@@ -130,6 +137,10 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
         // reflects only the decode → stitch → encode loop.
         progress.report_with_elapsed(p.frames_completed, p.elapsed);
     });
+
+    if args.projection == "cylindrical-stereo" {
+        job = job.cylindrical_stereo();
+    }
 
     if let Some(t) = args.start_time {
         job = job.start_time(t);
