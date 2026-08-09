@@ -220,6 +220,56 @@ impl Projection for CylindricalProjection {
     }
 }
 
+/// Parameters for full-frame cylindrical reprojection of a calibrated stereo rig.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CylindricalStereoProjectionConfig {
+    /// Horizontal angular extent of the output panorama.
+    pub yaw_span_rad: f32,
+    /// World-space yaw at the centre of the output.
+    pub yaw_center_rad: f32,
+    /// Vertical field of view of the output.
+    pub vertical_fov_rad: f32,
+    /// Width of the right-camera seam ramp in normalized plane UV units.
+    pub blend_width: f32,
+}
+
+impl Default for CylindricalStereoProjectionConfig {
+    fn default() -> Self {
+        Self {
+            yaw_span_rad: std::f32::consts::PI,
+            yaw_center_rad: 0.0,
+            vertical_fov_rad: 70.0_f32.to_radians(),
+            blend_width: 0.15,
+        }
+    }
+}
+
+/// Full-frame cylindrical reprojection of the existing calibrated two-plane scene.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CylindricalStereoProjection {
+    /// Projection parameters.
+    pub config: CylindricalStereoProjectionConfig,
+}
+
+impl CylindricalStereoProjection {
+    /// Construct a projection with explicit parameters.
+    pub fn new(config: CylindricalStereoProjectionConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl Projection for CylindricalStereoProjection {
+    fn name(&self) -> &'static str {
+        "cylindrical-stereo-2camera"
+    }
+    fn camera_count(&self) -> u8 {
+        2
+    }
+    fn wgsl_composite_source(&self) -> &str {
+        include_str!("../shaders/cylindrical_stereo.wgsl")
+    }
+}
+
 /// Maximum Newton-Raphson iterations for KB4 inverse distortion.
 const MAX_ITERATIONS: usize = 20;
 /// Convergence threshold for Newton-Raphson.
@@ -1384,5 +1434,14 @@ mod tests {
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<CylindricalProjection>();
         assert_send_sync::<CylindricalProjectionConfig>();
+    }
+
+    #[test]
+    fn cylindrical_stereo_projection_contract() {
+        let projection = CylindricalStereoProjection::default();
+        assert_eq!(projection.camera_count(), 2);
+        let shader = projection.wgsl_composite_source();
+        assert!(!shader.is_empty());
+        assert!(shader.contains("fs_cylindrical_stereo"));
     }
 }

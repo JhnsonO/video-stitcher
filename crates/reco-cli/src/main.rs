@@ -174,6 +174,10 @@ enum Commands {
         #[arg(long, default_value_t = 0.15, value_parser = parse_blend)]
         blend: f32,
 
+        /// Output projection: l-shape (default) or cylindrical-stereo.
+        #[arg(long, default_value = "l-shape", value_parser = ["l-shape", "cylindrical-stereo"])]
+        projection: String,
+
         /// Frame offset for temporal sync between cameras.
         /// Positive: skip N right frames (right started first).
         /// Negative: skip N left frames (left started first).
@@ -760,6 +764,7 @@ fn main() -> anyhow::Result<()> {
             codec,
             quality,
             blend,
+            projection,
             sync_offset,
             model,
             detection_interval,
@@ -785,6 +790,7 @@ fn main() -> anyhow::Result<()> {
                 width,
                 height,
                 blend,
+                projection: &projection,
                 start_time,
                 end_time,
                 max_frames,

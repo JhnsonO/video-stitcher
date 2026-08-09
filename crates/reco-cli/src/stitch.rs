@@ -24,6 +24,8 @@ pub struct StitchArgs<'a> {
     pub width: u32,
     pub height: u32,
     pub blend: f32,
+    /// Selected output projection.
+    pub projection: &'a str,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
     pub max_frames: Option<u64>,
@@ -77,6 +79,11 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
         "Output dimensions {}x{} out of range: width and height must be 1..={MAX_DIM}",
         args.width,
         args.height,
+    );
+    anyhow::ensure!(
+        matches!(args.projection, "l-shape" | "cylindrical-stereo"),
+        "unknown projection '{}' (expected l-shape or cylindrical-stereo)",
+        args.projection
     );
 
     #[cfg(feature = "autocam")]

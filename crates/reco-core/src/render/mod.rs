@@ -3,6 +3,7 @@
 //! Groups the modules responsible for turning decoded video frames into a
 //! stitched panoramic output on the GPU.
 
+pub mod cylindrical_renderer;
 pub mod pipeline;
 pub mod planes;
 pub mod renderer;
