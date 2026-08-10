@@ -190,6 +190,12 @@ enum Commands {
         #[arg(long, allow_hyphen_values = true)]
         yaw_center_deg: Option<f32>,
 
+        /// Cylindrical panorama center pitch in degrees. Positive tilts
+        /// the crop window up, negative tilts it down (trade sky for
+        /// more near-touchline coverage without widening vertical FOV).
+        #[arg(long, allow_hyphen_values = true)]
+        pitch_center_deg: Option<f32>,
+
         /// Frame offset for temporal sync between cameras.
         /// Positive: skip N right frames (right started first).
         /// Negative: skip N left frames (left started first).
@@ -780,6 +786,7 @@ fn main() -> anyhow::Result<()> {
             yaw_span_deg,
             vertical_fov_deg,
             yaw_center_deg,
+            pitch_center_deg,
             sync_offset,
             model,
             detection_interval,
@@ -809,6 +816,7 @@ fn main() -> anyhow::Result<()> {
                 yaw_span_rad: yaw_span_deg.map(f32::to_radians),
                 vertical_fov_rad: vertical_fov_deg.map(f32::to_radians),
                 yaw_center_rad: yaw_center_deg.map(f32::to_radians),
+                pitch_center_rad: pitch_center_deg.map(f32::to_radians),
                 start_time,
                 end_time,
                 max_frames,

@@ -31,6 +31,8 @@ struct Uniforms {
     right: CameraUniforms,
     camera_position: [f32; 4],
     projection: [f32; 4],
+    // x = pitch_center_rad; yzw unused padding to keep vec4 alignment.
+    pitch: [f32; 4],
 }
 
 /// GPU pipeline for yaw-linear cylindrical stereo compositing.
@@ -189,6 +191,7 @@ impl CylindricalRenderer {
                 (self.config.vertical_fov_rad * 0.5).tan(),
                 self.config.blend_width,
             ],
+            pitch: [self.config.pitch_center_rad, 0.0, 0.0, 0.0],
         };
         gpu.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -307,14 +310,14 @@ pub fn inverse_models(scene: &SceneGeometry) -> (Matrix4<f32>, Matrix4<f32>) {
 pub fn output_uv_to_yaw_pitch(uv: [f32; 2], c: CylindricalStereoProjectionConfig) -> [f32; 2] {
     [
         c.yaw_center_rad + (uv[0] - 0.5) * c.yaw_span_rad,
-        ((0.5 - uv[1]) * 2.0 * (c.vertical_fov_rad * 0.5).tan()).atan(),
+        c.pitch_center_rad + ((0.5 - uv[1]) * 2.0 * (c.vertical_fov_rad * 0.5).tan()).atan(),
     ]
 }
 /// Convert shader yaw/pitch to output UV.
 pub fn yaw_pitch_to_output_uv(v: [f32; 2], c: CylindricalStereoProjectionConfig) -> [f32; 2] {
     [
         0.5 + (v[0] - c.yaw_center_rad) / c.yaw_span_rad,
-        0.5 - v[1].tan() / (2.0 * (c.vertical_fov_rad * 0.5).tan()),
+        0.5 - (v[1] - c.pitch_center_rad).tan() / (2.0 * (c.vertical_fov_rad * 0.5).tan()),
     ]
 }
 
