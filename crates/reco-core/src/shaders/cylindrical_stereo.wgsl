@@ -12,6 +12,7 @@ struct Uniforms {
     right: CameraUniforms,
     camera_position: vec4<f32>,
     projection: vec4<f32>, // yaw span, yaw centre, tan(vertical_fov/2), blend width
+    pitch: vec4<f32>, // x = pitch centre (rad), yzw unused padding
 };
 @group(0) @binding(0) var left_y: texture_2d<f32>;
 @group(0) @binding(1) var left_u: texture_2d<f32>;
@@ -55,7 +56,7 @@ fn camera_uv(c:CameraUniforms, origin:vec3<f32>, dir:vec3<f32>) -> vec3<f32> {
 }
 @fragment fn fs_cylindrical_stereo(in:VsOut) -> @location(0) vec4<f32> {
     let yaw=uniforms.projection.y+(in.uv.x-0.5)*uniforms.projection.x;
-    let pitch=atan((0.5-in.uv.y)*2.0*uniforms.projection.z);
+    let pitch=uniforms.pitch.x+atan((0.5-in.uv.y)*2.0*uniforms.projection.z);
     let cp=cos(pitch); let dir=vec3(sin(yaw)*cp,sin(pitch),-cos(yaw)*cp); let origin=uniforms.camera_position.xyz;
     let lu=camera_uv(uniforms.left,origin,dir); let ru=camera_uv(uniforms.right,origin,dir);
     if lu.z==0.0&&ru.z==0.0 { return vec4(0.0); }

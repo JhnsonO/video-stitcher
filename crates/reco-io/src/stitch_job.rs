@@ -58,6 +58,7 @@ pub struct StitchJob {
     yaw_span_rad: Option<f32>,
     vertical_fov_rad: Option<f32>,
     yaw_center_rad: Option<f32>,
+    pitch_center_rad: Option<f32>,
 
     // Callbacks
     on_progress: Option<ProgressCallback>,
@@ -264,6 +265,7 @@ impl StitchJob {
             yaw_span_rad: None,
             vertical_fov_rad: None,
             yaw_center_rad: None,
+            pitch_center_rad: None,
             on_progress: None,
             on_finalizing: None,
             session_hooks: Vec::new(),
@@ -346,6 +348,15 @@ impl StitchJob {
         self
     }
 
+    /// Override the cylindrical panorama's center pitch in radians.
+    /// Positive tilts the crop window up, negative tilts it down —
+    /// use this to trade sky for more near-touchline coverage without
+    /// widening `vertical_fov_rad`.
+    pub fn pitch_center_rad(mut self, value: f32) -> Self {
+        self.pitch_center_rad = Some(value);
+        self
+    }
+
     fn cylindrical_stereo_config(
         &self,
     ) -> reco_core::projection::CylindricalStereoProjectionConfig {
@@ -361,6 +372,9 @@ impl StitchJob {
         }
         if let Some(value) = self.yaw_center_rad {
             config.yaw_center_rad = value;
+        }
+        if let Some(value) = self.pitch_center_rad {
+            config.pitch_center_rad = value;
         }
         config
     }

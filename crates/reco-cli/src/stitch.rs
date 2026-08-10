@@ -29,6 +29,7 @@ pub struct StitchArgs<'a> {
     pub yaw_span_rad: Option<f32>,
     pub vertical_fov_rad: Option<f32>,
     pub yaw_center_rad: Option<f32>,
+    pub pitch_center_rad: Option<f32>,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
     pub max_frames: Option<u64>,
@@ -152,6 +153,9 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
     }
     if let Some(value) = args.yaw_center_rad {
         job = job.yaw_center_rad(value);
+    }
+    if let Some(value) = args.pitch_center_rad {
+        job = job.pitch_center_rad(value);
     }
 
     if let Some(t) = args.start_time {

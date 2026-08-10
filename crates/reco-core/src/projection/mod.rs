@@ -234,6 +234,11 @@ pub struct CylindricalStereoProjectionConfig {
     pub yaw_center_rad: f32,
     /// Vertical field of view of the output.
     pub vertical_fov_rad: f32,
+    /// World-space pitch at the vertical centre of the output. Positive
+    /// tilts the view up, negative tilts it down. Lets the crop window
+    /// move off the horizon (e.g. trade sky for more near-touchline
+    /// coverage) independently of `vertical_fov_rad`.
+    pub pitch_center_rad: f32,
     /// Width of the right-camera seam ramp in normalized plane UV units.
     pub blend_width: f32,
 }
@@ -244,6 +249,7 @@ impl Default for CylindricalStereoProjectionConfig {
             yaw_span_rad: std::f32::consts::PI,
             yaw_center_rad: 0.0,
             vertical_fov_rad: 70.0_f32.to_radians(),
+            pitch_center_rad: 0.0,
             blend_width: 0.15,
         }
     }
