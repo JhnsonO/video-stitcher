@@ -60,6 +60,7 @@ pub fn spawn_single_decoder_gpu(
                 log::info!("{label}: skipped {skip_frames} frames for sync offset");
             }
 
+            let mut frame_count: u64 = 0;
             loop {
                 if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -114,6 +115,53 @@ pub fn spawn_single_decoder_gpu(
                             log::error!("{label} cuCtxSynchronize: {e}");
                             break;
                         }
+
+                        // DIAGNOSTIC (temporary, env-gated, no effect unless
+                        // RECO_DEBUG_DUMP_FRAME=1): read back the Y plane we
+                        // just wrote via cuMemcpy2D and report its actual
+                        // byte content. This isolates whether NVDEC->shared
+                        // texture writes ever contain real pixel data,
+                        // independent of anything wgpu/Vulkan does with that
+                        // memory afterward. Only fires once, on this decode
+                        // thread's first successfully-copied frame.
+                        if frame_count == 0 && std::env::var("RECO_DEBUG_DUMP_FRAME").is_ok() {
+                            let w = buf.width as usize;
+                            let h = buf.height as usize;
+                            let mut host_buf = vec![0u8; w * h];
+                            match reco_core::interop::cuda::cuda_2d_copy_dtoh(
+                                host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                                w,
+                                buf.y_ptr[s],
+                                buf.y_pitch[s],
+                                w,
+                                h,
+                            ) {
+                                Ok(()) => {
+                                    let min = *host_buf.iter().min().unwrap_or(&0);
+                                    let max = *host_buf.iter().max().unwrap_or(&0);
+                                    let sum: u64 = host_buf.iter().map(|&b| b as u64).sum();
+                                    let mean = sum as f64 / host_buf.len() as f64;
+                                    let nonzero = host_buf.iter().filter(|&&b| b != 0).count();
+                                    log::warn!(
+                                        "{label} DIAG frame0 Y-plane readback: {w}x{h}, min={min} max={max} mean={mean:.2} nonzero_bytes={nonzero}/{}",
+                                        host_buf.len()
+                                    );
+                                    if let Some(dir) = std::env::var_os("RECO_DEBUG_DUMP_DIR") {
+                                        let path = std::path::Path::new(&dir)
+                                            .join(format!("{label}_frame0_y_{w}x{h}.raw"));
+                                        if let Err(e) = std::fs::write(&path, &host_buf) {
+                                            log::error!("{label} DIAG dump write failed: {e}");
+                                        } else {
+                                            log::warn!("{label} DIAG dumped raw Y plane to {}", path.display());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("{label} DIAG readback failed: {e}");
+                                }
+                            }
+                        }
+                        frame_count += 1;
 
                         if tx.send(slot).is_err() {
                             break;
