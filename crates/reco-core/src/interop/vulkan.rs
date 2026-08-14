@@ -497,11 +497,18 @@ mod tests {
 fn _compile_only_probe_add_wait_semaphore_typechecks(gpu: &GpuContext) {
     use wgpu::hal::api::Vulkan;
 
-    if let Some(hal_queue) = gpu.queue.as_hal::<Vulkan>() {
-        hal_queue.add_wait_semaphore(
-            ash::vk::Semaphore::null(),
-            None,
-            ash::vk::PipelineStageFlags::TOP_OF_PIPE,
-        );
+    // SAFETY: compile-only probe, never called. `as_hal` requires the
+    // caller not to destroy the returned resource while in use by the
+    // GPU; no resource is destroyed here, and no semaphore is created
+    // or waited on -- this exists purely to type-check
+    // `add_wait_semaphore` against the patched wgpu-hal.
+    unsafe {
+        if let Some(hal_queue) = gpu.queue.as_hal::<Vulkan>() {
+            hal_queue.add_wait_semaphore(
+                ash::vk::Semaphore::null(),
+                None,
+                ash::vk::PipelineStageFlags::TOP_OF_PIPE,
+            );
+        }
     }
 }
