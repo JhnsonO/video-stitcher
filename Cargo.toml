@@ -40,11 +40,18 @@ lto = "thin"
 # SPIKE: wgpu 28 interop with Slint. Fork removed; if wgpu 28 doesn't
 # have the shaderDrawParameters regression, no patch is needed.
 
-# Compile-only proof (ticket 1b): pin wgpu-hal to a fork containing a
-# minimal backport of upstream gfx-rs/wgpu #9461 (dc7f438b) --
-# Queue::add_wait_semaphore -- onto the exact v28.0.1 tag Reco already
-# resolves. wgpu/wgpu-core/wgpu-types versions are unchanged; only the
-# source of wgpu-hal 28.0.1 is redirected. Diagnostic-only: no zero-copy
-# behavioral change, no CUDA semaphore usage yet.
+# Compile-only proof (ticket 1c): 1b proved that patching wgpu-hal's
+# SOURCE alone while leaving wgpu/wgpu-core/wgpu-types on crates.io
+# produces two incompatible copies of wgpu-types in the graph (rustc
+# E0308 "two different versions of crate `wgpu_types`"), because the
+# forked wgpu-hal pulls its own workspace-locked wgpu-types from the
+# fork's monorepo. Patching the whole tightly-coupled quartet to the
+# same fork/rev keeps a single wgpu-types instance. Versions are
+# unchanged (all four resolve at their existing 28.0.x); only source
+# is redirected. Diagnostic-only: no zero-copy behavioral change, no
+# CUDA semaphore usage yet.
 [patch.crates-io]
-wgpu-hal = { git = "https://github.com/JhnsonO/wgpu", rev = "62e15ce1cc94929235d27b59962abb511622fb4e" }
+wgpu       = { git = "https://github.com/JhnsonO/wgpu", rev = "62e15ce1cc94929235d27b59962abb511622fb4e" }
+wgpu-core  = { git = "https://github.com/JhnsonO/wgpu", rev = "62e15ce1cc94929235d27b59962abb511622fb4e" }
+wgpu-hal   = { git = "https://github.com/JhnsonO/wgpu", rev = "62e15ce1cc94929235d27b59962abb511622fb4e" }
+wgpu-types = { git = "https://github.com/JhnsonO/wgpu", rev = "62e15ce1cc94929235d27b59962abb511622fb4e" }
