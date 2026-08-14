@@ -486,3 +486,22 @@ mod tests {
         }
     }
 }
+
+
+/// Compile-only probe (ticket 1b): proves `wgpu::Queue::as_hal::<Vulkan>()`
+/// reaches the patched `wgpu-hal` and that `add_wait_semaphore` type-checks
+/// through Reco's existing HAL access pattern. Intentionally never called --
+/// no semaphore is created or waited on. Backing implementation lives in
+/// `JhnsonO/wgpu@62e15ce1` (backport of upstream #9461 onto v28.0.1).
+#[allow(dead_code)]
+fn _compile_only_probe_add_wait_semaphore_typechecks(gpu: &GpuContext) {
+    use wgpu::hal::api::Vulkan;
+
+    if let Some(hal_queue) = gpu.queue.as_hal::<Vulkan>() {
+        hal_queue.add_wait_semaphore(
+            ash::vk::Semaphore::null(),
+            None,
+            ash::vk::PipelineStageFlags::TOP_OF_PIPE,
+        );
+    }
+}

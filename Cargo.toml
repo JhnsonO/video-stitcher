@@ -39,3 +39,12 @@ lto = "thin"
 
 # SPIKE: wgpu 28 interop with Slint. Fork removed; if wgpu 28 doesn't
 # have the shaderDrawParameters regression, no patch is needed.
+
+# Compile-only proof (ticket 1b): pin wgpu-hal to a fork containing a
+# minimal backport of upstream gfx-rs/wgpu #9461 (dc7f438b) --
+# Queue::add_wait_semaphore -- onto the exact v28.0.1 tag Reco already
+# resolves. wgpu/wgpu-core/wgpu-types versions are unchanged; only the
+# source of wgpu-hal 28.0.1 is redirected. Diagnostic-only: no zero-copy
+# behavioral change, no CUDA semaphore usage yet.
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/JhnsonO/wgpu", rev = "62e15ce1cc94929235d27b59962abb511622fb4e" }
