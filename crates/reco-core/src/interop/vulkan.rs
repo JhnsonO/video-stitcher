@@ -200,6 +200,146 @@ pub fn create_shared_texture(
             .bind_image_memory(vk_image, device_memory, 0)
             .map_err(|e| CudaInteropError::VulkanError(format!("vkBindImageMemory: {e:?}")))?;
 
+        // --- ZC_EXP5 (diagnostic): one-time PREINITIALIZED -> ---
+        // --- TRANSFER_SRC_OPTIMAL layout transition ---
+        //
+        // The image is created with initial_layout = PREINITIALIZED
+        // (above). Left alone, wgpu's create_texture_from_hal previously
+        // hard-coded TextureUses::UNINITIALIZED for every imported HAL
+        // texture -- and per the Vulkan spec, a transition FROM
+        // UNDEFINED/PREINITIALIZED is legally allowed to discard existing
+        // contents on first use. That's the leading hypothesis for why
+        // Vulkan's own readback of this texture has shown all-zero bytes
+        // even when CUDA's own view of the same shared memory is correct
+        // (see docs/ai-project-state.md, "zero-copy NV12 corruption").
+        //
+        // This performs the transition ourselves, once, at texture
+        // creation time -- before any CUDA write has happened and before
+        // wgpu ever sees the image -- so that when create_texture_from_hal
+        // is told (a few lines below, outside this block) that the
+        // texture's initial_state is COPY_SRC, that claim is actually
+        // true of the real VkImageLayout, not just of wgpu's tracker.
+        //
+        // This does NOT synchronize against CUDA's later per-frame
+        // writes to the same shared memory -- that's a separate, already
+        // scoped concern (Ticket 2's external-semaphore design). This is
+        // strictly a one-time "stop wgpu from treating fresh memory as
+        // discardable" fix, submitted on the exact queue wgpu itself
+        // uses (via Queue::as_hal, mirroring the proven pattern already
+        // used for add_wait_semaphore below in this same file) so there
+        // is no cross-queue-family hazard.
+        {
+            let (raw_queue, queue_family_index) = gpu
+                .queue
+                .as_hal::<Vulkan>()
+                .map(|hal_queue| (hal_queue.as_raw(), hal_queue.family_index()))
+                .ok_or(CudaInteropError::NotVulkan)?;
+
+            let pool_info =
+                vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
+            let cmd_pool = raw_device.create_command_pool(&pool_info, None).map_err(|e| {
+                CudaInteropError::VulkanError(format!(
+                    "vkCreateCommandPool (ZC_EXP5 transition): {e:?}"
+                ))
+            })?;
+
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(cmd_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd_buf = raw_device
+                .allocate_command_buffers(&alloc_info)
+                .map_err(|e| {
+                    CudaInteropError::VulkanError(format!(
+                        "vkAllocateCommandBuffers (ZC_EXP5 transition): {e:?}"
+                    ))
+                })?[0];
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            raw_device
+                .begin_command_buffer(cmd_buf, &begin_info)
+                .map_err(|e| {
+                    CudaInteropError::VulkanError(format!(
+                        "vkBeginCommandBuffer (ZC_EXP5 transition): {e:?}"
+                    ))
+                })?;
+
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::PREINITIALIZED)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(vk_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                // There is no real prior GPU-visible write to synchronize
+                // against yet (the image is freshly allocated/bound, CUDA
+                // hasn't written anything through it), so HOST_WRITE is
+                // the conventional (if imperfect) srcAccessMask for a
+                // transition away from PREINITIALIZED -- see Vulkan spec
+                // 11.4, "Layout Transitions".
+                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+
+            raw_device.cmd_pipeline_barrier(
+                cmd_buf,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&barrier),
+            );
+
+            raw_device.end_command_buffer(cmd_buf).map_err(|e| {
+                CudaInteropError::VulkanError(format!(
+                    "vkEndCommandBuffer (ZC_EXP5 transition): {e:?}"
+                ))
+            })?;
+
+            let fence = raw_device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| {
+                    CudaInteropError::VulkanError(format!(
+                        "vkCreateFence (ZC_EXP5 transition): {e:?}"
+                    ))
+                })?;
+
+            let submit_info =
+                vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd_buf));
+            raw_device
+                .queue_submit(raw_queue, std::slice::from_ref(&submit_info), fence)
+                .map_err(|e| {
+                    CudaInteropError::VulkanError(format!(
+                        "vkQueueSubmit (ZC_EXP5 transition): {e:?}"
+                    ))
+                })?;
+
+            raw_device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| {
+                    CudaInteropError::VulkanError(format!(
+                        "vkWaitForFences (ZC_EXP5 transition): {e:?}"
+                    ))
+                })?;
+
+            // Destroying the pool implicitly frees the command buffer
+            // allocated from it -- no separate free_command_buffers call.
+            raw_device.destroy_fence(fence, None);
+            raw_device.destroy_command_pool(cmd_pool, None);
+
+            log::info!(
+                "ZC_EXP5: transitioned imported VkImage PREINITIALIZED -> \
+                 TRANSFER_SRC_OPTIMAL (one-time, before any CUDA write)"
+            );
+        }
+
         log::info!(
             "Vulkan image created: {}x{} {:?}, pitch={}, imported fd={}",
             width,
@@ -284,6 +424,18 @@ pub fn create_shared_texture(
                     | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             },
+            // ZC_EXP5 (diagnostic): tell wgpu the true state of this
+            // imported texture instead of letting it assume UNINITIALIZED
+            // (which, per Vulkan spec, permits wgpu to discard the
+            // contents CUDA already wrote on first use -- see the
+            // one-time PREINITIALIZED -> TRANSFER_SRC_OPTIMAL transition
+            // performed above, immediately before this call). COPY_SRC
+            // because the first real operation on this texture is always
+            // a copy-out (zc_exp4_readback_texture's copy_texture_to_buffer,
+            // then VramPool::copy_from_textures' copy_texture_to_texture)
+            // -- confirmed by direct inspection of both call sites, this
+            // texture is never sampled or copy-dst'd before being read.
+            wgpu::TextureUses::COPY_SRC,
         )
     };
 
