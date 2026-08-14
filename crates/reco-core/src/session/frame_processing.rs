@@ -489,6 +489,19 @@ impl StitchSession {
             );
         }
 
+        // ZC_EXP1 (diagnostic-only, Reco #136 hypothesis test): block until
+        // the GPU has actually finished consuming this frame's shared
+        // Y/UV textures before releasing the slots back to the decoder for
+        // reuse. render_gpu_frame_at_pose()/submit_render_output() above
+        // only *enqueue* GPU work (nv12_converter deliberately uses
+        // non-blocking PollType::Poll for its own triple-buffered
+        // readback, per its own comment, to avoid a 7-14ms stall per
+        // frame) -- without this wait, the decode thread can start
+        // overwriting a slot's shared CUDA memory while wgpu/Vulkan may
+        // still be reading it for this frame's render pass. This is
+        // exactly reco-project/video-stitcher#136.
+        let _ = self.core.gpu().device().poll(wgpu::PollType::wait_indefinitely());
+
         if let Some((ref left_tx, ref right_tx)) = self.gpu_slot_free_tx {
             if left_tx.send(left_slot).is_err() {
                 log::error!(
