@@ -211,6 +211,23 @@ impl VramPool {
         gpu.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// ZC_EXP4 (diagnostic-only): raw texture accessors for a pool slot,
+    /// so a caller can read back the destination of `copy_from_textures`
+    /// (e.g. to verify the CUDA-shared -> plain-VRAM copy itself). Not
+    /// used by any non-diagnostic code path.
+    pub fn destination_textures(
+        &self,
+        slot: usize,
+    ) -> (
+        &wgpu::Texture,
+        &wgpu::Texture,
+        &wgpu::Texture,
+        &wgpu::Texture,
+    ) {
+        let s = &self.slots[slot];
+        (&s.left_y, &s.left_uv, &s.right_y, &s.right_uv)
+    }
+
     /// Left bind group for rendering a pool slot.
     pub fn left_bind_group(&self, slot: usize) -> &wgpu::BindGroup {
         &self.slots[slot].left_bind_group
