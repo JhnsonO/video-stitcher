@@ -436,6 +436,12 @@ impl MetalTextureCache {
                     usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 },
+                // Out of scope for the CUDA/vulkan.rs zero-copy diagnostic
+                // this ticket is about (macOS/iOS-only path) -- preserves
+                // the exact prior implicit behavior. Not investigated
+                // whether this path has the same discard-on-first-use
+                // issue.
+                wgpu::TextureUses::UNINITIALIZED,
             )
         };
 

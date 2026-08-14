@@ -539,6 +539,13 @@ fn import_single_plane(
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             },
+            // Out of scope for the CUDA/vulkan.rs zero-copy diagnostic this
+            // ticket is about -- preserves the exact prior implicit
+            // behavior (this was the hard-coded default before upstream
+            // #9496 made it an explicit parameter). Not investigated
+            // whether this DMA-BUF import path has the same discard-on-
+            // first-use issue; if it does, that's a separate ticket.
+            wgpu::TextureUses::UNINITIALIZED,
         )
     };
 

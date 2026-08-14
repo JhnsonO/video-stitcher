@@ -583,7 +583,17 @@ unsafe fn import_d3d11_shared_handle(
     };
 
     // Wrap the HAL texture into a wgpu::Texture.
-    let texture = unsafe { device.create_texture_from_hal::<Dx12>(hal_texture, &desc) };
+    let texture = unsafe {
+        device.create_texture_from_hal::<Dx12>(
+            hal_texture,
+            &desc,
+            // Out of scope for the CUDA/vulkan.rs zero-copy diagnostic this
+            // ticket is about (Windows-only path) -- preserves the exact
+            // prior implicit behavior. Not investigated whether this path
+            // has the same discard-on-first-use issue.
+            wgpu::TextureUses::UNINITIALIZED,
+        )
+    };
 
     Ok(texture)
 }
