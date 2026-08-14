@@ -160,6 +160,50 @@ pub fn spawn_single_decoder_gpu(
                                     log::error!("{label} DIAG readback failed: {e}");
                                 }
                             }
+
+                            // UV plane: same diagnostic, same trigger. NV12 UV
+                            // is interleaved U/V, full width in bytes, half
+                            // height. This is upstream of the cycle-3
+                            // device.poll(Wait) fix (which lives in
+                            // render_gpu_resident(), after this decode thread
+                            // has already returned the slot) -- so this
+                            // readback tells us whether the CUDA-side UV copy
+                            // itself is valid, independent of that fix.
+                            let uv_w = buf.width as usize;
+                            let uv_h = buf.height as usize / 2;
+                            let mut uv_host_buf = vec![0u8; uv_w * uv_h];
+                            match reco_core::interop::cuda::cuda_2d_copy_dtoh(
+                                uv_host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                                uv_w,
+                                buf.uv_ptr[s],
+                                buf.uv_pitch[s],
+                                uv_w,
+                                uv_h,
+                            ) {
+                                Ok(()) => {
+                                    let min = *uv_host_buf.iter().min().unwrap_or(&0);
+                                    let max = *uv_host_buf.iter().max().unwrap_or(&0);
+                                    let sum: u64 = uv_host_buf.iter().map(|&b| b as u64).sum();
+                                    let mean = sum as f64 / uv_host_buf.len() as f64;
+                                    let nonzero = uv_host_buf.iter().filter(|&&b| b != 0).count();
+                                    log::warn!(
+                                        "{label} DIAG frame0 UV-plane readback: {uv_w}x{uv_h}, min={min} max={max} mean={mean:.2} nonzero_bytes={nonzero}/{}",
+                                        uv_host_buf.len()
+                                    );
+                                    if let Some(dir) = std::env::var_os("RECO_DEBUG_DUMP_DIR") {
+                                        let path = std::path::Path::new(&dir)
+                                            .join(format!("{label}_frame0_uv_{uv_w}x{uv_h}.raw"));
+                                        if let Err(e) = std::fs::write(&path, &uv_host_buf) {
+                                            log::error!("{label} DIAG UV dump write failed: {e}");
+                                        } else {
+                                            log::warn!("{label} DIAG dumped raw UV plane to {}", path.display());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("{label} DIAG UV readback failed: {e}");
+                                }
+                            }
                         }
                         frame_count += 1;
 
