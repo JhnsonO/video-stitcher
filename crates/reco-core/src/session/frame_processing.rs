@@ -469,120 +469,6 @@ impl StitchSession {
                 "GPU bind groups not configured - call setup_gpu_source() before run()".into(),
             )
         })?;
-
-        // ZC_EXP3 (diagnostic-only, Reco #103 cross-API visibility test):
-        // on frame 0 only, read back the shared Y/UV textures through
-        // wgpu/Vulkan's OWN copy path (copy_texture_to_buffer + map),
-        // immediately before the render pass samples them. Cycle 4 proved
-        // CUDA's own view of this same memory is correct (Y and UV both
-        // reconstruct to a clean frame). This tells us whether Vulkan
-        // sees the same bytes CUDA wrote, or something else -- isolating
-        // cross-API visibility (#103) from the render/NV12-convert shader
-        // logic as the remaining suspect.
-        if self.frame_count == 0 && std::env::var("RECO_DEBUG_DUMP_FRAME").is_ok() {
-            if let Some(ref textures) = self.gpu_shared_textures {
-                let ls = left_slot as usize;
-                let rs = right_slot as usize;
-                // Dimensions/bytes-per-texel pulled from the real
-                // wgpu::Texture (not hardcoded) so this can never silently
-                // diverge from what the CUDA-side ZC_DIAG readback already
-                // confirmed (vk_actual_pitch=3840 for both planes).
-                let targets: [(&str, &wgpu::Texture); 4] = [
-                    ("left_y", &textures[ls * 2]),
-                    ("left_uv", &textures[ls * 2 + 1]),
-                    ("right_y", &textures[4 + rs * 2]),
-                    ("right_uv", &textures[4 + rs * 2 + 1]),
-                ];
-                for (label, texture) in targets {
-                    let w = texture.width();
-                    let h = texture.height();
-                    let bytes_per_texel = texture
-                        .format()
-                        .block_copy_size(None)
-                        .unwrap_or(1);
-                    let bytes_per_row = w * bytes_per_texel;
-                    debug_assert_eq!(
-                        bytes_per_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
-                        0,
-                        "ZC_EXP3: {label} bytes_per_row must already be 256-aligned"
-                    );
-                    let buf_size = (bytes_per_row * h) as u64;
-                    let device = self.core.gpu().device();
-                    let queue = self.core.gpu().queue();
-                    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("zc_exp3_staging"),
-                        size: buf_size,
-                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                        mapped_at_creation: false,
-                    });
-                    let mut encoder =
-                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("zc_exp3_readback_encoder"),
-                        });
-                    encoder.copy_texture_to_buffer(
-                        wgpu::TexelCopyTextureInfo {
-                            texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::TexelCopyBufferInfo {
-                            buffer: &staging,
-                            layout: wgpu::TexelCopyBufferLayout {
-                                offset: 0,
-                                bytes_per_row: Some(bytes_per_row),
-                                rows_per_image: Some(h),
-                            },
-                        },
-                        wgpu::Extent3d {
-                            width: w,
-                            height: h,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                    // Matches the proven map_and_strip_blocking pattern in
-                    // gpu/rgba_readback.rs: submit, then a single poll(Wait)
-                    // driven by map_async's own completion, not a separate
-                    // poll before it.
-                    queue.submit(std::iter::once(encoder.finish()));
-
-                    let slice = staging.slice(..);
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    slice.map_async(wgpu::MapMode::Read, move |result| {
-                        let _ = tx.send(result);
-                    });
-                    let _ = device.poll(wgpu::PollType::wait_indefinitely());
-                    match rx.recv() {
-                        Ok(Ok(())) => {
-                            let data = slice.get_mapped_range();
-                            let min = *data.iter().min().unwrap_or(&0);
-                            let max = *data.iter().max().unwrap_or(&0);
-                            let sum: u64 = data.iter().map(|&b| b as u64).sum();
-                            let mean = sum as f64 / data.len() as f64;
-                            let nonzero = data.iter().filter(|&&b| b != 0).count();
-                            log::warn!(
-                                "ZC_EXP3: {label} Vulkan-side readback {w}x{h} min={min} max={max} mean={mean:.2} nonzero_bytes={nonzero}/{}",
-                                data.len()
-                            );
-                            if let Some(dir) = std::env::var_os("RECO_DEBUG_DUMP_DIR") {
-                                let path = std::path::Path::new(&dir)
-                                    .join(format!("{label}_vulkan_frame0_{w}x{h}.raw"));
-                                if let Err(e) = std::fs::write(&path, &*data) {
-                                    log::error!("ZC_EXP3: {label} dump write failed: {e}");
-                                } else {
-                                    log::warn!("ZC_EXP3: {label} dumped raw Vulkan-side readback to {}", path.display());
-                                }
-                            }
-                            drop(data);
-                        }
-                        Ok(Err(e)) => log::error!("ZC_EXP3: {label} buffer map failed: {e:?}"),
-                        Err(e) => log::error!("ZC_EXP3: {label} map channel recv failed: {e}"),
-                    }
-                    staging.unmap();
-                }
-            }
-        }
-
         let render_buf =
             self.core
                 .render_gpu_frame_at_pose(bind_groups, left_slot, right_slot, yaw, pitch);
@@ -865,7 +751,7 @@ impl StitchSession {
     fn copy_to_vram_pool_platform(
         &mut self,
         frame: &StereoFrame,
-        _produce_index: u64,
+        produce_index: u64,
     ) -> Result<Option<usize>, SessionError> {
         let (ls, rs) = match frame {
             StereoFrame::GpuResident {
@@ -886,6 +772,44 @@ impl StitchSession {
                     ))
                 })?;
                 let gpu = self.core.pipeline().gpu();
+
+                // ZC_EXP4 (diagnostic-only, produce_index==0 i.e. the
+                // first frame produced): read the CUDA-shared SOURCE
+                // textures through Vulkan's own copy path, immediately
+                // before the existing copy_from_textures() call. This is
+                // the corrected location -- render_gpu_resident()'s
+                // "shared texture path" (cycle 5's ZC_EXP3) never runs
+                // once the VRAM pool is active, which it always is with
+                // --lookahead. See docs/ai-project-state.md for the full
+                // chain.
+                if produce_index == 0 && std::env::var("RECO_DEBUG_DUMP_FRAME").is_ok() {
+                    zc_exp4_readback_texture(
+                        &gpu.device,
+                        &gpu.queue,
+                        &shared_tex[ls * 2],
+                        "left_y_vram_src",
+                    );
+                    zc_exp4_readback_texture(
+                        &gpu.device,
+                        &gpu.queue,
+                        &shared_tex[ls * 2 + 1],
+                        "left_uv_vram_src",
+                    );
+                    zc_exp4_readback_texture(
+                        &gpu.device,
+                        &gpu.queue,
+                        &shared_tex[4 + rs * 2],
+                        "right_y_vram_src",
+                    );
+                    zc_exp4_readback_texture(
+                        &gpu.device,
+                        &gpu.queue,
+                        &shared_tex[4 + rs * 2 + 1],
+                        "right_uv_vram_src",
+                    );
+                }
+
+                // Existing copy + existing wait -- UNCHANGED.
                 pool.copy_from_textures(
                     gpu,
                     slot,
@@ -895,6 +819,39 @@ impl StitchSession {
                     &shared_tex[4 + rs * 2 + 1],
                 );
                 let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+
+                // ZC_EXP4 continued: read the plain (non-shared) VRAM
+                // pool DESTINATION textures, immediately after the copy
+                // and existing wait above.
+                if produce_index == 0 && std::env::var("RECO_DEBUG_DUMP_FRAME").is_ok() {
+                    let (dst_left_y, dst_left_uv, dst_right_y, dst_right_uv) =
+                        pool.destination_textures(slot);
+                    zc_exp4_readback_texture(
+                        &gpu.device,
+                        &gpu.queue,
+                        dst_left_y,
+                        "left_y_vram_dst",
+                    );
+                    zc_exp4_readback_texture(
+                        &gpu.device,
+                        &gpu.queue,
+                        dst_left_uv,
+                        "left_uv_vram_dst",
+                    );
+                    zc_exp4_readback_texture(
+                        &gpu.device,
+                        &gpu.queue,
+                        dst_right_y,
+                        "right_y_vram_dst",
+                    );
+                    zc_exp4_readback_texture(
+                        &gpu.device,
+                        &gpu.queue,
+                        dst_right_uv,
+                        "right_uv_vram_dst",
+                    );
+                }
+
                 // NOTE: the decode slot is NOT released here. Detection
                 // reads it after this copy (see `produce_one`), so the
                 // slot must stay held until `release_gpu_decode_slot` is
@@ -989,4 +946,98 @@ impl StitchSession {
     ) -> Result<Option<usize>, SessionError> {
         Ok(None)
     }
+}
+
+/// ZC_EXP4 (diagnostic-only, corrected location -- see cycle 5 handoff):
+/// read back a wgpu texture via `copy_texture_to_buffer` + `map_async`,
+/// log min/max/mean/nonzero, and dump the raw bytes under
+/// `RECO_DEBUG_DUMP_DIR`. Used on frame 0 only, around the real
+/// CUDA-shared -> plain-VRAM-pool copy in `copy_to_vram_pool_platform()`
+/// (Linux). Read-only -- no effect on the copy/render/encode path.
+/// Dimensions/bytes-per-texel are pulled from the live `wgpu::Texture`.
+#[cfg(target_os = "linux")]
+fn zc_exp4_readback_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    label: &str,
+) {
+    let w = texture.width();
+    let h = texture.height();
+    let bytes_per_texel = texture.format().block_copy_size(None).unwrap_or(1);
+    let bytes_per_row = w * bytes_per_texel;
+    debug_assert_eq!(
+        bytes_per_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+        0,
+        "ZC_EXP4: {label} bytes_per_row must already be 256-aligned"
+    );
+    let buf_size = (bytes_per_row * h) as u64;
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("zc_exp4_staging"),
+        size: buf_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("zc_exp4_readback_encoder"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    // Matches the proven map_and_strip_blocking pattern in
+    // gpu/rgba_readback.rs: submit, then a single poll(Wait) driven by
+    // map_async's own completion, not a separate poll before it.
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    match rx.recv() {
+        Ok(Ok(())) => {
+            let data = slice.get_mapped_range();
+            let min = *data.iter().min().unwrap_or(&0);
+            let max = *data.iter().max().unwrap_or(&0);
+            let sum: u64 = data.iter().map(|&b| b as u64).sum();
+            let mean = sum as f64 / data.len() as f64;
+            let nonzero = data.iter().filter(|&&b| b != 0).count();
+            log::warn!(
+                "ZC_EXP4: {label} readback {w}x{h} min={min} max={max} mean={mean:.2} nonzero_bytes={nonzero}/{}",
+                data.len()
+            );
+            if let Some(dir) = std::env::var_os("RECO_DEBUG_DUMP_DIR") {
+                let path =
+                    std::path::Path::new(&dir).join(format!("{label}_{w}x{h}.raw"));
+                if let Err(e) = std::fs::write(&path, &*data) {
+                    log::error!("ZC_EXP4: {label} dump write failed: {e}");
+                } else {
+                    log::warn!("ZC_EXP4: {label} dumped raw readback to {}", path.display());
+                }
+            }
+            drop(data);
+        }
+        Ok(Err(e)) => log::error!("ZC_EXP4: {label} buffer map failed: {e:?}"),
+        Err(e) => log::error!("ZC_EXP4: {label} map channel recv failed: {e}"),
+    }
+    staging.unmap();
 }
