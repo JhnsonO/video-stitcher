@@ -711,6 +711,15 @@ unsafe impl Sync for CudaExternalSemaphore {}
 pub fn cuda_import_external_semaphore(
     fd: std::os::raw::c_int,
 ) -> Result<CudaExternalSemaphore, CudaInteropError> {
+    // Real bug, found on real hardware (RunPod run 31848571928):
+    // CUDA_ERROR_INVALID_CONTEXT (201) on cuImportExternalSemaphore.
+    // This is called from the source-init thread (smart_source.rs
+    // open_zero_copy), before any decode thread has run its own
+    // cuda_ensure_context() -- unlike allocate_shared_memory (used
+    // just above this in the same call site for the actual shared
+    // textures), which already ensures a context internally. Mirror
+    // that same pattern here.
+    cuda_ensure_context()?;
     let desc = CudaExternalSemaphoreHandleDesc {
         handle_type: CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD,
         _pad_before_union: 0,
