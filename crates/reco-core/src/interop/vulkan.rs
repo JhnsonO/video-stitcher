@@ -721,8 +721,13 @@ pub fn create_export_semaphore(
         let get_fd_info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(semaphore)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+        // ash 0.38's `khr::external_semaphore_fd::Device` drops the `_khr`
+        // suffix on its idiomatic wrapper methods (confirmed against the
+        // actual pinned version, ash-0.38.0+1.3.281, via docs.rs -- the
+        // real method is `get_semaphore_fd`, not `get_semaphore_fd_khr`;
+        // the first real compile-proof dispatch caught this as E0599).
         let fd = ext_semaphore_fd
-            .get_semaphore_fd_khr(&get_fd_info)
+            .get_semaphore_fd(&get_fd_info)
             .map_err(|e| CudaInteropError::VulkanError(format!("vkGetSemaphoreFdKHR: {e:?}")))?;
 
         Ok((semaphore, fd))
