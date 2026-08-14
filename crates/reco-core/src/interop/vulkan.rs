@@ -123,6 +123,36 @@ pub fn create_shared_texture(
         let layout = raw_device.get_image_subresource_layout(vk_image, subresource);
         let actual_pitch = layout.row_pitch as usize;
 
+        // --- ZC_DIAG: diagnostic-only, no behavioral change ---
+        // Narrowed hypothesis check (per Johnson, 14 Aug 2026): pitch already
+        // confirmed matching on real footage (run 31557269688 logged
+        // actual_pitch=3840 for both Y/UV, same as the guessed pitch here).
+        // The only open question is whether shared_mem.alloc_size (after CUDA
+        // VMM granularity rounding) actually satisfies Vulkan's mem_reqs.size.
+        let mem_reqs_size = mem_reqs.size as usize;
+        let mem_reqs_alignment = mem_reqs.alignment as usize;
+        let actual_pitch_x_height = actual_pitch * height as usize;
+        let pass_vs_mem_reqs = shared_mem.alloc_size >= mem_reqs_size;
+        let pass_vs_pitch_x_height = shared_mem.alloc_size >= actual_pitch_x_height;
+        log::info!(
+            "ZC_DIAG: {}x{} {:?} bpp={} row_bytes={} guessed_pitch={} requested_alloc_size={} shared_mem_alloc_size={} vk_actual_pitch={} vk_mem_reqs_size={} vk_mem_reqs_alignment={} actual_pitch_x_height={} PASS_vs_mem_reqs={} PASS_vs_pitch_x_height={}",
+            width,
+            height,
+            format,
+            bpp,
+            row_bytes,
+            pitch,
+            alloc_size,
+            shared_mem.alloc_size,
+            actual_pitch,
+            mem_reqs_size,
+            mem_reqs_alignment,
+            actual_pitch_x_height,
+            if pass_vs_mem_reqs { "PASS" } else { "FAIL" },
+            if pass_vs_pitch_x_height { "PASS" } else { "FAIL" },
+        );
+        // --- end ZC_DIAG ---
+
         // Find a DEVICE_LOCAL memory type
         let mem_props = {
             let instance = hal_device.shared_instance().raw_instance();
