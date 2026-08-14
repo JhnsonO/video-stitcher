@@ -640,6 +640,95 @@ mod tests {
 }
 
 
+/// Create a binary Vulkan semaphore exportable as a POSIX fd, for the
+/// diagnostic CUDA->Vulkan cross-API sync (Ticket 2). CUDA imports the
+/// returned fd via `cuImportExternalSemaphore` and signals it after
+/// `cuCtxSynchronize()` confirms a frame's `cuMemcpy2D` writes are
+/// complete; Vulkan waits on the returned `VkSemaphore` (via the
+/// existing `add_wait_semaphore`, see the compile-only probe below)
+/// before reading the same shared memory.
+///
+/// Requires `VK_KHR_external_semaphore_fd` enabled on the device --
+/// added to `JhnsonO/wgpu`'s optional-extension list (version-gated:
+/// `VK_KHR_external_semaphore` is only separately requested on a
+/// Vulkan 1.0 device, since it's core as of 1.1) alongside the
+/// existing `VK_KHR_external_memory_fd` request this file already
+/// relies on for the shared textures above.
+///
+/// Checks the physical device's advertised extensions directly before
+/// touching the KHR loader or its function pointers, so an
+/// unsupported device fails with a clear error here rather than
+/// risking a call through an unresolved (null) `vkGetSemaphoreFdKHR`
+/// if the extension wasn't actually enabled at device creation.
+///
+/// Per the extension spec, each successful `vkGetSemaphoreFdKHR` call
+/// transfers ownership of a fresh fd to the caller; the caller must
+/// ensure it's eventually consumed. On the CUDA side specifically:
+/// `cuImportExternalSemaphore` takes ownership of the fd only on a
+/// *successful* import -- if that import fails, the fd is still ours
+/// to close (see `cuda_import_external_semaphore`'s caller contract).
+#[cfg(target_os = "linux")]
+pub fn create_export_semaphore(
+    gpu: &GpuContext,
+) -> Result<(ash::vk::Semaphore, std::os::raw::c_int), CudaInteropError> {
+    use ash::vk;
+    use wgpu::hal::api::Vulkan;
+
+    unsafe {
+        let hal_device_guard = gpu
+            .device
+            .as_hal::<Vulkan>()
+            .ok_or(CudaInteropError::NotVulkan)?;
+        let hal_device = &*hal_device_guard;
+        let raw_device = hal_device.raw_device();
+        let physical_device = hal_device.raw_physical_device();
+        let raw_instance = hal_device.shared_instance().raw_instance();
+
+        // Fail clearly here rather than risk dereferencing an
+        // unavailable extension function pointer below: confirm the
+        // physical device actually advertises the fd-export extension
+        // (equivalent to the check the wgpu-hal patch above uses to
+        // decide whether to enable it at device creation).
+        let supported_extensions = raw_instance
+            .enumerate_device_extension_properties(physical_device)
+            .map_err(|e| {
+                CudaInteropError::VulkanError(format!(
+                    "vkEnumerateDeviceExtensionProperties: {e:?}"
+                ))
+            })?;
+        let has_semaphore_fd = supported_extensions.iter().any(|ep| {
+            ep.extension_name_as_c_str() == Ok(ash::khr::external_semaphore_fd::NAME)
+        });
+        if !has_semaphore_fd {
+            return Err(CudaInteropError::VulkanError(
+                "VK_KHR_external_semaphore_fd not supported by this device -- \
+                 diagnostic CUDA<->Vulkan semaphore sync unavailable"
+                    .into(),
+            ));
+        }
+
+        let mut export_info = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+        let sem_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+        let semaphore = raw_device
+            .create_semaphore(&sem_info, None)
+            .map_err(|e| {
+                CudaInteropError::VulkanError(format!("vkCreateSemaphore (export): {e:?}"))
+            })?;
+
+        let ext_semaphore_fd =
+            ash::khr::external_semaphore_fd::Device::new(raw_instance, raw_device);
+        let get_fd_info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+        let fd = ext_semaphore_fd
+            .get_semaphore_fd_khr(&get_fd_info)
+            .map_err(|e| CudaInteropError::VulkanError(format!("vkGetSemaphoreFdKHR: {e:?}")))?;
+
+        Ok((semaphore, fd))
+    }
+}
+
 /// Compile-only probe (ticket 1b): proves `wgpu::Queue::as_hal::<Vulkan>()`
 /// reaches the patched `wgpu-hal` and that `add_wait_semaphore` type-checks
 /// through Reco's existing HAL access pattern. Intentionally never called --

@@ -38,4 +38,13 @@ pub struct SharedTextureSet {
     /// (e.g. `SmartFileSource`). The session creates them lazily at
     /// the start of `run()`.
     pub bind_groups: Option<crate::render::pipeline::GpuSourceBindGroups>,
+    /// The 4 exportable `VkSemaphore`s for the diagnostic CUDA->Vulkan
+    /// sync (Ticket 2), one per double-buffer slot: `[left_slot_0,
+    /// left_slot_1, right_slot_0, right_slot_1]` (Y+UV share one
+    /// semaphore per slot). CUDA holds the imported/signaling side
+    /// (`GpuBufInfo::sem_cuda`); the session waits on these via
+    /// `add_wait_semaphore` in `copy_to_vram_pool_platform` before
+    /// reading the shared textures. Owned here (not `SharedTexture`)
+    /// since a semaphore, unlike a texture, isn't tied to one plane.
+    pub vk_semaphores: [ash::vk::Semaphore; 4],
 }

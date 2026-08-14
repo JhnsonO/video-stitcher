@@ -354,6 +354,33 @@ impl SmartFileSource {
         let (right_y_0, right_uv_0) = create_pair("right[0]")?;
         let (right_y_1, right_uv_1) = create_pair("right[1]")?;
 
+        // ZC_SEM (diagnostic, Ticket 2): one exportable VkSemaphore per
+        // double-buffer slot -- [left_0, left_1, right_0, right_1],
+        // matching the SharedTextureSet::vk_semaphores layout. Each is
+        // exported as a POSIX fd and immediately imported into CUDA;
+        // the decode thread signals the CUDA side, the render side
+        // waits on the VkSemaphore side. Y+UV within a slot share one
+        // semaphore since both are written by the same decode-thread
+        // iteration before any signal, and both read together by the
+        // same copy_from_textures() call.
+        use reco_core::interop::cuda::cuda_import_external_semaphore;
+        use reco_core::interop::vulkan::create_export_semaphore;
+        let make_slot_semaphore = |label: &str| -> Result<
+            (ash::vk::Semaphore, reco_core::interop::cuda::CudaExternalSemaphore),
+            SourceError,
+        > {
+            let (vk_sem, fd) =
+                create_export_semaphore(gpu).map_err(|e| map_err(format!("{label} sem: {e}")))?;
+            let cuda_sem = cuda_import_external_semaphore(fd)
+                .map_err(|e| map_err(format!("{label} sem import: {e}")))?;
+            Ok((vk_sem, cuda_sem))
+        };
+        let (left_vk_sem_0, left_cuda_sem_0) = make_slot_semaphore("left[0]")?;
+        let (left_vk_sem_1, left_cuda_sem_1) = make_slot_semaphore("left[1]")?;
+        let (right_vk_sem_0, right_cuda_sem_0) = make_slot_semaphore("right[0]")?;
+        let (right_vk_sem_1, right_cuda_sem_1) = make_slot_semaphore("right[1]")?;
+        let vk_semaphores = [left_vk_sem_0, left_vk_sem_1, right_vk_sem_0, right_vk_sem_1];
+
         log::info!(
             "SmartFileSource: GPU zero-copy ({input_width}x{input_height}, {pixel_format:?}), Y pitch={}/{}",
             left_y_0.pitch,
@@ -368,6 +395,7 @@ impl SmartFileSource {
             width: input_width,
             height: input_height,
             pixel_format,
+            sem_cuda: [left_cuda_sem_0, left_cuda_sem_1],
         };
         let right_buf = GpuBufInfo {
             y_ptr: [right_y_0.cuda_ptr, right_y_1.cuda_ptr],
@@ -377,6 +405,7 @@ impl SmartFileSource {
             width: input_width,
             height: input_height,
             pixel_format,
+            sem_cuda: [right_cuda_sem_0, right_cuda_sem_1],
         };
 
         // Slot-free channels for backpressure
@@ -425,6 +454,7 @@ impl SmartFileSource {
             // Bind groups are created lazily by setup_gpu_source()
             // when it sees None. The source doesn't have pipeline access.
             bind_groups: None,
+            vk_semaphores,
         };
 
         Ok(Self {

@@ -116,6 +116,22 @@ pub fn spawn_single_decoder_gpu(
                             break;
                         }
 
+                        // ZC_SEM (diagnostic, Ticket 2): signal this
+                        // slot's CUDA->Vulkan semaphore now that
+                        // cuCtxSynchronize() above has confirmed both
+                        // cuMemcpy2D writes for this frame are actually
+                        // complete (not merely submitted). The render
+                        // side waits on the matching VkSemaphore
+                        // (session::frame_processing::
+                        // copy_to_vram_pool_platform) before reading
+                        // this slot's shared textures via Vulkan.
+                        if let Err(e) =
+                            reco_core::interop::cuda::cuda_signal_external_semaphore(buf.sem_cuda[s])
+                        {
+                            log::error!("{label} cuSignalExternalSemaphoresAsync: {e}");
+                            break;
+                        }
+
                         // DIAGNOSTIC (temporary, env-gated, no effect unless
                         // RECO_DEBUG_DUMP_FRAME=1): read back the Y plane we
                         // just wrote via cuMemcpy2D and report its actual

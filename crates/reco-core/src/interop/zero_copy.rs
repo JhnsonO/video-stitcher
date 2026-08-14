@@ -28,6 +28,14 @@ pub struct GpuBufInfo {
     /// Pixel format (NV12 8-bit or P010 10-bit). Determines CUDA copy
     /// width via `GpuPixelFormat::bytes_per_sample()`.
     pub pixel_format: crate::render::renderer::GpuPixelFormat,
+    /// CUDA-imported external semaphores for the double-buffered slots
+    /// (diagnostic, Ticket 2). The decode thread signals `sem_cuda[s]`
+    /// immediately after `cuCtxSynchronize()` confirms slot `s`'s
+    /// `cuMemcpy2D` writes are complete; the render side waits on the
+    /// matching `VkSemaphore` (see `SharedTextureSet::vk_semaphores`)
+    /// before reading the same shared memory via Vulkan.
+    #[cfg(target_os = "linux")]
+    pub sem_cuda: [crate::interop::cuda::CudaExternalSemaphore; 2],
 }
 
 /// A pair of double-buffer slot indices from the decode threads.

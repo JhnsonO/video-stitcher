@@ -809,6 +809,34 @@ impl StitchSession {
                     );
                 }
 
+                // ZC_SEM (diagnostic, Ticket 2): wait on this slot's
+                // CUDA->Vulkan semaphores before the copy below reads
+                // the shared textures. Staged via the proven
+                // `add_wait_semaphore` HAL escape hatch (same pattern
+                // as the ZC_EXP5 layout transition above/`Queue::as_hal`
+                // probe in interop/vulkan.rs) -- consumed on the next
+                // `gpu.queue.submit()`, which `copy_from_textures`
+                // performs. `left_idx`/`right_idx` index
+                // `gpu_vk_semaphores` as `[left_0, left_1, right_0,
+                // right_1]`.
+                if let Some(vk_sems) = self.gpu_vk_semaphores {
+                    use wgpu::hal::api::Vulkan;
+                    let left_idx = ls;
+                    let right_idx = 2 + rs;
+                    if let Some(hal_queue) = unsafe { gpu.queue.as_hal::<Vulkan>() } {
+                        hal_queue.add_wait_semaphore(
+                            vk_sems[left_idx],
+                            None,
+                            ash::vk::PipelineStageFlags::TRANSFER,
+                        );
+                        hal_queue.add_wait_semaphore(
+                            vk_sems[right_idx],
+                            None,
+                            ash::vk::PipelineStageFlags::TRANSFER,
+                        );
+                    }
+                }
+
                 // Existing copy + existing wait -- UNCHANGED.
                 pool.copy_from_textures(
                     gpu,

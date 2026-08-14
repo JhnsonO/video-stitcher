@@ -128,6 +128,7 @@ impl StitchSession {
             t[6].texture.clone(),
             t[7].texture.clone(),
         ]);
+        self.gpu_vk_semaphores = Some(shared.vk_semaphores);
         log::info!("Session configured for GPU-resident source");
     }
 

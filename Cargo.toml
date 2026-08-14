@@ -51,7 +51,7 @@ lto = "thin"
 # is redirected. Diagnostic-only: no zero-copy behavioral change, no
 # CUDA semaphore usage yet.
 [patch.crates-io]
-wgpu       = { git = "https://github.com/JhnsonO/wgpu", rev = "0750ea88863e6e4e8acd9128ce820d71f44e968f" }
-wgpu-core  = { git = "https://github.com/JhnsonO/wgpu", rev = "0750ea88863e6e4e8acd9128ce820d71f44e968f" }
-wgpu-hal   = { git = "https://github.com/JhnsonO/wgpu", rev = "0750ea88863e6e4e8acd9128ce820d71f44e968f" }
-wgpu-types = { git = "https://github.com/JhnsonO/wgpu", rev = "0750ea88863e6e4e8acd9128ce820d71f44e968f" }
+wgpu       = { git = "https://github.com/JhnsonO/wgpu", rev = "c8b6f2f00895210857f77f2a10fc1a32a80d5148" }
+wgpu-core  = { git = "https://github.com/JhnsonO/wgpu", rev = "c8b6f2f00895210857f77f2a10fc1a32a80d5148" }
+wgpu-hal   = { git = "https://github.com/JhnsonO/wgpu", rev = "c8b6f2f00895210857f77f2a10fc1a32a80d5148" }
+wgpu-types = { git = "https://github.com/JhnsonO/wgpu", rev = "c8b6f2f00895210857f77f2a10fc1a32a80d5148" }

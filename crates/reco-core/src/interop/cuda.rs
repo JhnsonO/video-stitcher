@@ -139,6 +139,57 @@ type CUmemGenericAllocationHandle = u64;
 #[cfg(target_os = "windows")]
 type CUexternalMemory = *mut c_void;
 
+/// Opaque CUDA external semaphore handle (driver API `CUexternalSemaphore`).
+/// Linux-only: imported from a Vulkan-exported POSIX fd for the
+/// diagnostic CUDA<->Vulkan cross-API sync (Ticket 2).
+#[cfg(target_os = "linux")]
+type CUexternalSemaphoreRaw = *mut c_void;
+
+/// `CUexternalSemaphoreHandleType_enum::CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD`.
+#[cfg(target_os = "linux")]
+const CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD: u32 = 1;
+
+/// `CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC` (driver API, opaque-fd branch
+/// only). Layout mirrors the real C struct byte-for-byte on the Linux
+/// x86-64/aarch64 SysV ABI: a 4-byte enum, implicit 4-byte pad to bring
+/// the union to its natural 8-byte (pointer) alignment, the union
+/// itself sized to its largest member (the win32 `{handle, name}`
+/// branch, 16 bytes -- of which only the first 4 bytes, the `fd`
+/// branch, are ever populated here), then `flags` and `reserved[16]`,
+/// with 4 bytes of trailing pad so the whole struct's size is a
+/// multiple of its 8-byte alignment.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct CudaExternalSemaphoreHandleDesc {
+    handle_type: u32,
+    _pad_before_union: u32,
+    fd: i32,
+    _union_pad: [u8; 12],
+    flags: u32,
+    reserved: [u32; 16],
+    _tail_pad: [u8; 4],
+}
+
+/// `CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS`. Only the fence/nvSciSync/
+/// keyedMutex fields exist for timeline/NvSciSync/keyed-mutex
+/// semaphores; for a plain binary semaphore (this ticket's case) they
+/// are ignored by the driver and left zeroed. Layout mirrors the real
+/// C struct: an inner `params` struct (fence.value: u64, nvSciSync
+/// union as u64, keyedMutex.key: u64, reserved[12]: u32 = 72 bytes),
+/// then `flags` and `reserved[16]`, then 4 bytes of trailing pad for
+/// 8-byte struct alignment.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct CudaExternalSemaphoreSignalParams {
+    fence_value: u64,
+    nv_sci_sync: u64,
+    keyed_mutex_key: u64,
+    params_reserved: [u32; 12],
+    flags: u32,
+    reserved: [u32; 16],
+    _tail_pad: [u8; 4],
+}
+
 /// External memory handle type: D3D11 resource shared via NT handle.
 #[cfg(target_os = "windows")]
 const CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_RESOURCE: u32 = 4;
@@ -251,6 +302,23 @@ struct CudaFunctions {
     ) -> CUresult,
     #[cfg(target_os = "windows")]
     cu_destroy_external_memory: unsafe extern "C" fn(CUexternalMemory) -> CUresult,
+
+    // External semaphore (Vulkan -> CUDA import, Linux zero-copy sync,
+    // Ticket 2 diagnostic)
+    #[cfg(target_os = "linux")]
+    cu_import_external_semaphore: unsafe extern "C" fn(
+        *mut CUexternalSemaphoreRaw,
+        *const CudaExternalSemaphoreHandleDesc,
+    ) -> CUresult,
+    #[cfg(target_os = "linux")]
+    cu_signal_external_semaphores_async: unsafe extern "C" fn(
+        *const CUexternalSemaphoreRaw,
+        *const CudaExternalSemaphoreSignalParams,
+        u32,
+        CUstream,
+    ) -> CUresult,
+    #[cfg(target_os = "linux")]
+    cu_destroy_external_semaphore: unsafe extern "C" fn(CUexternalSemaphoreRaw) -> CUresult,
 
     // Module / kernel launch
     cu_module_load_data: unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult,
@@ -366,6 +434,15 @@ impl CudaFunctions {
                 ),
                 #[cfg(target_os = "windows")]
                 cu_destroy_external_memory: load_sym!(lib_cuda, "cuDestroyExternalMemory"),
+                #[cfg(target_os = "linux")]
+                cu_import_external_semaphore: load_sym!(lib_cuda, "cuImportExternalSemaphore"),
+                #[cfg(target_os = "linux")]
+                cu_signal_external_semaphores_async: load_sym!(
+                    lib_cuda,
+                    "cuSignalExternalSemaphoresAsync"
+                ),
+                #[cfg(target_os = "linux")]
+                cu_destroy_external_semaphore: load_sym!(lib_cuda, "cuDestroyExternalSemaphore"),
                 cu_module_load_data: load_sym!(lib_cuda, "cuModuleLoadData"),
                 cu_module_unload: load_sym!(lib_cuda, "cuModuleUnload"),
                 cu_module_get_function: load_sym!(lib_cuda, "cuModuleGetFunction"),
@@ -601,6 +678,99 @@ pub fn cuda_synchronize() -> Result<(), CudaInteropError> {
         check_cuda("cuCtxSynchronize", (cuda.cu_ctx_synchronize)())?;
     }
     Ok(())
+}
+
+/// A CUDA-imported external semaphore (Linux, Ticket 2 diagnostic).
+///
+/// Wraps the opaque `CUexternalSemaphore` driver handle returned by
+/// `cuImportExternalSemaphore`. Like `CUdeviceptr`, this is an opaque
+/// ID/pointer-sized handle managed by the CUDA driver, not a Rust
+/// reference -- `Copy`/`Send`/`Sync` mirror how `CUdeviceptr` is
+/// already threaded across the decode-thread boundary in this file.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+pub struct CudaExternalSemaphore(CUexternalSemaphoreRaw);
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for CudaExternalSemaphore {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for CudaExternalSemaphore {}
+
+/// Import a Vulkan-exported POSIX fd
+/// (`VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT`, from
+/// `crate::interop::vulkan::create_export_semaphore`) as a CUDA
+/// external semaphore.
+///
+/// FD ownership per `VK_KHR_external_semaphore_fd`: a *successful*
+/// import transfers ownership of `fd` to the CUDA driver -- the caller
+/// must not touch it afterward. If the import fails, ownership never
+/// transferred, so this function closes `fd` itself before returning
+/// the error (the caller remains responsible only for `fd`s it never
+/// hands to this function in the first place).
+#[cfg(target_os = "linux")]
+pub fn cuda_import_external_semaphore(
+    fd: std::os::raw::c_int,
+) -> Result<CudaExternalSemaphore, CudaInteropError> {
+    let desc = CudaExternalSemaphoreHandleDesc {
+        handle_type: CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD,
+        _pad_before_union: 0,
+        fd,
+        _union_pad: [0; 12],
+        flags: 0,
+        reserved: [0; 16],
+        _tail_pad: [0; 4],
+    };
+    let cuda = match cuda() {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+    };
+    let mut sem: CUexternalSemaphoreRaw = std::ptr::null_mut();
+    unsafe {
+        if let Err(e) = check_cuda(
+            "cuImportExternalSemaphore",
+            (cuda.cu_import_external_semaphore)(&mut sem, &desc),
+        ) {
+            // Import did not succeed -- ownership never transferred,
+            // so we still own fd and must close it ourselves.
+            libc::close(fd);
+            return Err(e);
+        }
+    }
+    Ok(CudaExternalSemaphore(sem))
+}
+
+/// Signal an imported external semaphore on the default (NULL) CUDA
+/// stream (diagnostic-only, Ticket 2).
+///
+/// Called immediately after `cuda_synchronize()` in the decode thread
+/// (`spawn_single_decoder_gpu`), so the context is already idle at the
+/// point this executes -- the signal is ordered after this frame's
+/// completed `cuMemcpy2D` writes, not just their submission, so
+/// Vulkan's matching `add_wait_semaphore` wait is guaranteed to
+/// observe the real data.
+#[cfg(target_os = "linux")]
+pub fn cuda_signal_external_semaphore(
+    sem: CudaExternalSemaphore,
+) -> Result<(), CudaInteropError> {
+    let params = CudaExternalSemaphoreSignalParams {
+        fence_value: 0,
+        nv_sci_sync: 0,
+        keyed_mutex_key: 0,
+        params_reserved: [0; 12],
+        flags: 0,
+        reserved: [0; 16],
+        _tail_pad: [0; 4],
+    };
+    let cuda = cuda()?;
+    unsafe {
+        check_cuda(
+            "cuSignalExternalSemaphoresAsync",
+            (cuda.cu_signal_external_semaphores_async)(&sem.0, &params, 1, std::ptr::null_mut()),
+        )
+    }
 }
 
 /// Query (free, total) device memory in bytes via the CUDA driver.

@@ -30,6 +30,11 @@ stacked-output = ["ffmpeg"]
 reco-core = { path = "../reco-core" }
 log = "0.4"
 thiserror = "2"
+# Needed for the diagnostic CUDA<->Vulkan semaphore sync (Ticket 2,
+# Linux zero-copy path only): `ash::vk::Semaphore` is the type carried
+# in `SharedTextureSet::vk_semaphores`. Version pinned to match
+# reco-core's `ash = "0.38"` so cargo unifies both to one instance.
+ash = "0.38"
 tracing = { workspace = true, optional = true }
 
 # FFmpeg backend
