@@ -189,7 +189,7 @@ pub fn create_shared_texture(
             .fd(fd);
 
         let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(shared_mem.alloc_size as u64)
+            .allocation_size(mem_reqs.size)
             .memory_type_index(memory_type_index)
             .push_next(&mut import_info);
 
