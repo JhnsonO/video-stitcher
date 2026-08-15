@@ -1,0 +1,42 @@
+name: Stride CLI guard helper
+
+on:
+  push:
+    branches: [feature/frame-stride-testing]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[stride-cli-guard]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: feature/frame-stride-testing
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: rustfmt
+      - uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05
+        with:
+          packages: libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev libavfilter-dev libswresample-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libfontconfig1-dev libobs-dev pkg-config clang
+      - name: Apply guard fix
+        run: python3 tools/fix_stride_cli_guard.py
+      - name: Verify formatting and feature boundaries
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          git diff --check
+          cargo check -p reco-cli --no-default-features
+          cargo check -p reco-cli
+          cargo test -p reco-core frame_stride_tests --lib
+          cargo test -p reco-core sparse_future_states_exclude_render_only_duplicates --lib
+          cargo test -p reco-autocam stride_ --lib
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/reco-cli/src/stitch.rs
+          git commit -m "fix: keep frame stride CLI feature-safe [stride-cli-guard]"
+          git push origin HEAD:feature/frame-stride-testing
