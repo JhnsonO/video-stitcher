@@ -5574,7 +5574,6 @@ dependencies = [
 name = "reco-io"
 version = "0.5.4"
 dependencies = [
- "ash",
  "directories",
  "ffmpeg-next",
  "gstreamer",
