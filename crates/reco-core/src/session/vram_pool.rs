@@ -75,7 +75,9 @@ impl VramPool {
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
                         format: fmt,
-                        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                        usage: wgpu::TextureUsages::COPY_DST
+                            | wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_SRC,
                         view_formats: &[],
                     })
                 };

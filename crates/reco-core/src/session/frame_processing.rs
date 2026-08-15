@@ -500,7 +500,11 @@ impl StitchSession {
         // overwriting a slot's shared CUDA memory while wgpu/Vulkan may
         // still be reading it for this frame's render pass. This is
         // exactly reco-project/video-stitcher#136.
-        let _ = self.core.gpu().device().poll(wgpu::PollType::wait_indefinitely());
+        let _ = self
+            .core
+            .gpu()
+            .device()
+            .poll(wgpu::PollType::wait_indefinitely());
 
         if let Some((ref left_tx, ref right_tx)) = self.gpu_slot_free_tx {
             if left_tx.send(left_slot).is_err() {
@@ -779,8 +783,7 @@ impl StitchSession {
                 self.vram_pool.as_mut(),
                 self.gpu_shared_buffers.as_ref(),
                 self.gpu_shared_textures.as_ref(),
-            )
-            {
+            ) {
                 let slot = pool.acquire().ok_or_else(|| {
                     SessionError::Config(format!(
                         "VRAM pool exhausted ({} slots, {} available)",
@@ -1092,8 +1095,7 @@ fn zc_exp4_readback_texture(
                 data.len()
             );
             if let Some(dir) = std::env::var_os("RECO_DEBUG_DUMP_DIR") {
-                let path =
-                    std::path::Path::new(&dir).join(format!("{label}_{w}x{h}.raw"));
+                let path = std::path::Path::new(&dir).join(format!("{label}_{w}x{h}.raw"));
                 if let Err(e) = std::fs::write(&path, &*data) {
                     log::error!("ZC_EXP4: {label} dump write failed: {e}");
                 } else {

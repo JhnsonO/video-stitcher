@@ -761,9 +761,7 @@ pub fn cuda_import_external_semaphore(
 /// Vulkan's matching `add_wait_semaphore` wait is guaranteed to
 /// observe the real data.
 #[cfg(target_os = "linux")]
-pub fn cuda_signal_external_semaphore(
-    sem: CudaExternalSemaphore,
-) -> Result<(), CudaInteropError> {
+pub fn cuda_signal_external_semaphore(sem: CudaExternalSemaphore) -> Result<(), CudaInteropError> {
     let params = CudaExternalSemaphoreSignalParams {
         fence_value: 0,
         nv_sci_sync: 0,
@@ -790,9 +788,7 @@ pub fn cuda_signal_external_semaphore(
 /// `VkSemaphore` and must `vkDestroySemaphore` it separately. The fd was
 /// consumed by the import and must not be closed again here.
 #[cfg(target_os = "linux")]
-pub fn cuda_destroy_external_semaphore(
-    sem: CudaExternalSemaphore,
-) -> Result<(), CudaInteropError> {
+pub fn cuda_destroy_external_semaphore(sem: CudaExternalSemaphore) -> Result<(), CudaInteropError> {
     let cuda = cuda()?;
     unsafe {
         check_cuda(

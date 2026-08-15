@@ -174,12 +174,8 @@ pub fn create_shared_buffer(
             .device
             .as_hal::<Vulkan>()
             .ok_or(CudaInteropError::NotVulkan)?;
-        let hal_buffer = wgpu::hal::vulkan::Buffer::from_raw_managed(
-            vk_buffer,
-            device_memory,
-            0,
-            memory_size,
-        );
+        let hal_buffer =
+            wgpu::hal::vulkan::Buffer::from_raw_managed(vk_buffer, device_memory, 0, memory_size);
         drop(hal_device_guard);
         gpu.device.create_buffer_from_hal::<Vulkan>(
             hal_buffer,
@@ -366,7 +362,11 @@ pub fn create_shared_texture(
             mem_reqs_alignment,
             actual_pitch_x_height,
             if pass_vs_mem_reqs { "PASS" } else { "FAIL" },
-            if pass_vs_pitch_x_height { "PASS" } else { "FAIL" },
+            if pass_vs_pitch_x_height {
+                "PASS"
+            } else {
+                "FAIL"
+            },
             layout.offset,
             layout.size,
         );
@@ -456,11 +456,13 @@ pub fn create_shared_texture(
 
             let pool_info =
                 vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
-            let cmd_pool = raw_device.create_command_pool(&pool_info, None).map_err(|e| {
-                CudaInteropError::VulkanError(format!(
-                    "vkCreateCommandPool (ZC_EXP5 transition): {e:?}"
-                ))
-            })?;
+            let cmd_pool = raw_device
+                .create_command_pool(&pool_info, None)
+                .map_err(|e| {
+                    CudaInteropError::VulkanError(format!(
+                        "vkCreateCommandPool (ZC_EXP5 transition): {e:?}"
+                    ))
+                })?;
 
             let alloc_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(cmd_pool)
@@ -810,11 +812,15 @@ unsafe fn zc_exp7_image_caps(
         Ok(()) => {}
     }
 
-    let features = external_props.external_memory_properties.external_memory_features;
+    let features = external_props
+        .external_memory_properties
+        .external_memory_features;
     let exportable = features.contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE);
     let importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
     let dedicated_only = features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
-    let compatible = external_props.external_memory_properties.compatible_handle_types;
+    let compatible = external_props
+        .external_memory_properties
+        .compatible_handle_types;
     let export_from_imported = external_props
         .external_memory_properties
         .export_from_imported_handle_types;
@@ -1006,10 +1012,14 @@ fn zc_exp7_buffer_alias_control(gpu: &GpuContext) -> Result<(), CudaInteropError
                 &mut ext_buf_props,
             );
 
-            let features = ext_buf_props.external_memory_properties.external_memory_features;
+            let features = ext_buf_props
+                .external_memory_properties
+                .external_memory_features;
             let importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
             let dedicated_only = features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
-            let compatible = ext_buf_props.external_memory_properties.compatible_handle_types;
+            let compatible = ext_buf_props
+                .external_memory_properties
+                .compatible_handle_types;
             let opaque_fd_compatible =
                 compatible.contains(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
 
@@ -1094,7 +1104,9 @@ fn zc_exp7_buffer_alias_control(gpu: &GpuContext) -> Result<(), CudaInteropError
         )
         .or_else(|| pick_memory_type(buf_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()))
         .ok_or_else(|| {
-            CudaInteropError::VulkanError("EXP7: no compatible memory type for imported buffer".into())
+            CudaInteropError::VulkanError(
+                "EXP7: no compatible memory type for imported buffer".into(),
+            )
         })?;
 
         // NVIDIA passes memRequirements.size verbatim -- not the CUDA
@@ -1224,8 +1236,8 @@ fn zc_exp7_buffer_alias_control(gpu: &GpuContext) -> Result<(), CudaInteropError
                 CudaInteropError::VulkanError(format!("vkAllocateCommandBuffers (EXP7): {e:?}"))
             })?[0];
 
-        let begin_info =
-            vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         raw_device
             .begin_command_buffer(cmd_buf, &begin_info)
             .map_err(|e| {
@@ -1400,16 +1412,10 @@ pub fn create_nv12_shared_buffer(
     label: &str,
 ) -> Result<SharedBuffer, CudaInteropError> {
     match plane {
-        Nv12Plane::Y => {
-            create_shared_buffer(gpu, width, height, pixel_format.y_format(), label)
+        Nv12Plane::Y => create_shared_buffer(gpu, width, height, pixel_format.y_format(), label),
+        Nv12Plane::Uv => {
+            create_shared_buffer(gpu, width / 2, height / 2, pixel_format.uv_format(), label)
         }
-        Nv12Plane::Uv => create_shared_buffer(
-            gpu,
-            width / 2,
-            height / 2,
-            pixel_format.uv_format(),
-            label,
-        ),
     }
 }
 
@@ -1546,7 +1552,6 @@ mod tests {
     }
 }
 
-
 /// Create a binary Vulkan semaphore exportable as a POSIX fd, for the
 /// diagnostic CUDA->Vulkan cross-API sync (Ticket 2). CUDA imports the
 /// returned fd via `cuImportExternalSemaphore` and signals it after
@@ -1603,9 +1608,9 @@ pub fn create_export_semaphore(
                     "vkEnumerateDeviceExtensionProperties: {e:?}"
                 ))
             })?;
-        let has_semaphore_fd = supported_extensions.iter().any(|ep| {
-            ep.extension_name_as_c_str() == Ok(ash::khr::external_semaphore_fd::NAME)
-        });
+        let has_semaphore_fd = supported_extensions
+            .iter()
+            .any(|ep| ep.extension_name_as_c_str() == Ok(ash::khr::external_semaphore_fd::NAME));
         if !has_semaphore_fd {
             return Err(CudaInteropError::VulkanError(
                 "VK_KHR_external_semaphore_fd not supported by this device -- \
@@ -1617,11 +1622,9 @@ pub fn create_export_semaphore(
         let mut export_info = vk::ExportSemaphoreCreateInfo::default()
             .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
         let sem_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
-        let semaphore = raw_device
-            .create_semaphore(&sem_info, None)
-            .map_err(|e| {
-                CudaInteropError::VulkanError(format!("vkCreateSemaphore (export): {e:?}"))
-            })?;
+        let semaphore = raw_device.create_semaphore(&sem_info, None).map_err(|e| {
+            CudaInteropError::VulkanError(format!("vkCreateSemaphore (export): {e:?}"))
+        })?;
 
         let ext_semaphore_fd =
             ash::khr::external_semaphore_fd::Device::new(raw_instance, raw_device);

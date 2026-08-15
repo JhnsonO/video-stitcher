@@ -399,7 +399,10 @@ impl SmartFileSource {
         use reco_core::interop::cuda::cuda_import_external_semaphore;
         use reco_core::interop::vulkan::create_export_semaphore;
         let make_slot_semaphore = |label: &str| -> Result<
-            (ash::vk::Semaphore, reco_core::interop::cuda::CudaExternalSemaphore),
+            (
+                ash::vk::Semaphore,
+                reco_core::interop::cuda::CudaExternalSemaphore,
+            ),
             SourceError,
         > {
             let (vk_sem, fd) =
