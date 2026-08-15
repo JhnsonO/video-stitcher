@@ -21,6 +21,38 @@
 use reco_core::render::renderer::GpuPixelFormat;
 use reco_core::source::{FrameSource, SourceError, SourceInfo, StereoFrame};
 
+const MAX_TEST_FRAME_STRIDE: u64 = 64;
+
+/// Read the testing-only full-pipeline frame stride.
+///
+/// This is deliberately an environment variable rather than a production
+/// source option: normal callers remain byte/behavior compatible when it is
+/// unset. The OEV diagnostic harness owns the corresponding timing/output
+/// adaptation. Invalid values fail closed to stride 1 instead of changing
+/// production behavior.
+fn test_frame_stride_from_env() -> u64 {
+    let Ok(raw) = std::env::var("RECO_TEST_FRAME_STRIDE") else {
+        return 1;
+    };
+    match raw.parse::<u64>() {
+        Ok(value @ 1..=MAX_TEST_FRAME_STRIDE) => {
+            if value > 1 {
+                log::info!(
+                    "RECO_TEST_FRAME_STRIDE={value}: testing-only source stride enabled; \
+                     stereo pairs remain locked and skipped pairs bypass downstream GPU/session work"
+                );
+            }
+            value
+        }
+        _ => {
+            log::warn!(
+                "Ignoring invalid RECO_TEST_FRAME_STRIDE={raw:?}; expected integer 1..={MAX_TEST_FRAME_STRIDE}. Using stride 1."
+            );
+            1
+        }
+    }
+}
+
 /// GPU-aware stereo file source that auto-selects the optimal decode path.
 ///
 /// Probes the input files at construction and selects the best available
@@ -46,6 +78,11 @@ pub struct SmartFileSource {
     /// for zero-copy modes this is set locally when the pair receiver
     /// returns `Err` (decode threads finished).
     exhausted: bool,
+    /// Testing-only full-pipeline stride. `1` is normal behavior.
+    test_frame_stride: u64,
+    /// False until the first kept stereo pair is emitted. Thereafter each
+    /// `next_frame` discards `test_frame_stride - 1` raw paired frames first.
+    test_stride_started: bool,
 }
 
 enum SourceMode {
@@ -292,6 +329,8 @@ impl SmartFileSource {
             right_rotation,
             decode_mode: "CPU upload",
             exhausted: false,
+            test_frame_stride: test_frame_stride_from_env(),
+            test_stride_started: false,
         })
     }
 
@@ -447,6 +486,8 @@ impl SmartFileSource {
             right_rotation,
             decode_mode: "GPU zero-copy (CUDA shared buffer/Vulkan)",
             exhausted: false,
+            test_frame_stride: test_frame_stride_from_env(),
+            test_stride_started: false,
         })
     }
 
@@ -481,6 +522,8 @@ impl SmartFileSource {
             right_rotation,
             decode_mode: "Metal zero-copy (VideoToolbox)",
             exhausted: false,
+            test_frame_stride: test_frame_stride_from_env(),
+            test_stride_started: false,
         })
     }
 
@@ -515,6 +558,8 @@ impl SmartFileSource {
             right_rotation,
             decode_mode: "D3D11VA zero-copy",
             exhausted: false,
+            test_frame_stride: test_frame_stride_from_env(),
+            test_stride_started: false,
         })
     }
 
@@ -605,14 +650,9 @@ impl SmartFileSource {
             _ => None,
         }
     }
-}
 
-impl FrameSource for SmartFileSource {
-    fn info(&self) -> SourceInfo {
-        self.info.clone()
-    }
-
-    fn next_frame(&mut self) -> Result<Option<StereoFrame>, SourceError> {
+    /// Read one raw stereo pair without applying the testing stride.
+    fn next_raw_frame(&mut self) -> Result<Option<StereoFrame>, SourceError> {
         match &mut self.mode {
             SourceMode::Cpu(source) => {
                 let frame = source.next_frame()?;
@@ -666,7 +706,7 @@ impl FrameSource for SmartFileSource {
                         };
                         // Keep the D3d11Frame pair alive so FFmpeg doesn't
                         // recycle the decode pool slices before stage_frame
-                        // copies them. The previous guard is dropped here,
+                        // copies it. The previous guard is dropped here,
                         // which is safe because its staging copy already
                         // completed in the previous loop iteration.
                         state.live_frame_guard = Some((left, right));
@@ -681,12 +721,24 @@ impl FrameSource for SmartFileSource {
         }
     }
 
-    fn is_gpu_resident(&self) -> bool {
-        !matches!(self.mode, SourceMode::Cpu(_))
-    }
-
-    fn skip_frames(&mut self, count: u64) -> Result<u64, SourceError> {
+    /// Sequentially discard raw paired source frames from the current decode
+    /// position. Linux zero-copy must consume the CUDA->Vulkan semaphore signal
+    /// before returning both camera slots to the decode threads; this is the
+    /// same synchronization contract used by start-time skipping.
+    fn discard_raw_frames(&mut self, count: u64) -> Result<u64, SourceError> {
+        if count == 0 {
+            return Ok(0);
+        }
         match &mut self.mode {
+            SourceMode::Cpu(source) => {
+                for i in 0..count {
+                    if source.next_frame()?.is_none() {
+                        self.exhausted = true;
+                        return Ok(i);
+                    }
+                }
+                Ok(count)
+            }
             #[cfg(target_os = "linux")]
             SourceMode::GpuZeroCopy(state) => {
                 let rx = state
@@ -721,33 +773,79 @@ impl FrameSource for SmartFileSource {
                         }
                     }
                 }
-                log::debug!("GPU zero-copy: skipped {count} frames for start_time");
-                Ok(count)
-            }
-            SourceMode::Cpu(source) => {
-                source.seek(count)?;
-                log::debug!("CPU seek: jumped to frame {count}");
                 Ok(count)
             }
             #[cfg(target_os = "macos")]
-            SourceMode::MetalZeroCopy(_) => {
+            SourceMode::MetalZeroCopy(rx) => {
                 for i in 0..count {
-                    if self.next_frame()?.is_none() {
+                    if rx.recv().is_err() {
+                        self.exhausted = true;
                         return Ok(i);
                     }
                 }
                 Ok(count)
             }
             #[cfg(target_os = "windows")]
-            SourceMode::D3d11ZeroCopy(_) => {
+            SourceMode::D3d11ZeroCopy(state) => {
+                state.ensure_running();
+                // The previous kept frame has already been staged before the
+                // session asks for another source frame, so its guard can be
+                // released before discarding the gap.
+                state.live_frame_guard = None;
+                let pair_rx = match &state.decode {
+                    WindowsDecodeState::Running { pair_rx, .. } => pair_rx,
+                    _ => unreachable!(),
+                };
                 for i in 0..count {
-                    if self.next_frame()?.is_none() {
+                    if pair_rx.recv().is_err() {
+                        self.exhausted = true;
                         return Ok(i);
                     }
                 }
                 Ok(count)
             }
         }
+    }
+}
+
+impl FrameSource for SmartFileSource {
+    fn info(&self) -> SourceInfo {
+        self.info.clone()
+    }
+
+    fn next_frame(&mut self) -> Result<Option<StereoFrame>, SourceError> {
+        if self.test_stride_started && self.test_frame_stride > 1 {
+            let gap = self.test_frame_stride - 1;
+            let skipped = self.discard_raw_frames(gap)?;
+            if skipped < gap {
+                return Ok(None);
+            }
+        }
+
+        let frame = self.next_raw_frame()?;
+        if frame.is_some() {
+            self.test_stride_started = true;
+        }
+        Ok(frame)
+    }
+
+    fn is_gpu_resident(&self) -> bool {
+        !matches!(self.mode, SourceMode::Cpu(_))
+    }
+
+    fn skip_frames(&mut self, count: u64) -> Result<u64, SourceError> {
+        if let SourceMode::Cpu(source) = &mut self.mode {
+            source.seek(count)?;
+            log::debug!("CPU seek: jumped to frame {count}");
+            return Ok(count);
+        }
+
+        let skipped = self.discard_raw_frames(count)?;
+        #[cfg(target_os = "linux")]
+        if matches!(&self.mode, SourceMode::GpuZeroCopy(_)) {
+            log::debug!("GPU zero-copy: skipped {skipped}/{count} raw paired frames");
+        }
+        Ok(skipped)
     }
 
     fn gpu_pixel_format(&self) -> GpuPixelFormat {
