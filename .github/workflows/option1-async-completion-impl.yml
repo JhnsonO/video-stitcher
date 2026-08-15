@@ -28,7 +28,9 @@ jobs:
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev
 
       - name: Apply bounded option1 source changes
-        run: python3 scripts/option1_async_completion_impl.py
+        run: |
+          python3 scripts/option1_async_completion_impl.py
+          python3 scripts/option1_async_completion_compile_fix.py
 
       - name: Format
         run: cargo fmt --all
