@@ -85,10 +85,10 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
         args.width,
         args.height,
     );
+    const MAX_FRAME_STRIDE: u64 = 4;
     anyhow::ensure!(
-        (1..=reco_autocam::MAX_FRAME_STRIDE).contains(&args.frame_stride),
-        "--frame-stride must be between 1 and {}, got {}",
-        reco_autocam::MAX_FRAME_STRIDE,
+        (1..=MAX_FRAME_STRIDE).contains(&args.frame_stride),
+        "--frame-stride must be between 1 and {MAX_FRAME_STRIDE}, got {}",
         args.frame_stride,
     );
     if args.frame_stride > 1 {
