@@ -135,7 +135,7 @@ pub fn create_shared_texture(
         let pass_vs_mem_reqs = shared_mem.alloc_size >= mem_reqs_size;
         let pass_vs_pitch_x_height = shared_mem.alloc_size >= actual_pitch_x_height;
         log::info!(
-            "ZC_DIAG: {}x{} {:?} bpp={} row_bytes={} guessed_pitch={} requested_alloc_size={} shared_mem_alloc_size={} vk_actual_pitch={} vk_mem_reqs_size={} vk_mem_reqs_alignment={} actual_pitch_x_height={} PASS_vs_mem_reqs={} PASS_vs_pitch_x_height={}",
+            "ZC_DIAG: {}x{} {:?} bpp={} row_bytes={} guessed_pitch={} requested_alloc_size={} shared_mem_alloc_size={} vk_actual_pitch={} vk_mem_reqs_size={} vk_mem_reqs_alignment={} actual_pitch_x_height={} PASS_vs_mem_reqs={} PASS_vs_pitch_x_height={} vk_subresource_offset={} vk_subresource_size={}",
             width,
             height,
             format,
@@ -150,6 +150,8 @@ pub fn create_shared_texture(
             actual_pitch_x_height,
             if pass_vs_mem_reqs { "PASS" } else { "FAIL" },
             if pass_vs_pitch_x_height { "PASS" } else { "FAIL" },
+            layout.offset,
+            layout.size,
         );
         // --- end ZC_DIAG ---
 
