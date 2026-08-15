@@ -782,6 +782,26 @@ pub fn cuda_signal_external_semaphore(
     }
 }
 
+/// Destroy a CUDA external semaphore imported via
+/// [`cuda_import_external_semaphore`] (diagnostic-only).
+///
+/// Per the CUDA Driver API, destroying the CUDA-side handle does NOT
+/// destroy the underlying Vulkan semaphore -- the caller still owns the
+/// `VkSemaphore` and must `vkDestroySemaphore` it separately. The fd was
+/// consumed by the import and must not be closed again here.
+#[cfg(target_os = "linux")]
+pub fn cuda_destroy_external_semaphore(
+    sem: CudaExternalSemaphore,
+) -> Result<(), CudaInteropError> {
+    let cuda = cuda()?;
+    unsafe {
+        check_cuda(
+            "cuDestroyExternalSemaphore",
+            (cuda.cu_destroy_external_semaphore)(sem.0),
+        )
+    }
+}
+
 /// Query (free, total) device memory in bytes via the CUDA driver.
 ///
 /// `free` is the OS-wide free device memory (matches `nvidia-smi`), so

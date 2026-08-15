@@ -59,6 +59,12 @@ pub fn create_shared_texture(
     use ash::vk;
     use wgpu::hal::api::Vulkan;
 
+    // ZC_EXP7 (diagnostic-only, avenue 3): run the VkBuffer alias control
+    // exactly once, before any decode work, on the first shared-texture
+    // creation. Self-contained -- allocates, writes, reads and frees its
+    // own resources; depends on nothing but `gpu`.
+    zc_exp7_run_buffer_control_once(gpu);
+
     let bpp = format_bytes_per_pixel(format);
 
     // Allocate row-aligned: Vulkan may require specific row pitch alignment.
@@ -81,6 +87,34 @@ pub fn create_shared_texture(
         let raw_device = hal_device.raw_device();
         let physical_device = hal_device.raw_physical_device();
         let vk_format = wgpu_format_to_vk(format);
+
+        // --- ZC_EXP7 (diagnostic-only, avenue 3): image capability query ---
+        // Asks the driver whether THIS EXACT external image configuration is
+        // importable from OPAQUE_FD, and whether it demands a dedicated
+        // allocation -- rather than inferring it from vkAllocateMemory
+        // returning VK_SUCCESS, which run 31854089581 showed is not evidence
+        // of real page sharing. Read-only, and fully gated: with ZC_EXP7
+        // unset there is no behavioural change whatsoever.
+        if zc_exp7_enabled() {
+            let instance = hal_device.shared_instance().raw_instance();
+            let api_version = hal_device.shared_instance().instance_api_version();
+            if zc_exp7_vulkan_11_available(api_version) {
+                zc_exp7_image_caps(
+                    instance,
+                    physical_device,
+                    vk_format,
+                    vk::ImageTiling::LINEAR,
+                    vk::ImageUsageFlags::TRANSFER_DST
+                        | vk::ImageUsageFlags::TRANSFER_SRC
+                        | vk::ImageUsageFlags::SAMPLED,
+                    vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD,
+                    width,
+                    height,
+                    format,
+                );
+            }
+        }
+        // --- end ZC_EXP7 image capability query ---
 
         // Create VkImage with external memory support
         let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
@@ -113,6 +147,22 @@ pub fn create_shared_texture(
 
         // Get memory requirements
         let mem_reqs = raw_device.get_image_memory_requirements(vk_image);
+
+        // --- ZC_EXP7 (diagnostic-only): requirements2 + dedicated reqs ---
+        // Additive. The v1 call above is deliberately left in place so the
+        // existing ZC_DIAG line stays byte-comparable with prior runs.
+        // Reports requiresDedicatedAllocation/prefersDedicatedAllocation --
+        // never queried anywhere in this codebase before -- and measures
+        // shared_mem.alloc_size against mem_reqs2.size for EXACT equality.
+        // The existing ZC_DIAG only ever asserted `>=`; NVIDIA's own
+        // simpleVulkanMMAP passes memRequirements.size verbatim as
+        // allocationSize, so the delta has never actually been measured.
+        if zc_exp7_enabled()
+            && zc_exp7_vulkan_11_available(hal_device.shared_instance().instance_api_version())
+        {
+            zc_exp7_mem_reqs2(raw_device, vk_image, shared_mem.alloc_size, format);
+        }
+        // --- end ZC_EXP7 requirements2 ---
 
         // Get actual row pitch from the image layout
         let subresource = vk::ImageSubresource {
@@ -441,12 +491,676 @@ pub fn create_shared_texture(
         )
     };
 
+    // ZC_EXP7: optional abort-before-decode. `ZC_EXP7_ABORT_AFTER=<n>` exits
+    // cleanly once n shared textures have been probed, so the diagnostic
+    // never spends decode/render/encode time. n=2 covers one camera's Y+UV
+    // pair plus the once-only buffer control -- everything this experiment
+    // needs. Unset (the default) = no behavioural change.
+    zc_exp7_maybe_abort();
+
     Ok(SharedTexture {
         texture: wgpu_texture,
         cuda_ptr,
         pitch: actual_pitch,
         _shared_mem: shared_mem,
     })
+}
+
+// ── ZC_EXP7 (diagnostic-only, avenue 3) ─────────────────────────────
+//
+// Avenue 2 (run 31854089581) established that the synchronized Vulkan
+// IMAGE path failed to observe a CUDA-written sentinel that a CUDA-side
+// readback confirmed byte-exact at the same offsets. That is NOT the same
+// as proving CUDA and Vulkan are definitively on different physical pages
+// -- an image-specific external-memory requirement or layout/semantics
+// mismatch would produce the identical symptom. Distinguishing those two
+// explanations is exactly what EXP7 exists to do. Every API call in the
+// import path returns VK_SUCCESS, so success codes are known not to be
+// evidence here.
+//
+// This block adds three things, all read-only or self-contained:
+//   A. Does the driver actually declare this exact external IMAGE config
+//      importable from OPAQUE_FD, and does it require a dedicated alloc?
+//   B. Modern requirements2 path incl. VkMemoryDedicatedRequirements.
+//   C. A runtime VkBuffer control mirroring NVIDIA's simpleVulkanMMAP --
+//      the only official NVIDIA implementation of the CUDA-VMM-export ->
+//      Vulkan-import direction, which imports into a VkBuffer, never a
+//      VkImage, and passes memRequirements.size as allocationSize.
+//
+// Reference: NVIDIA/cuda-samples @ v11.8,
+// Samples/5_Domain_Specific/simpleVulkanMMAP/VulkanBaseApp.cpp,
+// importExternalBuffer(), lines ~1624-1676.
+//
+// Classification is pre-registered in docs/ai-project-state.md; do not
+// re-derive it after seeing the numbers.
+
+#[cfg(target_os = "linux")]
+static ZC_EXP7_BUFFER_CONTROL_RAN: std::sync::Once = std::sync::Once::new();
+
+#[cfg(target_os = "linux")]
+static ZC_EXP7_TEXTURES_PROBED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// ZC_EXP7 master gate. With `ZC_EXP7` unset or != "1", every probe in this
+/// block is skipped and behaviour is byte-identical to the base commit.
+#[cfg(target_os = "linux")]
+fn zc_exp7_enabled() -> bool {
+    std::env::var("ZC_EXP7").as_deref() == Ok("1")
+}
+
+/// ZC_EXP7: `vkGetPhysicalDeviceImageFormatProperties2`,
+/// `vkGetImageMemoryRequirements2` and
+/// `vkGetPhysicalDeviceExternalBufferProperties` are Vulkan 1.1 CORE, not
+/// extensions. On a 1.0 instance their function pointers are null and
+/// calling them segfaults rather than returning an error, so the instance
+/// API version is checked and logged before any of them is invoked.
+#[cfg(target_os = "linux")]
+fn zc_exp7_vulkan_11_available(api_version: u32) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+
+    let ok = api_version >= ash::vk::API_VERSION_1_1;
+    if !LOGGED.swap(true, Ordering::SeqCst) {
+        log::info!(
+            "ZC_EXP7_API: instance_api_version={}.{}.{} (raw={api_version}) \
+             vulkan_1_1_core_available={ok}{}",
+            ash::vk::api_version_major(api_version),
+            ash::vk::api_version_minor(api_version),
+            ash::vk::api_version_patch(api_version),
+            if ok {
+                ""
+            } else {
+                " -- SKIPPING all ZC_EXP7 1.1-core queries; this run yields NO \
+                 capability evidence and must not be classified"
+            }
+        );
+    }
+    ok
+}
+
+/// ZC_EXP7 step A: query external-memory capabilities for this exact image
+/// configuration. Never fatal -- `VK_ERROR_FORMAT_NOT_SUPPORTED` is itself
+/// a first-class result for this experiment, not an error to unwrap on.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn zc_exp7_image_caps(
+    instance: &ash::Instance,
+    physical_device: ash::vk::PhysicalDevice,
+    vk_format: ash::vk::Format,
+    tiling: ash::vk::ImageTiling,
+    usage: ash::vk::ImageUsageFlags,
+    handle_type: ash::vk::ExternalMemoryHandleTypeFlags,
+    width: u32,
+    height: u32,
+    wgpu_format: wgpu::TextureFormat,
+) {
+    use ash::vk;
+
+    let mut external_info =
+        vk::PhysicalDeviceExternalImageFormatInfo::default().handle_type(handle_type);
+
+    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(vk_format)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(tiling)
+        .usage(usage)
+        .flags(vk::ImageCreateFlags::empty())
+        .push_next(&mut external_info);
+
+    let mut external_props = vk::ExternalImageFormatProperties::default();
+    let (query, image_format_properties) = {
+        let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+        let query = unsafe {
+            instance.get_physical_device_image_format_properties2(
+                physical_device,
+                &format_info,
+                &mut props,
+            )
+        };
+        (query, props.image_format_properties)
+    };
+
+    match query {
+        Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => {
+            log::info!(
+                "ZC_EXP7_IMG: wgpu_format={wgpu_format:?} vk_format={vk_format:?} \
+                 tiling={tiling:?} usage={usage:?} extent={width}x{height} \
+                 requested_handle_type={handle_type:?} \
+                 query_result=FORMAT_NOT_SUPPORTED \
+                 -- driver declares this external image configuration \
+                 unsupported; this is a RESULT, not a harness failure"
+            );
+            return;
+        }
+        Err(e) => {
+            log::info!(
+                "ZC_EXP7_IMG: wgpu_format={wgpu_format:?} vk_format={vk_format:?} \
+                 tiling={tiling:?} usage={usage:?} extent={width}x{height} \
+                 requested_handle_type={handle_type:?} query_result=ERROR({e:?})"
+            );
+            return;
+        }
+        Ok(()) => {}
+    }
+
+    let features = external_props.external_memory_properties.external_memory_features;
+    let exportable = features.contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE);
+    let importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+    let dedicated_only = features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
+    let compatible = external_props.external_memory_properties.compatible_handle_types;
+    let export_from_imported = external_props
+        .external_memory_properties
+        .export_from_imported_handle_types;
+    let opaque_fd_compatible = compatible.contains(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+
+    log::info!(
+        "ZC_EXP7_IMG: wgpu_format={wgpu_format:?} vk_format={vk_format:?} tiling={tiling:?} \
+         usage={usage:?} extent={width}x{height} requested_handle_type={handle_type:?} \
+         query_result=SUCCESS externalMemoryFeatures_raw={:#x} EXPORTABLE={exportable} \
+         IMPORTABLE={importable} DEDICATED_ONLY={dedicated_only} \
+         compatibleHandleTypes={compatible:?} opaque_fd_in_compatible={opaque_fd_compatible} \
+         exportFromImportedHandleTypes={export_from_imported:?} maxExtent={}x{}x{} \
+         maxMipLevels={} maxArrayLayers={}",
+        features.as_raw(),
+        image_format_properties.max_extent.width,
+        image_format_properties.max_extent.height,
+        image_format_properties.max_extent.depth,
+        image_format_properties.max_mip_levels,
+        image_format_properties.max_array_layers,
+    );
+}
+
+/// ZC_EXP7 step B: `vkGetImageMemoryRequirements2` +
+/// `VkMemoryDedicatedRequirements`. Additive -- the v1 call at the real call
+/// site is left untouched so the existing ZC_DIAG line stays comparable.
+#[cfg(target_os = "linux")]
+unsafe fn zc_exp7_mem_reqs2(
+    raw_device: &ash::Device,
+    vk_image: ash::vk::Image,
+    cuda_alloc_size: usize,
+    wgpu_format: wgpu::TextureFormat,
+) {
+    use ash::vk;
+
+    let info = vk::ImageMemoryRequirementsInfo2::default().image(vk_image);
+    let mut dedicated = vk::MemoryDedicatedRequirements::default();
+    let memory_requirements = {
+        let mut reqs2 = vk::MemoryRequirements2::default().push_next(&mut dedicated);
+        unsafe {
+            raw_device.get_image_memory_requirements2(&info, &mut reqs2);
+        }
+        reqs2.memory_requirements
+    };
+
+    let size = memory_requirements.size as usize;
+    let size_exact_match = cuda_alloc_size == size;
+
+    log::info!(
+        "ZC_EXP7_REQ2: wgpu_format={wgpu_format:?} \
+         requiresDedicatedAllocation={} prefersDedicatedAllocation={} \
+         size={size} alignment={} memoryTypeBits={:#x} \
+         cuda_alloc_size={cuda_alloc_size} size_exact_match={size_exact_match}",
+        dedicated.requires_dedicated_allocation != 0,
+        dedicated.prefers_dedicated_allocation != 0,
+        memory_requirements.alignment,
+        memory_requirements.memory_type_bits,
+    );
+}
+
+/// ZC_EXP7: exit cleanly once `ZC_EXP7_ABORT_AFTER=<n>` shared textures have
+/// been probed, so the diagnostic never reaches decode/render/encode.
+/// Unset = no behavioural change.
+#[cfg(target_os = "linux")]
+fn zc_exp7_maybe_abort() {
+    use std::sync::atomic::Ordering;
+
+    let Ok(raw) = std::env::var("ZC_EXP7_ABORT_AFTER") else {
+        return;
+    };
+    if !zc_exp7_enabled() {
+        log::warn!(
+            "ZC_EXP7_ABORT_AFTER is set but ZC_EXP7 != 1 -- ignoring, since no \
+             EXP7 evidence is being collected"
+        );
+        return;
+    }
+    let Ok(limit) = raw.trim().parse::<usize>() else {
+        log::warn!("ZC_EXP7_ABORT_AFTER={raw:?} is not a number; ignoring");
+        return;
+    };
+
+    let probed = ZC_EXP7_TEXTURES_PROBED.fetch_add(1, Ordering::SeqCst) + 1;
+    if probed < limit {
+        return;
+    }
+
+    log::info!(
+        "ZC_EXP7_COMPLETE: probed {probed} shared texture(s) (limit={limit}); \
+         exiting before decode. All ZC_EXP7_IMG / ZC_EXP7_REQ2 / \
+         ZC_EXP7_BUF_* evidence above is complete."
+    );
+    // Flush the logger before exit -- process::exit does not run destructors.
+    log::logger().flush();
+    std::process::exit(0);
+}
+
+/// ZC_EXP7 step C: run the VkBuffer alias control exactly once.
+#[cfg(target_os = "linux")]
+fn zc_exp7_run_buffer_control_once(gpu: &GpuContext) {
+    if !zc_exp7_enabled() {
+        return;
+    }
+    ZC_EXP7_BUFFER_CONTROL_RAN.call_once(|| match zc_exp7_buffer_alias_control(gpu) {
+        Ok(()) => {}
+        Err(e) => {
+            // A harness failure is NOT a falsified hypothesis. Say so
+            // explicitly so the result cannot be misread as "buffer FAIL".
+            log::error!(
+                "ZC_EXP7_BUF_ALIAS_RESULT=HARNESS_ERROR ({e:?}) -- the control \
+                 itself failed to run to completion. This is NOT evidence \
+                 about buffer aliasing; fix the harness and rerun before \
+                 interpreting anything."
+            );
+        }
+    });
+}
+
+/// ZC_EXP7 step C: CUDA-VMM-export -> Vulkan-VkBuffer-import sentinel alias
+/// control, mirroring NVIDIA's simpleVulkanMMAP `importExternalBuffer()`.
+///
+/// Uses the SAME `allocate_shared_memory()` as production (same `cuMemCreate`
+/// + `CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR` + `cuMemExportToShareableHandle`)
+/// and the SAME sentinel generator as the avenue-2 image test
+/// (`(j as u8) ^ 0xC3`), so the two runs are directly comparable. The only
+/// deliberate variable is buffer-vs-image (and, following NVIDIA,
+/// `memRequirements.size` as `allocationSize`).
+///
+/// Self-contained: allocates, writes, reads and frees everything it touches.
+#[cfg(target_os = "linux")]
+fn zc_exp7_buffer_alias_control(gpu: &GpuContext) -> Result<(), CudaInteropError> {
+    use ash::vk;
+    use wgpu::hal::api::Vulkan;
+
+    const CONTROL_SIZE: usize = 1024 * 1024;
+    const SENTINEL_LEN: usize = 1024;
+    const OFFSETS: [usize; 3] = [0, 524_288, 1_047_552];
+
+    // Same generator as the avenue-2 image sentinel (run 31854089581).
+    let sentinel: Vec<u8> = (0..SENTINEL_LEN).map(|j| (j as u8) ^ 0xC3).collect();
+
+    crate::interop::cuda::cuda_ensure_context()?;
+    let shared_mem = crate::interop::cuda::allocate_shared_memory(CONTROL_SIZE)?;
+    let cuda_ptr = shared_mem.device_ptr;
+    let fd = shared_mem.shared_handle;
+
+    log::info!(
+        "ZC_EXP7_BUF: allocated via the production allocate_shared_memory() path: \
+         requested={CONTROL_SIZE} cuda_alloc_size={} device_ptr=0x{cuda_ptr:x} fd={fd}",
+        shared_mem.alloc_size,
+    );
+
+    unsafe {
+        let hal_device_guard = gpu
+            .device
+            .as_hal::<Vulkan>()
+            .ok_or(CudaInteropError::NotVulkan)?;
+        let hal_device = &*hal_device_guard;
+        let raw_device = hal_device.raw_device();
+        let physical_device = hal_device.raw_physical_device();
+        let instance = hal_device.shared_instance().raw_instance();
+
+        let buffer_usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+
+        if !zc_exp7_vulkan_11_available(hal_device.shared_instance().instance_api_version()) {
+            log::warn!(
+                "ZC_EXP7_BUF_ALIAS_RESULT=SKIPPED_NO_VK11 -- \
+                 vkGetPhysicalDeviceExternalBufferProperties is Vulkan 1.1 core and \
+                 is unavailable on this instance. No aliasing evidence collected."
+            );
+            libc::close(fd);
+            return Ok(());
+        }
+
+        // --- Buffer capability query (the buffer-side twin of step A) ---
+        // Gate: a DEDICATED_ONLY result means a plain (non-dedicated)
+        // allocation is not a legal way to back this buffer, so a byte
+        // mismatch afterwards would say nothing about aliasing. Classify
+        // and stop instead of producing a fake FAIL.
+        {
+            let mut ext_buf_info = vk::PhysicalDeviceExternalBufferInfo::default()
+                .usage(buffer_usage)
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+            ext_buf_info.flags = vk::BufferCreateFlags::empty();
+
+            let mut ext_buf_props = vk::ExternalBufferProperties::default();
+            instance.get_physical_device_external_buffer_properties(
+                physical_device,
+                &ext_buf_info,
+                &mut ext_buf_props,
+            );
+
+            let features = ext_buf_props.external_memory_properties.external_memory_features;
+            let importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+            let dedicated_only = features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
+            let compatible = ext_buf_props.external_memory_properties.compatible_handle_types;
+            let opaque_fd_compatible =
+                compatible.contains(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+
+            log::info!(
+                "ZC_EXP7_BUF_CAPS: usage={buffer_usage:?} \
+                 requested_handle_type=OPAQUE_FD externalMemoryFeatures_raw={:#x} \
+                 EXPORTABLE={} IMPORTABLE={importable} DEDICATED_ONLY={dedicated_only} \
+                 compatibleHandleTypes={compatible:?} \
+                 opaque_fd_in_compatible={opaque_fd_compatible} \
+                 exportFromImportedHandleTypes={:?}",
+                features.as_raw(),
+                features.contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE),
+                ext_buf_props
+                    .external_memory_properties
+                    .export_from_imported_handle_types,
+            );
+
+            if dedicated_only || !importable || !opaque_fd_compatible {
+                log::warn!(
+                    "ZC_EXP7_BUF_ALIAS_RESULT=CONFIG_UNSUPPORTED \
+                     (IMPORTABLE={importable} DEDICATED_ONLY={dedicated_only} \
+                     opaque_fd_in_compatible={opaque_fd_compatible}) -- a plain \
+                     non-dedicated import is not a legal backing for this buffer, \
+                     so the control is NOT run. This is a configuration result, \
+                     NOT a buffer aliasing failure, and must not be classified as \
+                     'buffer FAIL'. Next step is a VkMemoryDedicatedAllocateInfo \
+                     variant of this control, not a production import change."
+                );
+                // Nothing Vulkan-side has been created yet, and no import
+                // took ownership of the fd, so close it here to avoid a leak.
+                libc::close(fd);
+                return Ok(());
+            }
+        }
+
+        // --- Create + import the shared buffer (NVIDIA's path) ---
+        let mut external_buffer_info = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(CONTROL_SIZE as u64)
+            .usage(buffer_usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut external_buffer_info);
+
+        let shared_buffer = raw_device
+            .create_buffer(&buffer_info, None)
+            .map_err(|e| CudaInteropError::VulkanError(format!("vkCreateBuffer (EXP7): {e:?}")))?;
+
+        let buf_reqs = raw_device.get_buffer_memory_requirements(shared_buffer);
+        let mem_props = instance.get_physical_device_memory_properties(physical_device);
+
+        let pick_memory_type = |type_bits: u32, required: vk::MemoryPropertyFlags| {
+            (0..mem_props.memory_type_count).find(|&i| {
+                (type_bits & (1 << i)) != 0
+                    && mem_props.memory_types[i as usize]
+                        .property_flags
+                        .contains(required)
+            })
+        };
+
+        // OPAQUE_FD note (Khronos VUID-00674 / issue #1783):
+        // `vkGetMemoryFdPropertiesKHR` must NOT be called with OPAQUE_FD,
+        // so there is no fd-side memoryTypeBits query available for this
+        // CUDA-created payload. For OPAQUE_FD imported from outside Vulkan,
+        // the external-memory-fd spec does not provide a second runtime
+        // memory-type/size oracle equivalent to the DMA_BUF path.
+        // Therefore this control follows NVIDIA's simpleVulkanMMAP pattern:
+        // choose from the VkBuffer's own `memRequirements.memoryTypeBits`,
+        // prefer DEVICE_LOCAL, then fall back to any permitted type.
+        // The runtime sentinel comparison is the actual aliasing evidence.
+        // If this buffer control passes while the imported image path still
+        // fails, that points toward image-specific external-memory semantics
+        // rather than a generic CUDA-VMM -> Vulkan OPAQUE_FD failure.
+        // Do not reintroduce vkGetMemoryFdPropertiesKHR for OPAQUE_FD here.
+        // Capability/dedicated-allocation queries above remain the queryable
+        // evidence for whether this buffer configuration is importable.
+        //
+        let memory_type_index = pick_memory_type(
+            buf_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .or_else(|| pick_memory_type(buf_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()))
+        .ok_or_else(|| {
+            CudaInteropError::VulkanError("EXP7: no compatible memory type for imported buffer".into())
+        })?;
+
+        // NVIDIA passes memRequirements.size verbatim -- not the CUDA
+        // granularity-rounded size, which is what the image path uses.
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD)
+            .fd(fd);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(buf_reqs.size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import_info);
+
+        let shared_memory = raw_device.allocate_memory(&alloc_info, None).map_err(|e| {
+            CudaInteropError::VulkanError(format!("vkAllocateMemory (EXP7 import fd): {e:?}"))
+        })?;
+
+        raw_device
+            .bind_buffer_memory(shared_buffer, shared_memory, 0)
+            .map_err(|e| {
+                CudaInteropError::VulkanError(format!("vkBindBufferMemory (EXP7): {e:?}"))
+            })?;
+
+        log::info!(
+            "ZC_EXP7_BUF: imported OPAQUE_FD into VkBuffer -- vk_mem_reqs_size={} \
+             alignment={} cuda_alloc_size={} allocationSize_used={} \
+             size_exact_match={} memory_type_index={memory_type_index}",
+            buf_reqs.size,
+            buf_reqs.alignment,
+            shared_mem.alloc_size,
+            buf_reqs.size,
+            shared_mem.alloc_size as u64 == buf_reqs.size,
+        );
+
+        // --- CUDA->Vulkan sync: diagnostic external semaphore ---
+        // Without this the copy submit races the CUDA writes and a byte
+        // mismatch would be inconclusive. Created here (not earlier) so the
+        // capability gates above can bail without leaking semaphore state.
+        let (vk_semaphore, sem_fd) = create_export_semaphore(gpu)?;
+        // Takes ownership of sem_fd on success; closes it itself on failure.
+        let cuda_semaphore = crate::interop::cuda::cuda_import_external_semaphore(sem_fd)?;
+
+        // --- CUDA writes the sentinel at the three offsets ---
+        for off in OFFSETS {
+            crate::interop::cuda::cuda_memcpy_htod_2d(
+                cuda_ptr + off as u64,
+                SENTINEL_LEN,
+                sentinel.as_ptr(),
+                SENTINEL_LEN,
+                SENTINEL_LEN,
+                1,
+            )?;
+        }
+        // Ordered after the writes have *completed*, not merely been
+        // submitted, so the semaphore signal cannot precede the data.
+        crate::interop::cuda::cuda_synchronize()?;
+        crate::interop::cuda::cuda_signal_external_semaphore(cuda_semaphore)?;
+        log::info!(
+            "ZC_EXP7_BUF_SYNC: sentinel writes complete, CUDA signalled the \
+             imported external semaphore; the shared->staging copy submit below \
+             waits on it at TRANSFER"
+        );
+
+        // --- CUDA-side ground truth (control for the control) ---
+        // If this fails the harness is broken, not the hypothesis.
+        let mut cuda_nonzero = [0usize; OFFSETS.len()];
+        let mut cuda_exact = [false; OFFSETS.len()];
+        for (i, off) in OFFSETS.iter().enumerate() {
+            let mut host = vec![0u8; SENTINEL_LEN];
+            crate::interop::cuda::cuda_memcpy_dtoh(
+                host.as_mut_ptr() as *mut std::ffi::c_void,
+                cuda_ptr + *off as u64,
+                SENTINEL_LEN,
+            )?;
+            cuda_nonzero[i] = host.iter().filter(|b| **b != 0).count();
+            cuda_exact[i] = host == sentinel;
+        }
+
+        // --- Vulkan-side read: copy shared buffer -> host-visible staging ---
+        let staging_info = vk::BufferCreateInfo::default()
+            .size(CONTROL_SIZE as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let staging_buffer = raw_device.create_buffer(&staging_info, None).map_err(|e| {
+            CudaInteropError::VulkanError(format!("vkCreateBuffer (EXP7 staging): {e:?}"))
+        })?;
+        let staging_reqs = raw_device.get_buffer_memory_requirements(staging_buffer);
+        let staging_type = pick_memory_type(
+            staging_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or_else(|| {
+            CudaInteropError::VulkanError("EXP7: no HOST_VISIBLE|HOST_COHERENT memory type".into())
+        })?;
+        let staging_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(staging_reqs.size)
+            .memory_type_index(staging_type);
+        let staging_memory = raw_device
+            .allocate_memory(&staging_alloc, None)
+            .map_err(|e| {
+                CudaInteropError::VulkanError(format!("vkAllocateMemory (EXP7 staging): {e:?}"))
+            })?;
+        raw_device
+            .bind_buffer_memory(staging_buffer, staging_memory, 0)
+            .map_err(|e| {
+                CudaInteropError::VulkanError(format!("vkBindBufferMemory (EXP7 staging): {e:?}"))
+            })?;
+
+        let (raw_queue, queue_family_index) = gpu
+            .queue
+            .as_hal::<Vulkan>()
+            .map(|hal_queue| (hal_queue.as_raw(), hal_queue.family_index()))
+            .ok_or(CudaInteropError::NotVulkan)?;
+
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
+        let cmd_pool = raw_device
+            .create_command_pool(&pool_info, None)
+            .map_err(|e| {
+                CudaInteropError::VulkanError(format!("vkCreateCommandPool (EXP7): {e:?}"))
+            })?;
+        let cmd_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(cmd_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd_buf = raw_device
+            .allocate_command_buffers(&cmd_alloc)
+            .map_err(|e| {
+                CudaInteropError::VulkanError(format!("vkAllocateCommandBuffers (EXP7): {e:?}"))
+            })?[0];
+
+        let begin_info =
+            vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        raw_device
+            .begin_command_buffer(cmd_buf, &begin_info)
+            .map_err(|e| {
+                CudaInteropError::VulkanError(format!("vkBeginCommandBuffer (EXP7): {e:?}"))
+            })?;
+        let region = vk::BufferCopy::default()
+            .src_offset(0)
+            .dst_offset(0)
+            .size(CONTROL_SIZE as u64);
+        raw_device.cmd_copy_buffer(
+            cmd_buf,
+            shared_buffer,
+            staging_buffer,
+            std::slice::from_ref(&region),
+        );
+        raw_device.end_command_buffer(cmd_buf).map_err(|e| {
+            CudaInteropError::VulkanError(format!("vkEndCommandBuffer (EXP7): {e:?}"))
+        })?;
+
+        let fence = raw_device
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+            .map_err(|e| CudaInteropError::VulkanError(format!("vkCreateFence (EXP7): {e:?}")))?;
+        // THE synchronized submit: waits on the CUDA-signalled semaphore at
+        // TRANSFER before the shared->staging copy executes. PASS/FAIL may
+        // only be classified from bytes read after this completes.
+        let wait_semaphores = [vk_semaphore];
+        let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+        let submit_info = vk::SubmitInfo::default()
+            .wait_semaphores(&wait_semaphores)
+            .wait_dst_stage_mask(&wait_stages)
+            .command_buffers(std::slice::from_ref(&cmd_buf));
+        raw_device
+            .queue_submit(raw_queue, std::slice::from_ref(&submit_info), fence)
+            .map_err(|e| CudaInteropError::VulkanError(format!("vkQueueSubmit (EXP7): {e:?}")))?;
+        raw_device
+            .wait_for_fences(&[fence], true, u64::MAX)
+            .map_err(|e| CudaInteropError::VulkanError(format!("vkWaitForFences (EXP7): {e:?}")))?;
+
+        let mapped = raw_device
+            .map_memory(
+                staging_memory,
+                0,
+                CONTROL_SIZE as u64,
+                vk::MemoryMapFlags::empty(),
+            )
+            .map_err(|e| CudaInteropError::VulkanError(format!("vkMapMemory (EXP7): {e:?}")))?;
+        let host_view = std::slice::from_raw_parts(mapped as *const u8, CONTROL_SIZE);
+
+        let mut all_pass = true;
+        for (i, off) in OFFSETS.iter().enumerate() {
+            let window = &host_view[*off..*off + SENTINEL_LEN];
+            let vk_nonzero = window.iter().filter(|b| **b != 0).count();
+            let byte_exact = window == sentinel.as_slice();
+            if !byte_exact {
+                all_pass = false;
+            }
+            log::info!(
+                "ZC_EXP7_BUF_ALIAS: offset={off} expected_nonzero={SENTINEL_LEN} \
+                 cuda_nonzero={} cuda_byte_exact={} vk_nonzero={vk_nonzero} \
+                 byte_exact={byte_exact}",
+                cuda_nonzero[i],
+                cuda_exact[i],
+            );
+        }
+
+        let cuda_ground_truth_ok = cuda_exact.iter().all(|v| *v);
+        raw_device.unmap_memory(staging_memory);
+
+        if !cuda_ground_truth_ok {
+            log::error!(
+                "ZC_EXP7_BUF_ALIAS_RESULT=HARNESS_ERROR -- the CUDA-side ground-truth \
+                 readback did not return the sentinel, so the intended mechanism was \
+                 never exercised. This says NOTHING about buffer aliasing."
+            );
+        } else {
+            log::info!(
+                "ZC_EXP7_BUF_ALIAS_RESULT={}",
+                if all_pass { "PASS" } else { "FAIL" }
+            );
+        }
+
+        // --- Teardown ---
+        // The wait above consumed the binary semaphore's signal, so it is
+        // unsignalled and has no pending operations; safe to destroy. The
+        // CUDA handle is destroyed separately from the VkSemaphore, and the
+        // exported fd was consumed by the import.
+        if let Err(e) = crate::interop::cuda::cuda_destroy_external_semaphore(cuda_semaphore) {
+            log::warn!("ZC_EXP7: cuDestroyExternalSemaphore failed: {e:?}");
+        }
+        raw_device.destroy_semaphore(vk_semaphore, None);
+        raw_device.destroy_fence(fence, None);
+        raw_device.destroy_command_pool(cmd_pool, None);
+        raw_device.destroy_buffer(staging_buffer, None);
+        raw_device.free_memory(staging_memory, None);
+        raw_device.destroy_buffer(shared_buffer, None);
+        // Frees the imported memory and, with it, the fd Vulkan took
+        // ownership of at import time.
+        raw_device.free_memory(shared_memory, None);
+    }
+
+    drop(shared_mem);
+    Ok(())
 }
 
 /// Bytes per pixel for the texture formats we use.
