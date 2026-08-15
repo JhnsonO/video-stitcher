@@ -67,11 +67,13 @@ impl StitchSession {
                     } else if let (Some(pool), Some(vram_slot)) =
                         (self.vram_pool.as_ref(), self.current_vram_slot)
                     {
-                        let (left_y, left_uv, right_y, right_uv) =
-                            pool.plane_views(vram_slot);
+                        let (left_y, left_uv, right_y, right_uv) = pool.plane_views(vram_slot);
                         let (w, h) = self.core.pipeline().source_info();
                         self.detection.run_detection_wgpu_nv12(
-                            left_y, left_uv, right_y, right_uv,
+                            left_y,
+                            left_uv,
+                            right_y,
+                            right_uv,
                             w,
                             h,
                             self.left_rotation,

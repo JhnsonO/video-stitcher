@@ -143,18 +143,13 @@ impl StitchSession {
                                 "GpuResident detection: VramPool texture views (ORT/wgpu preprocess)"
                             );
                         }
-                        let (left_y, left_uv, right_y, right_uv) =
-                            pool.plane_views(vram_slot);
+                        let (left_y, left_uv, right_y, right_uv) = pool.plane_views(vram_slot);
                         let (w, h) = self.core.pipeline().source_info();
                         let lr = self.left_rotation;
                         let rr = self.right_rotation;
                         if scheduled_detection {
                             let detections = self.detection.run_detection_wgpu_nv12(
-                                left_y, left_uv, right_y, right_uv,
-                                w,
-                                h,
-                                lr,
-                                rr,
+                                left_y, left_uv, right_y, right_uv, w, h, lr, rr,
                             );
                             self.detection.last_detections = self.map_detections(detections);
                         }
@@ -464,8 +459,7 @@ impl StitchSession {
                 .expect("vram_pool must exist when current_vram_slot is set");
             let left_bg = pool.left_bind_group(vram_idx);
             let right_bg = pool.right_bind_group(vram_idx);
-            self
-                .core
+            self.core
                 .pipeline_mut()
                 .render_with_bind_groups(left_bg, right_bg, yaw, pitch)
         };

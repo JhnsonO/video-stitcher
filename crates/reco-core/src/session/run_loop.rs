@@ -365,8 +365,7 @@ impl StitchSession {
             };
 
             session.current_vram_slot = vram_slot;
-            let detection_result =
-                session.detect_and_track_only(&frame, elapsed, *produce_count);
+            let detection_result = session.detect_and_track_only(&frame, elapsed, *produce_count);
             session.current_vram_slot = None;
             let world_state = match detection_result {
                 Ok(world_state) => world_state,
@@ -558,9 +557,7 @@ impl StitchSession {
         // mode needs one reusable destination slot; lookahead allocates its
         // larger pool in `run_buffered` instead.
         #[cfg(target_os = "linux")]
-        if source.is_gpu_resident()
-            && self.gpu_shared_buffers.is_some()
-            && self.vram_pool.is_none()
+        if source.is_gpu_resident() && self.gpu_shared_buffers.is_some() && self.vram_pool.is_none()
         {
             let (w, h) = self.core.pipeline().source_info();
             self.vram_pool = Some(

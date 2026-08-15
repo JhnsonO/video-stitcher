@@ -245,39 +245,35 @@ impl VramPool {
         right_uv_pitch: usize,
     ) -> Result<wgpu::CommandBuffer, String> {
         let row_bytes = self.width as usize * self.bytes_per_sample;
-        let validate = |label: &str,
-                        buffer: &wgpu::Buffer,
-                        pitch: usize,
-                        rows: u32|
-         -> Result<u32, String> {
-            if pitch < row_bytes {
-                return Err(format!(
-                    "{label} pitch {pitch} is smaller than row bytes {row_bytes}"
-                ));
-            }
-            if pitch % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize != 0 {
-                return Err(format!(
-                    "{label} pitch {pitch} is not {}-byte aligned",
-                    wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
-                ));
-            }
-            let required = pitch.checked_mul(rows as usize).ok_or_else(|| {
-                format!("{label} buffer size overflow: pitch={pitch}, rows={rows}")
-            })?;
-            if buffer.size() < required as u64 {
-                return Err(format!(
-                    "{label} buffer has {} bytes, requires {required}",
-                    buffer.size()
-                ));
-            }
-            u32::try_from(pitch).map_err(|_| format!("{label} pitch does not fit u32"))
-        };
+        let validate =
+            |label: &str, buffer: &wgpu::Buffer, pitch: usize, rows: u32| -> Result<u32, String> {
+                if pitch < row_bytes {
+                    return Err(format!(
+                        "{label} pitch {pitch} is smaller than row bytes {row_bytes}"
+                    ));
+                }
+                if pitch % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize != 0 {
+                    return Err(format!(
+                        "{label} pitch {pitch} is not {}-byte aligned",
+                        wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+                    ));
+                }
+                let required = pitch.checked_mul(rows as usize).ok_or_else(|| {
+                    format!("{label} buffer size overflow: pitch={pitch}, rows={rows}")
+                })?;
+                if buffer.size() < required as u64 {
+                    return Err(format!(
+                        "{label} buffer has {} bytes, requires {required}",
+                        buffer.size()
+                    ));
+                }
+                u32::try_from(pitch).map_err(|_| format!("{label} pitch does not fit u32"))
+            };
 
         let left_y_pitch = validate("left Y", src_left_y, left_y_pitch, self.height)?;
         let left_uv_pitch = validate("left UV", src_left_uv, left_uv_pitch, self.height / 2)?;
         let right_y_pitch = validate("right Y", src_right_y, right_y_pitch, self.height)?;
-        let right_uv_pitch =
-            validate("right UV", src_right_uv, right_uv_pitch, self.height / 2)?;
+        let right_uv_pitch = validate("right UV", src_right_uv, right_uv_pitch, self.height / 2)?;
 
         let dst = &self.slots[slot];
         let mut encoder = gpu

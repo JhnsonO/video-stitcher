@@ -107,11 +107,7 @@ pub fn stage_cuda_semaphore_waits(
 
     let hal_queue = unsafe { gpu.queue.as_hal::<Vulkan>() }.ok_or(CudaInteropError::NotVulkan)?;
     for &semaphore in semaphores {
-        hal_queue.add_wait_semaphore(
-            semaphore,
-            None,
-            ash::vk::PipelineStageFlags::TRANSFER,
-        );
+        hal_queue.add_wait_semaphore(semaphore, None, ash::vk::PipelineStageFlags::TRANSFER);
     }
     Ok(())
 }
@@ -128,8 +124,7 @@ pub fn consume_cuda_semaphore_signals(
     semaphores: &[ash::vk::Semaphore],
 ) -> Result<(), CudaInteropError> {
     stage_cuda_semaphore_waits(gpu, semaphores)?;
-    gpu.queue
-        .submit(std::iter::empty::<wgpu::CommandBuffer>());
+    gpu.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .map_err(|error| {
@@ -255,12 +250,8 @@ pub fn create_shared_buffer(
     };
 
     let buffer = unsafe {
-        let hal_buffer = wgpu::hal::vulkan::Buffer::from_raw_managed(
-            vk_buffer,
-            device_memory,
-            0,
-            memory_size,
-        );
+        let hal_buffer =
+            wgpu::hal::vulkan::Buffer::from_raw_managed(vk_buffer, device_memory, 0, memory_size);
         gpu.device.create_buffer_from_hal::<Vulkan>(
             hal_buffer,
             &wgpu::BufferDescriptor {
@@ -336,14 +327,13 @@ pub fn create_shared_semaphore(gpu: &GpuContext) -> Result<SharedSemaphore, Cuda
             }
         };
 
-        let cuda_semaphore =
-            match crate::interop::cuda::cuda_import_external_semaphore(fd) {
-                Ok(semaphore) => semaphore,
-                Err(error) => {
-                    raw_device.destroy_semaphore(vk_semaphore, None);
-                    return Err(error);
-                }
-            };
+        let cuda_semaphore = match crate::interop::cuda::cuda_import_external_semaphore(fd) {
+            Ok(semaphore) => semaphore,
+            Err(error) => {
+                raw_device.destroy_semaphore(vk_semaphore, None);
+                return Err(error);
+            }
+        };
 
         Ok(SharedSemaphore {
             vk_semaphore,
@@ -631,13 +621,9 @@ pub fn create_nv12_shared_buffer(
 ) -> Result<SharedBuffer, CudaInteropError> {
     match plane {
         Nv12Plane::Y => create_shared_buffer(gpu, width, height, pixel_format.y_format(), label),
-        Nv12Plane::Uv => create_shared_buffer(
-            gpu,
-            width / 2,
-            height / 2,
-            pixel_format.uv_format(),
-            label,
-        ),
+        Nv12Plane::Uv => {
+            create_shared_buffer(gpu, width / 2, height / 2, pixel_format.uv_format(), label)
+        }
     }
 }
 
