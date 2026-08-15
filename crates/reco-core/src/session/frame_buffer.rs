@@ -15,6 +15,10 @@ use crate::source::StereoFrame;
 /// A single buffered frame: decoded pixels + detection metadata.
 pub(crate) struct BufferedFrame {
     pub frame: StereoFrame,
+    /// Original source-frame index within this run.
+    pub source_frame_index: u64,
+    /// True when this frame ran the detector/tracker analysis chain.
+    pub analysis_frame: bool,
     pub world_state: WorldState,
     pub detections: Vec<MappedDetection>,
     pub elapsed_ms: f64,
@@ -74,6 +78,17 @@ impl FrameBuffer {
         self.frames.iter().map(|f| f.world_state.clone()).collect()
     }
 
+    /// Future states at the sparse analysis cadence. Skipped render-only
+    /// frames deliberately do not duplicate the last tracker state in the
+    /// panner's lookahead window.
+    pub fn future_analysis_world_states(&self) -> Vec<WorldState> {
+        self.frames
+            .iter()
+            .filter(|f| f.analysis_frame)
+            .map(|f| f.world_state.clone())
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
@@ -96,6 +111,8 @@ mod tests {
                     uv: vec![128; 2],
                 },
             }),
+            source_frame_index: 0,
+            analysis_frame: true,
             world_state: WorldState {
                 ball: Some(TrackedEntity {
                     id: 0,
@@ -166,6 +183,24 @@ mod tests {
         assert!((yaws[0] - 0.1).abs() < 1e-6);
         assert!((yaws[1] - 0.2).abs() < 1e-6);
         assert!((yaws[2] - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sparse_future_states_exclude_render_only_duplicates() {
+        let mut buf = FrameBuffer::new(4);
+        let mut a = make_frame(0.1);
+        a.analysis_frame = true;
+        let mut b = make_frame(0.1);
+        b.analysis_frame = false;
+        let mut c = make_frame(0.3);
+        c.analysis_frame = true;
+        buf.push(a);
+        buf.push(b);
+        buf.push(c);
+        let futures = buf.future_analysis_world_states();
+        assert_eq!(futures.len(), 2);
+        assert!((futures[0].ball.as_ref().unwrap().yaw - 0.1).abs() < 1e-6);
+        assert!((futures[1].ball.as_ref().unwrap().yaw - 0.3).abs() < 1e-6);
     }
 
     #[test]

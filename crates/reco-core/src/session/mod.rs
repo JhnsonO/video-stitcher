@@ -109,6 +109,10 @@ pub struct StitchSession {
     pub(crate) skip_detection: bool,
     /// Number of lookahead frames (0 = disabled).
     pub(crate) lookahead_frames: usize,
+    /// Analyze every Nth source frame while still rendering every frame.
+    /// Values above 1 are used by the buffered lookahead loop, which
+    /// interpolates camera poses between sparse analysis decisions.
+    pub(crate) frame_stride: u64,
     pub(crate) frame_count: u64,
     /// Session start time for metrics computation.
     session_start: Option<std::time::Instant>,
@@ -261,6 +265,7 @@ impl StitchSession {
             last_world_state: crate::detect::tracker::WorldState::default(),
             skip_detection: false,
             lookahead_frames: 0,
+            frame_stride: 1,
             frame_count: 0,
             extra_encoders: Vec::new(),
             session_start: None,

@@ -4,7 +4,7 @@
 //! into a clean [`WorldState`](reco_core::detect::tracker::WorldState) with
 //! stable identities and lifecycle flags; [`panners`] turn that world
 //! state into a virtual-camera [`ViewportPosition`](reco_core::detect::director::ViewportPosition).
-//! Detector backends live in reco-detect and are re-exported at
+//! Detector backends live in [`reco_detect`] and are re-exported at
 //! crate root for convenience but are not owned here.
 //!
 //! # What this crate owns
@@ -75,39 +75,8 @@ pub use tracking_mode::TrackingMode;
 use std::io;
 use std::path::Path;
 
-const MAX_TEST_FRAME_STRIDE: u64 = 64;
-
-/// Verify that an AI model file or model directory exists.
-///
-/// Call this at user-input boundaries before opening video sources. Regular
-/// files cover ONNX, TensorRT, and CoreML models; directories cover NCNN.
-pub fn validate_model_path(path: &Path) -> io::Result<()> {
-    if path.as_os_str().is_empty() || !path.try_exists()? {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("AI model path does not exist: {}", path.display()),
-        ));
-    }
-    Ok(())
-}
-
-/// Testing-only full-pipeline stride shared with `SmartFileSource`.
-/// Invalid values fail closed to 1 so production behavior cannot be changed
-/// accidentally by a malformed environment value.
-fn test_frame_stride_from_env() -> u64 {
-    let Ok(raw) = std::env::var("RECO_TEST_FRAME_STRIDE") else {
-        return 1;
-    };
-    match raw.parse::<u64>() {
-        Ok(value @ 1..=MAX_TEST_FRAME_STRIDE) => value,
-        _ => {
-            log::warn!(
-                "Autocam ignoring invalid RECO_TEST_FRAME_STRIDE={raw:?}; expected integer 1..={MAX_TEST_FRAME_STRIDE}. Using stride 1."
-            );
-            1
-        }
-    }
-}
+/// Highest sparse-analysis stride currently validated for production use.
+pub const MAX_FRAME_STRIDE: u64 = 4;
 
 /// Rebase an EMA alpha from one source-frame step to `stride` source-frame
 /// steps while preserving its continuous-time response.
@@ -118,9 +87,9 @@ fn stride_alpha(alpha: f32, stride: u64) -> f32 {
     1.0 - (1.0 - alpha).powf(stride as f32)
 }
 
-/// Rebase FieldPanner parameters whose units are explicitly "per frame".
-/// Geometric thresholds/weights stay unchanged; max velocity is handled by
-/// constructing the panner with the effective processed FPS below.
+/// Rebase panner values expressed per decision frame. Geometric values
+/// stay unchanged; max pan velocity is handled by constructing the panner
+/// with the effective analysis FPS.
 fn rebase_panner_config_for_stride(
     mut config: crate::panners::FieldPannerConfig,
     stride: u64,
@@ -141,6 +110,20 @@ fn coast_frames_for_stride(stride: u64) -> u32 {
     let stride = stride.max(1);
     let base = crate::trackers::ball::DEFAULT_COAST_FRAMES as u64;
     base.div_ceil(stride).max(1) as u32
+}
+
+/// Verify that an AI model file or model directory exists.
+///
+/// Call this at user-input boundaries before opening video sources. Regular
+/// files cover ONNX, TensorRT, and CoreML models; directories cover NCNN.
+pub fn validate_model_path(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() || !path.try_exists()? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("AI model path does not exist: {}", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 /// Set up automatic camera control on any [`DetectionTarget`](reco_core::detect::DetectionTarget).
@@ -174,8 +157,11 @@ pub struct AutocamConfig {
     pub model_path: std::path::PathBuf,
     /// Tracking strategy (default: Ball).
     pub tracking_mode: TrackingMode,
-    /// Run detection every N frames (default: 1).
+    /// Run detection every N analysis frames (default: 1).
     pub detection_interval: u64,
+    /// Analyze every Nth source frame while rendering every source frame.
+    /// 1 preserves the original full-rate analysis path.
+    pub frame_stride: u64,
     /// Optional playing field ROI polygons for filtering.
     pub field_roi: Option<reco_core::calibration::FieldRoi>,
     /// Whether the source produces P010 (10-bit NV12) frames.
@@ -194,6 +180,7 @@ impl AutocamConfig {
             model_path: model_path.into(),
             tracking_mode: TrackingMode::Field,
             detection_interval: 1,
+            frame_stride: 1,
             field_roi: None,
             is_10bit: false,
             field_panner_config: None,
@@ -210,6 +197,13 @@ impl AutocamConfig {
     /// Set the detection interval.
     pub fn with_detection_interval(mut self, interval: u64) -> Self {
         self.detection_interval = interval;
+        self
+    }
+
+    /// Analyze every Nth source frame while retaining full-rate rendering.
+    /// Values are clamped to the currently validated 1..=4 range.
+    pub fn with_frame_stride(mut self, stride: u64) -> Self {
+        self.frame_stride = stride.clamp(1, MAX_FRAME_STRIDE);
         self
     }
 
@@ -270,13 +264,13 @@ pub fn setup_autocam(
     let tracking_mode = config.tracking_mode;
     let field_roi = config.field_roi.as_ref();
     let is_10bit = config.is_10bit;
-    let test_frame_stride = test_frame_stride_from_env();
-    let panner_fps = fps / test_frame_stride as f32;
-    let coast_frames = coast_frames_for_stride(test_frame_stride);
-    if test_frame_stride > 1 {
+    let frame_stride = config.frame_stride.clamp(1, MAX_FRAME_STRIDE);
+    let panner_fps = fps / frame_stride as f32;
+    let coast_frames = coast_frames_for_stride(frame_stride);
+    if frame_stride > 1 {
         log::info!(
-            "Autocam test stride timing: source_fps={fps:.3}, stride={test_frame_stride}, \
-             effective_processed_fps={panner_fps:.3}, ball_coast_frames={coast_frames}"
+            "Autocam sparse analysis: source_fps={fps:.3}, stride={frame_stride}, \
+             analysis_fps={panner_fps:.3}, ball_coast_frames={coast_frames}"
         );
     }
 
@@ -603,7 +597,7 @@ pub fn setup_autocam(
                         ..Default::default()
                     },
                 );
-                let fp_config = rebase_panner_config_for_stride(fp_config, test_frame_stride);
+                let fp_config = rebase_panner_config_for_stride(fp_config, frame_stride);
                 log::info!(
                     "FieldPanner: framing={:?}, confidence_weighted={}, lock_pitch={}",
                     fp_config.framing,
@@ -630,7 +624,7 @@ pub fn setup_autocam(
                 // still comes from the supplied override.
                 let mut fp_config = config.field_panner_config.clone().unwrap_or_default();
                 fp_config.ball_weight = 1.0;
-                let fp_config = rebase_panner_config_for_stride(fp_config, test_frame_stride);
+                let fp_config = rebase_panner_config_for_stride(fp_config, frame_stride);
                 let panner = crate::panners::FieldPanner::with_config(panner_fps, fp_config);
 
                 log::info!(
@@ -688,24 +682,13 @@ mod tests {
     }
 
     #[test]
-    fn model_path_validation_rejects_empty_and_missing_paths() {
-        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let missing = crate_dir.join("model-that-does-not-exist.onnx");
-        assert_eq!(
-            validate_model_path(&missing).unwrap_err().kind(),
-            io::ErrorKind::NotFound
-        );
-        assert_eq!(
-            validate_model_path(Path::new("")).unwrap_err().kind(),
-            io::ErrorKind::NotFound
-        );
-    }
-
-    #[test]
     fn stride_one_panner_rebase_is_identity() {
         let config = crate::panners::FieldPannerConfig::broadcast();
         assert_eq!(rebase_panner_config_for_stride(config.clone(), 1), config);
-        assert_eq!(coast_frames_for_stride(1), crate::trackers::ball::DEFAULT_COAST_FRAMES);
+        assert_eq!(
+            coast_frames_for_stride(1),
+            crate::trackers::ball::DEFAULT_COAST_FRAMES
+        );
     }
 
     #[test]
@@ -727,5 +710,19 @@ mod tests {
         assert_eq!(coast_frames_for_stride(2), 10);
         assert_eq!(coast_frames_for_stride(3), 7);
         assert_eq!(coast_frames_for_stride(4), 5);
+    }
+
+    #[test]
+    fn model_path_validation_rejects_empty_and_missing_paths() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let missing = crate_dir.join("model-that-does-not-exist.onnx");
+        assert_eq!(
+            validate_model_path(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            validate_model_path(Path::new("")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 }

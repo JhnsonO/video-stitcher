@@ -9,6 +9,50 @@ use super::StitchSession;
 use crate::session::types::{FrameProgress, ProgressCallback, SessionError};
 use crate::source::FrameSource;
 
+fn interpolate_pose(
+    from: crate::detect::director::ViewportPosition,
+    to: crate::detect::director::ViewportPosition,
+    t: f32,
+) -> crate::detect::director::ViewportPosition {
+    let t = t.clamp(0.0, 1.0);
+    let yaw_delta = (to.yaw - from.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI;
+    let fov_degrees = match (from.fov_degrees, to.fov_degrees) {
+        (Some(a), Some(b)) => Some(a + (b - a) * t),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    crate::detect::director::ViewportPosition {
+        yaw: from.yaw + yaw_delta * t,
+        pitch: from.pitch + (to.pitch - from.pitch) * t,
+        fov_degrees,
+    }
+}
+
+fn queue_sparse_segment(
+    pose_queue: &mut std::collections::VecDeque<(
+        super::frame_buffer::BufferedFrame,
+        crate::detect::director::ViewportPosition,
+    )>,
+    anchor: (
+        super::frame_buffer::BufferedFrame,
+        crate::detect::director::ViewportPosition,
+    ),
+    between: &mut std::collections::VecDeque<super::frame_buffer::BufferedFrame>,
+    next_pose: Option<crate::detect::director::ViewportPosition>,
+) {
+    let (anchor_frame, anchor_pose) = anchor;
+    pose_queue.push_back((anchor_frame, anchor_pose));
+    let denominator = (between.len() + 1) as f32;
+    for (offset, frame) in between.drain(..).enumerate() {
+        let pose = next_pose.map_or(anchor_pose, |next| {
+            interpolate_pose(anchor_pose, next, (offset + 1) as f32 / denominator)
+        });
+        pose_queue.push_back((frame, pose));
+    }
+}
+
 /// Centered moving-average of a pose over the past + current + ahead
 /// window. Averages yaw, pitch, AND fov, so the zoom is smoothed the
 /// same lag-free way the angles are - otherwise FOV jitter survives the
@@ -138,6 +182,22 @@ impl StitchSession {
         mut on_progress: Option<ProgressCallback>,
     ) -> Result<u64, SessionError> {
         self.configure_from_source(source);
+
+        if self.frame_stride > 1 && self.lookahead_frames == 0 && self.panner.is_some() {
+            return Err(SessionError::Config(
+                "--frame-stride > 1 requires lookahead so full-rate camera poses can be interpolated"
+                    .to_string(),
+            ));
+        }
+        if self.frame_stride > 1 {
+            let fps = source.info().fps.max(1.0);
+            log::info!(
+                "Frame stride: render {:.2} fps, analyze every {} frames ({:.2} decisions/s)",
+                fps,
+                self.frame_stride,
+                fps / self.frame_stride as f64
+            );
+        }
 
         let result = if self.lookahead_frames > 0 {
             let fps = source.info().fps.max(1.0);
@@ -351,44 +411,65 @@ impl StitchSession {
                 None => return Ok(false),
             };
             let decode_time = frame_t0.elapsed();
-            let elapsed = start.elapsed();
+            let wall_elapsed = start.elapsed();
+            let source_index = *produce_count;
+            let frame_stride = session.frame_stride.max(1);
+            let analysis_frame = source_index.is_multiple_of(frame_stride);
+            let analysis_elapsed = if frame_stride > 1 {
+                std::time::Duration::from_secs_f64(source_index as f64 / source.info().fps.max(1.0))
+            } else {
+                wall_elapsed
+            };
 
-            // Stage GPU frames to persistent slots BEFORE detection. CUDA
-            // detection keeps reading the original shared-buffer pointers;
-            // wgpu detection consumes the normal destination textures.
+            // Stage every source frame so rendering remains full-rate. Only
+            // the sparse analysis frames enter detector/tracker state.
             let upload_t0 = std::time::Instant::now();
-            let vram_slot = session.copy_to_vram_pool(&frame, *produce_count)?;
+            let vram_slot = session.copy_to_vram_pool(&frame, source_index)?;
             let upload_time = if vram_slot.is_some() {
                 upload_t0.elapsed()
             } else {
                 std::time::Duration::ZERO
             };
 
-            session.current_vram_slot = vram_slot;
-            let detection_result = session.detect_and_track_only(&frame, elapsed, *produce_count);
-            session.current_vram_slot = None;
-            let world_state = match detection_result {
-                Ok(world_state) => world_state,
-                Err(error) => {
-                    if let (Some(slot), Some(pool)) = (vram_slot, session.vram_pool.as_mut()) {
-                        pool.release(slot);
+            let (world_state, detections) = if analysis_frame {
+                session.current_vram_slot = vram_slot;
+                let analysis_index = source_index / frame_stride;
+                let detection_result = session.detect_and_track_only(
+                    &frame,
+                    analysis_elapsed,
+                    source_index,
+                    analysis_index,
+                );
+                session.current_vram_slot = None;
+                let world_state = match detection_result {
+                    Ok(world_state) => world_state,
+                    Err(error) => {
+                        if let (Some(slot), Some(pool)) = (vram_slot, session.vram_pool.as_mut()) {
+                            pool.release(slot);
+                        }
+                        session.release_gpu_decode_slot(&frame);
+                        return Err(error);
                     }
-                    session.release_gpu_decode_slot(&frame);
-                    return Err(error);
-                }
+                };
+                (world_state, session.detection.last_detections.clone())
+            } else {
+                (
+                    session.last_world_state.clone(),
+                    session.detection.last_detections.clone(),
+                )
             };
-            let detections = session.detection.last_detections.clone();
 
-            // Detection has now read the decode slot; it is safe to hand
-            // it back to the decode thread for reuse. Releasing earlier
-            // (inside copy_to_vram_pool) raced detection's read.
+            // CUDA detection has now finished reading an analysis frame. A
+            // render-only frame never exposes the shared decode slot to AI.
             session.release_gpu_decode_slot(&frame);
 
             buffer.push(BufferedFrame {
                 frame,
+                source_frame_index: source_index,
+                analysis_frame,
                 world_state,
                 detections,
-                elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+                elapsed_ms: analysis_elapsed.as_secs_f64() * 1000.0,
                 decode_time,
                 upload_time,
                 vram_slot,
@@ -429,43 +510,80 @@ impl StitchSession {
         )> = std::collections::VecDeque::new();
         let mut past_poses: std::collections::VecDeque<crate::detect::director::ViewportPosition> =
             std::collections::VecDeque::new();
-        let mut panner_frame_idx: u64 = 0;
+        let mut sparse_anchor: Option<(BufferedFrame, crate::detect::director::ViewportPosition)> =
+            None;
+        let mut sparse_between: std::collections::VecDeque<BufferedFrame> =
+            std::collections::VecDeque::new();
+        let mut sparse_finalized = false;
 
-        // Helper: run the panner on the oldest buffered frame, push
-        // the (frame, pose) pair into the pose queue.
-        let run_panner_once = |session: &mut StitchSession,
-                               buffer: &mut FrameBuffer,
-                               pose_queue: &mut std::collections::VecDeque<(
-            BufferedFrame,
-            crate::detect::director::ViewportPosition,
-        )>,
-                               panner_frame_idx: &mut u64| {
-            if let Some(frame) = buffer.pop() {
-                session.lookahead_world_states = buffer.future_world_states();
-                let pose = if let Some(panner) = session.panner.as_mut() {
-                    let pan_ctx = crate::detect::panner::PanContext {
-                        frame_index: *panner_frame_idx,
-                        timestamp_ms: frame.elapsed_ms,
-                        previous_position: session.previous_panner_pose,
-                        calibration: session.core.pipeline().calibration(),
-                    };
-                    let p = panner.decide_with_lookahead(
-                        &frame.world_state,
-                        &session.lookahead_world_states,
-                        &pan_ctx,
-                    );
-                    session.previous_panner_pose = p;
-                    p
+        // Run the panner only on analysis frames. Render-only frames are
+        // queued between adjacent analysis anchors and receive an
+        // interpolated pose once the next anchor is known.
+        let run_panner_once =
+            |session: &mut StitchSession,
+             buffer: &mut FrameBuffer,
+             pose_queue: &mut std::collections::VecDeque<(
+                BufferedFrame,
+                crate::detect::director::ViewportPosition,
+            )>,
+             sparse_anchor: &mut Option<(
+                BufferedFrame,
+                crate::detect::director::ViewportPosition,
+            )>,
+             sparse_between: &mut std::collections::VecDeque<BufferedFrame>| {
+                if let Some(frame) = buffer.pop() {
+                    if session.frame_stride <= 1 {
+                        session.lookahead_world_states = buffer.future_world_states();
+                        let pose = if let Some(panner) = session.panner.as_mut() {
+                            let pan_ctx = crate::detect::panner::PanContext {
+                                frame_index: frame.source_frame_index,
+                                timestamp_ms: frame.elapsed_ms,
+                                previous_position: session.previous_panner_pose,
+                                calibration: session.core.pipeline().calibration(),
+                            };
+                            let p = panner.decide_with_lookahead(
+                                &frame.world_state,
+                                &session.lookahead_world_states,
+                                &pan_ctx,
+                            );
+                            session.previous_panner_pose = p;
+                            p
+                        } else {
+                            session.previous_panner_pose
+                        };
+                        pose_queue.push_back((frame, pose));
+                    } else if frame.analysis_frame {
+                        session.lookahead_world_states = buffer.future_analysis_world_states();
+                        let analysis_index = frame.source_frame_index / session.frame_stride;
+                        let pose = if let Some(panner) = session.panner.as_mut() {
+                            let pan_ctx = crate::detect::panner::PanContext {
+                                frame_index: analysis_index,
+                                timestamp_ms: frame.elapsed_ms,
+                                previous_position: session.previous_panner_pose,
+                                calibration: session.core.pipeline().calibration(),
+                            };
+                            let p = panner.decide_with_lookahead(
+                                &frame.world_state,
+                                &session.lookahead_world_states,
+                                &pan_ctx,
+                            );
+                            session.previous_panner_pose = p;
+                            p
+                        } else {
+                            session.previous_panner_pose
+                        };
+                        if let Some(anchor) = sparse_anchor.take() {
+                            queue_sparse_segment(pose_queue, anchor, sparse_between, Some(pose));
+                        }
+                        *sparse_anchor = Some((frame, pose));
+                    } else {
+                        sparse_between.push_back(frame);
+                    }
+                    true
                 } else {
-                    session.previous_panner_pose
-                };
-                *panner_frame_idx += 1;
-                pose_queue.push_back((frame, pose));
-                true
-            } else {
-                false
-            }
-        };
+                    false
+                }
+            };
 
         // ── Panner warm-up: run panner post_smooth_half frames ahead ──
         let mut eof = buffer.len() < n;
@@ -479,7 +597,13 @@ impl StitchSession {
             {
                 eof = true;
             }
-            run_panner_once(self, &mut buffer, &mut pose_queue, &mut panner_frame_idx);
+            run_panner_once(
+                self,
+                &mut buffer,
+                &mut pose_queue,
+                &mut sparse_anchor,
+                &mut sparse_between,
+            );
         }
 
         // ── Steady state: produce, run panner ahead, render with centered smooth ──
@@ -494,7 +618,22 @@ impl StitchSession {
 
             // Run panner on next buffered frame (stays ahead of rendering)
             if !buffer.is_empty() {
-                run_panner_once(self, &mut buffer, &mut pose_queue, &mut panner_frame_idx);
+                run_panner_once(
+                    self,
+                    &mut buffer,
+                    &mut pose_queue,
+                    &mut sparse_anchor,
+                    &mut sparse_between,
+                );
+            }
+
+            if eof && buffer.is_empty() && !sparse_finalized {
+                if self.frame_stride > 1 {
+                    if let Some(anchor) = sparse_anchor.take() {
+                        queue_sparse_segment(&mut pose_queue, anchor, &mut sparse_between, None);
+                    }
+                }
+                sparse_finalized = true;
             }
 
             // Render: consume from pose queue when we have enough context
@@ -638,5 +777,44 @@ impl StitchSession {
         }
 
         Ok(self.frame_count)
+    }
+}
+
+#[cfg(test)]
+mod frame_stride_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_pose_interpolation_hits_midpoint() {
+        let a = crate::detect::director::ViewportPosition {
+            yaw: 0.0,
+            pitch: 0.0,
+            fov_degrees: Some(30.0),
+        };
+        let b = crate::detect::director::ViewportPosition {
+            yaw: 0.3,
+            pitch: 0.12,
+            fov_degrees: Some(42.0),
+        };
+        let mid = interpolate_pose(a, b, 0.5);
+        assert!((mid.yaw - 0.15).abs() < 1e-6);
+        assert!((mid.pitch - 0.06).abs() < 1e-6);
+        assert!((mid.fov_degrees.unwrap() - 36.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sparse_pose_interpolation_uses_short_yaw_path() {
+        let a = crate::detect::director::ViewportPosition {
+            yaw: 3.10,
+            pitch: 0.0,
+            fov_degrees: None,
+        };
+        let b = crate::detect::director::ViewportPosition {
+            yaw: -3.10,
+            pitch: 0.0,
+            fov_degrees: None,
+        };
+        let mid = interpolate_pose(a, b, 0.5);
+        assert!(mid.yaw.abs() > 3.0);
     }
 }

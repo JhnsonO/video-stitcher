@@ -213,6 +213,13 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         detection_interval: u64,
 
+        /// Analyze every Nth source frame while still rendering every frame.
+        /// Validated range: 1-4. Stride 3 is the OEV production candidate.
+        /// Values above 1 require lookahead so camera poses can be smoothly
+        /// interpolated between sparse AI decisions.
+        #[arg(long, default_value_t = 1)]
+        frame_stride: u64,
+
         /// Lookahead buffer in seconds. Decodes N frames ahead so the
         /// panner can lead the play and the loop can centered-smooth the
         /// pose lag-free. The validated dead-zone/reactivity defaults
@@ -790,6 +797,7 @@ fn main() -> anyhow::Result<()> {
             sync_offset,
             model,
             detection_interval,
+            frame_stride,
             lookahead,
             tracking,
             quality_value,
@@ -826,6 +834,7 @@ fn main() -> anyhow::Result<()> {
                 sync_offset,
                 model_path: model.as_deref(),
                 detection_interval,
+                frame_stride,
                 lookahead,
                 tracking_mode: &tracking,
                 quality_value,

@@ -39,6 +39,7 @@ pub struct StitchArgs<'a> {
     pub sync_offset: i64,
     pub model_path: Option<&'a str>,
     pub detection_interval: u64,
+    pub frame_stride: u64,
     pub lookahead: f64,
     pub tracking_mode: &'a str,
     pub quality_value: Option<u8>,
@@ -84,6 +85,22 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
         args.width,
         args.height,
     );
+    anyhow::ensure!(
+        (1..=reco_autocam::MAX_FRAME_STRIDE).contains(&args.frame_stride),
+        "--frame-stride must be between 1 and {}, got {}",
+        reco_autocam::MAX_FRAME_STRIDE,
+        args.frame_stride,
+    );
+    if args.frame_stride > 1 {
+        anyhow::ensure!(
+            args.model_path.is_some() && args.tracking_mode != "sweep",
+            "--frame-stride > 1 requires AI tracking (--model, non-sweep)"
+        );
+        anyhow::ensure!(
+            args.lookahead > 0.0,
+            "--frame-stride > 1 requires --lookahead > 0 for full-rate pose interpolation"
+        );
+    }
     anyhow::ensure!(
         matches!(args.projection, "l-shape" | "cylindrical-stereo"),
         "unknown projection '{}' (expected l-shape or cylindrical-stereo)",
@@ -286,6 +303,7 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
     {
         let model_path = model_path.to_owned();
         let interval = args.detection_interval;
+        let frame_stride = args.frame_stride;
         let mode_str = args.tracking_mode.to_owned();
         let allow_fallback = args.allow_no_tracking;
         let tracking_failed = Arc::clone(&tracking_failed);
@@ -339,9 +357,11 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
             };
             let is_10bit =
                 source.gpu_pixel_format() == reco_core::render::renderer::GpuPixelFormat::P010;
+            session.set_frame_stride(frame_stride);
             let mut autocam_config = reco_autocam::AutocamConfig::new(&model_path)
                 .with_tracking_mode(mode)
                 .with_detection_interval(interval)
+                .with_frame_stride(frame_stride)
                 .with_10bit(is_10bit);
             if mode == reco_autocam::TrackingMode::Ball {
                 autocam_config.confidence_threshold = Some(0.25);
@@ -360,7 +380,14 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
                 info.fps as f32,
                 source.is_gpu_resident(),
             ) {
-                Ok(true) => println!("Autocam: tracking enabled (model: {model_path})"),
+                Ok(true) => {
+                    println!("Autocam: tracking enabled (model: {model_path})");
+                    if frame_stride > 1 {
+                        println!(
+                            "Frame stride: analyze 1/{frame_stride}, render every source frame"
+                        );
+                    }
+                }
                 Ok(false) => {
                     let msg = "Tracking requested but detection cannot run in zero-copy mode. \
                                Build with --features tensorrt for GPU detection, \

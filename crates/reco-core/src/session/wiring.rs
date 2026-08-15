@@ -121,6 +121,15 @@ impl StitchSession {
         self.lookahead_frames = frames;
     }
 
+    /// Set sparse analysis cadence while retaining full-rate rendering.
+    ///
+    /// `1` is the original behavior. Values above 1 require buffered
+    /// lookahead so the loop can interpolate full-rate camera poses between
+    /// analysis decisions. Production-validated values are currently 1..=4.
+    pub fn set_frame_stride(&mut self, stride: u64) {
+        self.frame_stride = stride.clamp(1, 4);
+    }
+
     /// Attach a stacked-video replay recorder.
     ///
     /// Forwards to `StitchCore::set_stacked_recorder` on the
