@@ -116,6 +116,61 @@ pub fn spawn_single_decoder_gpu(
                             break;
                         }
 
+                        // ZC_EXP7 (diagnostic-only, avenue 2): physical-
+                        // aliasing sentinel. LEFT decoder, first frame only:
+                        // AFTER the real frame copy has fully completed
+                        // (cuCtxSynchronize above), overwrite three
+                        // 1024-byte blocks of this slot's Y plane (start /
+                        // middle-row / last-row) with a deterministic
+                        // pattern ((j as u8) ^ 0xC3) via CUDA HtoD. The
+                        // Vulkan-side ZC_EXP4 `left_y_vram_src` readback of
+                        // this same slot later this frame dumps the whole
+                        // plane; the remote script compares these exact
+                        // offsets. Sentinel visible through Vulkan =>
+                        // CUDA/Vulkan alias the same physical pages;
+                        // absent => the external-memory import itself is
+                        // the failure boundary. The existing CUDA DtoH
+                        // DIAG dump below runs after this write, so the
+                        // same run also records CUDA's ground truth of
+                        // exactly these bytes.
+                        if label == "left"
+                            && frame_count == 0
+                            && std::env::var("RECO_DEBUG_DUMP_FRAME").is_ok()
+                        {
+                            let sentinel: Vec<u8> =
+                                (0..1024u32).map(|j| (j as u8) ^ 0xC3).collect();
+                            let pitch = buf.y_pitch[s];
+                            let h = buf.height as usize;
+                            let offsets = [0usize, (h / 2) * pitch, (h - 1) * pitch];
+                            let mut sentinel_ok = true;
+                            for &off in &offsets {
+                                if let Err(e) = reco_core::interop::cuda::cuda_memcpy_htod_2d(
+                                    buf.y_ptr[s] + off as u64,
+                                    1024,
+                                    sentinel.as_ptr(),
+                                    1024,
+                                    1024,
+                                    1,
+                                ) {
+                                    log::error!(
+                                        "ZC_EXP7: sentinel HtoD at offset {off} failed: {e}"
+                                    );
+                                    sentinel_ok = false;
+                                }
+                            }
+                            if sentinel_ok {
+                                match reco_core::interop::cuda::cuda_synchronize() {
+                                    Ok(()) => log::warn!(
+                                        "ZC_EXP7: wrote 3x1024B sentinel ((j as u8)^0xC3) into left Y slot {s} at byte_offsets={offsets:?} y_pitch={pitch} height={h} y_ptr=0x{:x}",
+                                        buf.y_ptr[s]
+                                    ),
+                                    Err(e) => log::error!(
+                                        "ZC_EXP7: post-sentinel cuCtxSynchronize failed: {e}"
+                                    ),
+                                }
+                            }
+                        }
+
                         // ZC_SEM (diagnostic, Ticket 2): signal this
                         // slot's CUDA->Vulkan semaphore now that
                         // cuCtxSynchronize() above has confirmed both
