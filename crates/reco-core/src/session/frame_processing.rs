@@ -738,7 +738,10 @@ impl StitchSession {
             SessionError::ZeroCopy("CUDA/Vulkan shared buffers are not configured".into())
         })?;
         let vk_semaphores = self.gpu_vk_semaphores.ok_or_else(|| {
-            SessionError::ZeroCopy("CUDA/Vulkan external semaphores are not configured".into())
+            SessionError::ZeroCopy("CUDA/Vulkan ready semaphores are not configured".into())
+        })?;
+        let vk_completion_semaphores = self.gpu_vk_completion_semaphores.ok_or_else(|| {
+            SessionError::ZeroCopy("CUDA/Vulkan completion semaphores are not configured".into())
         })?;
         let pool = self.vram_pool.as_mut().ok_or_else(|| {
             SessionError::ZeroCopy("VramPool is not configured for shared-buffer copy".into())
@@ -774,19 +777,24 @@ impl StitchSession {
             }
         };
 
-        if let Err(error) = crate::interop::vulkan::stage_cuda_semaphore_waits(
+        if let Err(error) = crate::interop::vulkan::stage_cuda_buffer_handoff(
             gpu,
             &[vk_semaphores[ls], vk_semaphores[2 + rs]],
+            &[
+                vk_completion_semaphores[ls],
+                vk_completion_semaphores[2 + rs],
+            ],
         ) {
             pool.release(slot);
             return Err(SessionError::ZeroCopy(error.to_string()));
         }
 
-        // CUDA has signalled both slot semaphores. This exact queue submission
-        // waits at TRANSFER and copies all four planes into ordinary wgpu
-        // textures; no CPU pixel path is involved.
+        // CUDA has signalled both ready semaphores. This exact queue submission
+        // waits at TRANSFER, copies all four planes into ordinary wgpu textures,
+        // then signals the reverse completion semaphores. CUDA waits for that
+        // signal on the decode thread before a reused slot is overwritten, so
+        // the session thread does not need a per-frame blocking device poll.
         gpu.queue.submit(std::iter::once(command));
-        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
 
         if produce_index == 0 {
             log::info!(

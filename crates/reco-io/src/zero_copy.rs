@@ -60,6 +60,9 @@ pub fn spawn_single_decoder_gpu(
                 log::info!("{label}: skipped {skip_frames} frames for sync offset");
             }
 
+            #[cfg(target_os = "linux")]
+            let mut slot_seen = [false; 2];
+
             loop {
                 if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -76,6 +79,26 @@ pub fn spawn_single_decoder_gpu(
                         if let Err(e) = reco_core::interop::cuda::cuda_ensure_context() {
                             log::error!("{label} cuda_ensure_context: {e}");
                             break;
+                        }
+
+                        #[cfg(target_os = "linux")]
+                        if slot_seen[s] {
+                            if let Err(e) = reco_core::interop::cuda::cuda_wait_external_semaphore(
+                                buf.sem_cuda_complete[s],
+                            ) {
+                                log::error!("{label} cuWaitExternalSemaphoresAsync: {e}");
+                                break;
+                            }
+                            // `cuMemcpy2D` below is not stream-parameterized.
+                            // Complete the default-stream external wait before
+                            // writing the shared allocation. This blocks only
+                            // the decode worker, not the session/render thread.
+                            if let Err(e) = reco_core::interop::cuda::cuda_synchronize() {
+                                log::error!("{label} completion semaphore wait sync: {e}");
+                                break;
+                            }
+                        } else {
+                            slot_seen[s] = true;
                         }
 
                         // Byte width for CUDA copy: width * bytes_per_sample.

@@ -145,6 +145,9 @@ pub struct StitchSession {
     /// right_1]. The source owns their lifetime.
     #[cfg(target_os = "linux")]
     pub(crate) gpu_vk_semaphores: Option<[ash::vk::Semaphore; 4]>,
+    /// Reverse Vulkan->CUDA completion semaphores in the same slot order.
+    #[cfg(target_os = "linux")]
+    pub(crate) gpu_vk_completion_semaphores: Option<[ash::vk::Semaphore; 4]>,
 
     /// VRAM buffer pool for GPU-resident lookahead.
     pub(crate) vram_pool: Option<vram_pool::VramPool>,
@@ -278,6 +281,8 @@ impl StitchSession {
             gpu_shared_buffers: None,
             #[cfg(target_os = "linux")]
             gpu_vk_semaphores: None,
+            #[cfg(target_os = "linux")]
+            gpu_vk_completion_semaphores: None,
             vram_pool: None,
             current_vram_slot: None,
             #[cfg(any(target_os = "macos", target_os = "ios"))]

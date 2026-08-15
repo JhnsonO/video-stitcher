@@ -111,6 +111,12 @@ impl StitchSession {
             shared.semaphores[2].vk_semaphore(),
             shared.semaphores[3].vk_semaphore(),
         ]);
+        self.gpu_vk_completion_semaphores = Some([
+            shared.completion_semaphores[0].vk_semaphore(),
+            shared.completion_semaphores[1].vk_semaphore(),
+            shared.completion_semaphores[2].vk_semaphore(),
+            shared.completion_semaphores[3].vk_semaphore(),
+        ]);
         log::info!("Session configured for CUDA shared-buffer source");
     }
 

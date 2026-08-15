@@ -172,6 +172,28 @@ struct CudaExternalSemaphoreSignalParams {
     _tail_pad: [u8; 4],
 }
 
+/// `CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS` for a binary semaphore.
+///
+/// The nested keyed-mutex member is 16 bytes on 64-bit targets (8-byte key,
+/// 4-byte timeout, 4 bytes of alignment padding), so the complete driver ABI
+/// is 144 bytes just like the signal-params structure above.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct CudaExternalSemaphoreWaitParams {
+    fence_value: u64,
+    nv_sci_sync: u64,
+    keyed_mutex_key: u64,
+    keyed_mutex_timeout_ms: u32,
+    _keyed_mutex_pad: u32,
+    params_reserved: [u32; 10],
+    flags: u32,
+    reserved: [u32; 16],
+    _tail_pad: [u8; 4],
+}
+
+#[cfg(target_os = "linux")]
+const _: [(); 144] = [(); std::mem::size_of::<CudaExternalSemaphoreWaitParams>()];
+
 /// External memory handle type: D3D11 resource shared via NT handle.
 #[cfg(target_os = "windows")]
 const CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_RESOURCE: u32 = 4;
@@ -299,6 +321,13 @@ struct CudaFunctions {
         CUstream,
     ) -> CUresult,
     #[cfg(target_os = "linux")]
+    cu_wait_external_semaphores_async: unsafe extern "C" fn(
+        *const CUexternalSemaphoreRaw,
+        *const CudaExternalSemaphoreWaitParams,
+        u32,
+        CUstream,
+    ) -> CUresult,
+    #[cfg(target_os = "linux")]
     cu_destroy_external_semaphore: unsafe extern "C" fn(CUexternalSemaphoreRaw) -> CUresult,
 
     // Module / kernel launch
@@ -421,6 +450,11 @@ impl CudaFunctions {
                 cu_signal_external_semaphores_async: load_sym!(
                     lib_cuda,
                     "cuSignalExternalSemaphoresAsync"
+                ),
+                #[cfg(target_os = "linux")]
+                cu_wait_external_semaphores_async: load_sym!(
+                    lib_cuda,
+                    "cuWaitExternalSemaphoresAsync"
                 ),
                 #[cfg(target_os = "linux")]
                 cu_destroy_external_semaphore: load_sym!(lib_cuda, "cuDestroyExternalSemaphore"),
@@ -731,6 +765,39 @@ pub fn cuda_signal_external_semaphore(
         check_cuda(
             "cuSignalExternalSemaphoresAsync",
             (cuda.cu_signal_external_semaphores_async)(
+                &semaphore.0,
+                &params,
+                1,
+                std::ptr::null_mut(),
+            ),
+        )
+    }
+}
+
+/// Enqueue a wait for a Vulkan-signalled binary semaphore on CUDA's default
+/// stream. Callers that are about to overwrite the shared allocation must
+/// synchronize the CUDA context before issuing that overwrite; doing the wait
+/// in the decode thread keeps the render/session thread non-blocking.
+#[cfg(target_os = "linux")]
+pub fn cuda_wait_external_semaphore(
+    semaphore: CudaExternalSemaphore,
+) -> Result<(), CudaInteropError> {
+    let params = CudaExternalSemaphoreWaitParams {
+        fence_value: 0,
+        nv_sci_sync: 0,
+        keyed_mutex_key: 0,
+        keyed_mutex_timeout_ms: 0,
+        _keyed_mutex_pad: 0,
+        params_reserved: [0; 10],
+        flags: 0,
+        reserved: [0; 16],
+        _tail_pad: [0; 4],
+    };
+    let cuda = cuda()?;
+    unsafe {
+        check_cuda(
+            "cuWaitExternalSemaphoresAsync",
+            (cuda.cu_wait_external_semaphores_async)(
                 &semaphore.0,
                 &params,
                 1,

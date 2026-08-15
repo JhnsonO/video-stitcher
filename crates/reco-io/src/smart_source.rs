@@ -352,13 +352,23 @@ impl SmartFileSource {
 
         let semaphores = [
             create_shared_semaphore(gpu)
-                .map_err(|e| map_err(format!("left slot 0 semaphore: {e}")))?,
+                .map_err(|e| map_err(format!("left slot 0 ready semaphore: {e}")))?,
             create_shared_semaphore(gpu)
-                .map_err(|e| map_err(format!("left slot 1 semaphore: {e}")))?,
+                .map_err(|e| map_err(format!("left slot 1 ready semaphore: {e}")))?,
             create_shared_semaphore(gpu)
-                .map_err(|e| map_err(format!("right slot 0 semaphore: {e}")))?,
+                .map_err(|e| map_err(format!("right slot 0 ready semaphore: {e}")))?,
             create_shared_semaphore(gpu)
-                .map_err(|e| map_err(format!("right slot 1 semaphore: {e}")))?,
+                .map_err(|e| map_err(format!("right slot 1 ready semaphore: {e}")))?,
+        ];
+        let completion_semaphores = [
+            create_shared_semaphore(gpu)
+                .map_err(|e| map_err(format!("left slot 0 completion semaphore: {e}")))?,
+            create_shared_semaphore(gpu)
+                .map_err(|e| map_err(format!("left slot 1 completion semaphore: {e}")))?,
+            create_shared_semaphore(gpu)
+                .map_err(|e| map_err(format!("right slot 0 completion semaphore: {e}")))?,
+            create_shared_semaphore(gpu)
+                .map_err(|e| map_err(format!("right slot 1 completion semaphore: {e}")))?,
         ];
 
         log::info!(
@@ -380,6 +390,10 @@ impl SmartFileSource {
                 semaphores[0].cuda_semaphore(),
                 semaphores[1].cuda_semaphore(),
             ],
+            sem_cuda_complete: [
+                completion_semaphores[0].cuda_semaphore(),
+                completion_semaphores[1].cuda_semaphore(),
+            ],
         };
         let right_buf = GpuBufInfo {
             y_ptr: [right_y_0.cuda_ptr, right_y_1.cuda_ptr],
@@ -392,6 +406,10 @@ impl SmartFileSource {
             sem_cuda: [
                 semaphores[2].cuda_semaphore(),
                 semaphores[3].cuda_semaphore(),
+            ],
+            sem_cuda_complete: [
+                completion_semaphores[2].cuda_semaphore(),
+                completion_semaphores[3].cuda_semaphore(),
             ],
         };
 
@@ -424,6 +442,7 @@ impl SmartFileSource {
                 right_uv_1,
             ],
             semaphores,
+            completion_semaphores,
             left_buf,
             right_buf,
             left_slot_free_tx,
@@ -703,9 +722,16 @@ impl FrameSource for SmartFileSource {
                                 state.shared.semaphores[2 + signal.right_slot as usize]
                                     .vk_semaphore(),
                             ];
+                            let completion_semaphores = [
+                                state.shared.completion_semaphores[signal.left_slot as usize]
+                                    .vk_semaphore(),
+                                state.shared.completion_semaphores[2 + signal.right_slot as usize]
+                                    .vk_semaphore(),
+                            ];
                             reco_core::interop::vulkan::consume_cuda_semaphore_signals(
                                 &state.gpu,
                                 &semaphores,
+                                &completion_semaphores,
                             )
                             .map_err(|error| SourceError::Read {
                                 reason: format!(
@@ -830,6 +856,13 @@ impl Drop for SmartFileSource {
             // Step 3: Join decode + pairing threads
             for handle in state.join_handles.drain(..) {
                 let _ = handle.join();
+            }
+
+            // Step 4: wait once at teardown before destroying Vulkan external
+            // semaphores. Frame-loop synchronization is GPU-to-GPU; this is
+            // only a lifetime fence for the final in-flight submission.
+            if let Err(error) = reco_core::interop::vulkan::wait_for_vulkan_idle(&state.gpu) {
+                log::warn!("Linux zero-copy teardown GPU wait failed: {error}");
             }
             // SharedTextureSet drops naturally after this
         }

@@ -103,34 +103,56 @@ pub fn stage_cuda_semaphore_waits(
     gpu: &GpuContext,
     semaphores: &[ash::vk::Semaphore],
 ) -> Result<(), CudaInteropError> {
+    stage_cuda_buffer_handoff(gpu, semaphores, &[])
+}
+
+/// Stage the complete CUDA->Vulkan->CUDA slot handoff on the next queue
+/// submission. Resolving the HAL queue happens before anything is staged, so
+/// a backend error cannot leave a half-configured submission behind.
+#[cfg(target_os = "linux")]
+pub fn stage_cuda_buffer_handoff(
+    gpu: &GpuContext,
+    wait_semaphores: &[ash::vk::Semaphore],
+    completion_semaphores: &[ash::vk::Semaphore],
+) -> Result<(), CudaInteropError> {
     use wgpu::hal::api::Vulkan;
 
     let hal_queue = unsafe { gpu.queue.as_hal::<Vulkan>() }.ok_or(CudaInteropError::NotVulkan)?;
-    for &semaphore in semaphores {
+    for &semaphore in wait_semaphores {
         hal_queue.add_wait_semaphore(semaphore, None, ash::vk::PipelineStageFlags::TRANSFER);
+    }
+    for &semaphore in completion_semaphores {
+        hal_queue.add_signal_semaphore(semaphore, None);
     }
     Ok(())
 }
 
-/// Consume signalled slot semaphores when a decoded frame is intentionally
-/// skipped instead of copied.
+/// Consume signalled ready semaphores when a decoded frame is intentionally
+/// skipped instead of copied, and signal the reverse completion semaphores.
 ///
-/// Binary semaphores must return to the unsignalled state before the decode
-/// slot can be reused. An empty Vulkan submission is sufficient to perform the
-/// waits; the device poll makes that consumption explicit before reuse.
+/// This submission is intentionally non-blocking on the CPU. The slot may be
+/// returned immediately: when CUDA later receives that slot, it waits on the
+/// completion semaphore before overwriting the shared allocation.
 #[cfg(target_os = "linux")]
 pub fn consume_cuda_semaphore_signals(
     gpu: &GpuContext,
-    semaphores: &[ash::vk::Semaphore],
+    ready_semaphores: &[ash::vk::Semaphore],
+    completion_semaphores: &[ash::vk::Semaphore],
 ) -> Result<(), CudaInteropError> {
-    stage_cuda_semaphore_waits(gpu, semaphores)?;
+    stage_cuda_buffer_handoff(gpu, ready_semaphores, completion_semaphores)?;
     gpu.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
+    Ok(())
+}
+
+/// Wait once for all submitted Vulkan work before external semaphore/resource
+/// teardown. This is a lifetime fence only; it is deliberately not used in the
+/// per-frame path.
+#[cfg(target_os = "linux")]
+pub fn wait_for_vulkan_idle(gpu: &GpuContext) -> Result<(), CudaInteropError> {
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .map_err(|error| {
-            CudaInteropError::VulkanError(format!(
-                "wait for skipped-frame semaphore consumption: {error:?}"
-            ))
+            CudaInteropError::VulkanError(format!("wait for final Vulkan work: {error:?}"))
         })?;
     Ok(())
 }

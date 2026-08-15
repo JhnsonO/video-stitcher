@@ -29,9 +29,14 @@ pub struct GpuBufInfo {
     /// width via `GpuPixelFormat::bytes_per_sample()`.
     pub pixel_format: crate::render::renderer::GpuPixelFormat,
     /// CUDA-imported binary semaphore for each decode slot. CUDA signals the
-    /// matching entry after both plane copies complete.
+    /// matching entry after both plane copies complete; Vulkan waits on it.
     #[cfg(target_os = "linux")]
     pub sem_cuda: [crate::interop::cuda::CudaExternalSemaphore; 2],
+    /// Reverse-direction semaphore for each slot. Vulkan signals it once the
+    /// shared-buffer copy has completed; CUDA waits on it before overwriting a
+    /// slot that has already been used once.
+    #[cfg(target_os = "linux")]
+    pub sem_cuda_complete: [crate::interop::cuda::CudaExternalSemaphore; 2],
 }
 
 /// A pair of double-buffer slot indices from the decode threads.

@@ -20,9 +20,12 @@ pub struct SharedTextureSet {
     /// right_y_0, right_uv_0, right_y_1, right_uv_1].
     /// Must be dropped after decode threads are joined.
     pub buffers: [SharedBuffer; 8],
-    /// Four binary semaphores: [left_0, left_1, right_0, right_1]. One
-    /// semaphore covers both planes in its decode slot.
+    /// Four CUDA->Vulkan ready semaphores: [left_0, left_1, right_0,
+    /// right_1]. One semaphore covers both planes in its decode slot.
     pub semaphores: [SharedSemaphore; 4],
+    /// Four Vulkan->CUDA completion semaphores with the same slot ordering.
+    /// Vulkan signals after the shared-buffer copy; CUDA waits before reuse.
+    pub completion_semaphores: [SharedSemaphore; 4],
     /// CUDA buffer info for left camera decode thread.
     pub left_buf: GpuBufInfo,
     /// CUDA buffer info for right camera decode thread.
