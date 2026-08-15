@@ -628,10 +628,10 @@ impl StitchSession {
             }
 
             if eof && buffer.is_empty() && !sparse_finalized {
-                if self.frame_stride > 1 {
-                    if let Some(anchor) = sparse_anchor.take() {
-                        queue_sparse_segment(&mut pose_queue, anchor, &mut sparse_between, None);
-                    }
+                if self.frame_stride > 1
+                    && let Some(anchor) = sparse_anchor.take()
+                {
+                    queue_sparse_segment(&mut pose_queue, anchor, &mut sparse_between, None);
                 }
                 sparse_finalized = true;
             }

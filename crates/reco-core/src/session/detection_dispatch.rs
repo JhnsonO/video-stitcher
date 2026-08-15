@@ -41,7 +41,7 @@ impl StitchSession {
         &mut self,
         frame: &StereoFrame,
         elapsed: std::time::Duration,
-        source_index: u64,
+        _source_index: u64,
         analysis_index: u64,
     ) -> Result<crate::detect::tracker::WorldState, SessionError> {
         let should_detect = self.detection.should_detect(analysis_index);
@@ -87,8 +87,8 @@ impl StitchSession {
                 #[cfg(target_os = "windows")]
                 StereoFrame::D3d11Resident { .. } => {
                     if let Some(ref pool) = self.d3d11_staging_pool {
-                        let left_slot = (source_index as usize * 2) % pool.n_slots();
-                        let right_slot = (source_index as usize * 2 + 1) % pool.n_slots();
+                        let left_slot = (_source_index as usize * 2) % pool.n_slots();
+                        let right_slot = (_source_index as usize * 2 + 1) % pool.n_slots();
                         let (w, h) = self.core.pipeline().source_info();
                         self.detection.run_detection_wgpu_nv12(
                             pool.y_view(left_slot),
