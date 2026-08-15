@@ -154,6 +154,11 @@ pub struct StitchSession {
     /// `copy_texture_to_texture` in the VRAM pool path. Cheap (Arc inside).
     #[cfg(target_os = "linux")]
     pub(crate) gpu_shared_textures: Option<[wgpu::Texture; 8]>,
+    /// The 8 CUDA/Vulkan shared plane buffers, in the same slot order as
+    /// `gpu_shared_textures`. These are copy sources only; rendering uses
+    /// ordinary VramPool textures.
+    #[cfg(target_os = "linux")]
+    pub(crate) gpu_shared_buffers: Option<[wgpu::Buffer; 8]>,
     /// The 4 diagnostic CUDA<->Vulkan sync semaphores (Ticket 2),
     /// `[left_slot_0, left_slot_1, right_slot_0, right_slot_1]`.
     /// Stashed at `setup_gpu_source` time (mirrors `gpu_shared_textures`
@@ -296,6 +301,8 @@ impl StitchSession {
             gpu_shared_views: None,
             #[cfg(target_os = "linux")]
             gpu_shared_textures: None,
+            #[cfg(target_os = "linux")]
+            gpu_shared_buffers: None,
             #[cfg(target_os = "linux")]
             gpu_vk_semaphores: None,
             vram_pool: None,

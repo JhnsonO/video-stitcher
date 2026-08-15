@@ -5,7 +5,7 @@
 //! decode path. Platform-specific session methods that operate on these
 //! textures live in `run_loop.rs` (`setup_gpu_source`, `step_gpu_with_bufs`).
 
-use crate::interop::vulkan::SharedTexture;
+use crate::interop::vulkan::{SharedBuffer, SharedTexture};
 use crate::interop::zero_copy::GpuBufInfo;
 
 /// Bundled shared textures, CUDA buffer info, slot channels, and bind
@@ -21,6 +21,10 @@ pub struct SharedTextureSet {
     /// right_y_0, right_uv_0, right_y_1, right_uv_1].
     /// Must be dropped after decode threads are joined.
     pub textures: [SharedTexture; 8],
+    /// The 8 CUDA-shared buffers matching `textures`' plane/slot order.
+    /// Decode writes target these buffers; Vulkan copies them into normal
+    /// VramPool textures before rendering.
+    pub buffers: [SharedBuffer; 8],
     /// CUDA buffer info for left camera decode thread.
     pub left_buf: GpuBufInfo,
     /// CUDA buffer info for right camera decode thread.

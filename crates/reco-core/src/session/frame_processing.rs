@@ -760,9 +760,26 @@ impl StitchSession {
             } => (*left_slot as usize, *right_slot as usize),
             _ => return Ok(None),
         };
+        let (left_y_pitch, left_uv_pitch, right_y_pitch, right_uv_pitch) = self
+            .gpu_buf_info
+            .as_ref()
+            .map(|(left, right)| {
+                (
+                    left.y_pitch[ls],
+                    left.uv_pitch[ls],
+                    right.y_pitch[rs],
+                    right.uv_pitch[rs],
+                )
+            })
+            .ok_or_else(|| {
+                SessionError::ZeroCopy("CUDA shared-buffer metadata is not configured".into())
+            })?;
         {
-            if let (Some(pool), Some(shared_tex)) =
-                (self.vram_pool.as_mut(), self.gpu_shared_textures.as_ref())
+            if let (Some(pool), Some(shared_buf), Some(shared_tex)) = (
+                self.vram_pool.as_mut(),
+                self.gpu_shared_buffers.as_ref(),
+                self.gpu_shared_textures.as_ref(),
+            )
             {
                 let slot = pool.acquire().ok_or_else(|| {
                     SessionError::Config(format!(
@@ -845,16 +862,29 @@ impl StitchSession {
                     }
                 }
 
-                // Existing copy + existing wait -- UNCHANGED.
-                pool.copy_from_textures(
+                // Option 2: the semaphore waits above are consumed by this
+                // exact submission, which copies the CUDA-shared buffers
+                // into ordinary wgpu/Vulkan textures. No CPU pixel path.
+                pool.copy_from_buffers(
                     gpu,
                     slot,
-                    &shared_tex[ls * 2],
-                    &shared_tex[ls * 2 + 1],
-                    &shared_tex[4 + rs * 2],
-                    &shared_tex[4 + rs * 2 + 1],
+                    &shared_buf[ls * 2],
+                    left_y_pitch,
+                    &shared_buf[ls * 2 + 1],
+                    left_uv_pitch,
+                    &shared_buf[4 + rs * 2],
+                    right_y_pitch,
+                    &shared_buf[4 + rs * 2 + 1],
+                    right_uv_pitch,
                 );
                 let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+
+                if produce_index == 0 {
+                    log::info!(
+                        "ZC_BUFFER_COPY: synchronized shared VkBuffer -> normal VramPool \
+                         textures complete for left_slot={ls} right_slot={rs}"
+                    );
+                }
 
                 // ZC_EXP4 continued: read the plain (non-shared) VRAM
                 // pool DESTINATION textures, immediately after the copy

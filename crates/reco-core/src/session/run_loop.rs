@@ -128,6 +128,17 @@ impl StitchSession {
             t[6].texture.clone(),
             t[7].texture.clone(),
         ]);
+        let b = &shared.buffers;
+        self.gpu_shared_buffers = Some([
+            b[0].buffer.clone(),
+            b[1].buffer.clone(),
+            b[2].buffer.clone(),
+            b[3].buffer.clone(),
+            b[4].buffer.clone(),
+            b[5].buffer.clone(),
+            b[6].buffer.clone(),
+            b[7].buffer.clone(),
+        ]);
         self.gpu_vk_semaphores = Some(shared.vk_semaphores);
         log::info!("Session configured for GPU-resident source");
     }

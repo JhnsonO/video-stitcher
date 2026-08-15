@@ -211,6 +211,103 @@ impl VramPool {
         gpu.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// Copy CUDA/Vulkan shared plane buffers into an ordinary pool texture.
+    ///
+    /// The source row pitches must satisfy wgpu's 256-byte alignment rule.
+    /// NV12 and P010 both use a full-frame byte width for Y and UV rows:
+    /// UV has half as many texels but two interleaved components.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_from_buffers(
+        &self,
+        gpu: &crate::gpu::GpuContext,
+        slot: usize,
+        src_left_y: &wgpu::Buffer,
+        left_y_pitch: usize,
+        src_left_uv: &wgpu::Buffer,
+        left_uv_pitch: usize,
+        src_right_y: &wgpu::Buffer,
+        right_y_pitch: usize,
+        src_right_uv: &wgpu::Buffer,
+        right_uv_pitch: usize,
+    ) {
+        let dst = &self.slots[slot];
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vram_pool_buffer_to_texture"),
+            });
+
+        let copy_plane = |enc: &mut wgpu::CommandEncoder,
+                          src: &wgpu::Buffer,
+                          pitch: usize,
+                          dst: &wgpu::Texture,
+                          width: u32,
+                          height: u32| {
+            let pitch = u32::try_from(pitch).expect("GPU plane pitch must fit in u32");
+            debug_assert_eq!(
+                pitch % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+                0,
+                "shared-buffer pitch must be 256-byte aligned"
+            );
+            enc.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: src,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(pitch),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: dst,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+
+        copy_plane(
+            &mut encoder,
+            src_left_y,
+            left_y_pitch,
+            &dst.left_y,
+            self.width,
+            self.height,
+        );
+        copy_plane(
+            &mut encoder,
+            src_left_uv,
+            left_uv_pitch,
+            &dst.left_uv,
+            self.width / 2,
+            self.height / 2,
+        );
+        copy_plane(
+            &mut encoder,
+            src_right_y,
+            right_y_pitch,
+            &dst.right_y,
+            self.width,
+            self.height,
+        );
+        copy_plane(
+            &mut encoder,
+            src_right_uv,
+            right_uv_pitch,
+            &dst.right_uv,
+            self.width / 2,
+            self.height / 2,
+        );
+
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+    }
+
     /// ZC_EXP4 (diagnostic-only): raw texture accessors for a pool slot,
     /// so a caller can read back the destination of `copy_from_textures`
     /// (e.g. to verify the CUDA-shared -> plain-VRAM copy itself). Not

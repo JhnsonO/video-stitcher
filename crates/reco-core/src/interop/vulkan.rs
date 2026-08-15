@@ -34,6 +34,173 @@ pub struct SharedTexture {
     _shared_mem: CudaSharedMemory,
 }
 
+/// A wgpu buffer backed by CUDA VMM memory imported through OPAQUE_FD.
+///
+/// CUDA writes decoded plane bytes through [`cuda_ptr`](Self::cuda_ptr).
+/// Vulkan/wgpu reads the same allocation as a copy source and transfers it
+/// into an ordinary texture; the buffer is never mapped by wgpu.
+pub struct SharedBuffer {
+    /// The imported buffer, usable as a wgpu `COPY_SRC`.
+    pub buffer: wgpu::Buffer,
+    /// CUDA device pointer for the decode thread's `cuMemcpy2D` destination.
+    pub cuda_ptr: crate::interop::cuda::CUdeviceptr,
+    /// Row stride in bytes. Always aligned to wgpu's buffer-copy requirement.
+    pub pitch: usize,
+    /// Logical plane size in bytes (`pitch * height`).
+    pub size: usize,
+    /// Keep the CUDA VMM allocation alive until after the wgpu handle drops.
+    _shared_mem: CudaSharedMemory,
+}
+
+/// Create a CUDA-VMM allocation shared with Vulkan as a `VkBuffer` and wrap
+/// it as a wgpu copy source.
+///
+/// This deliberately follows the byte-exact EXP7 control: CUDA creates and
+/// exports the allocation, Vulkan imports the OPAQUE_FD into a buffer using
+/// the buffer's exact `memRequirements.size`, and wgpu owns the imported
+/// `VkBuffer`/`VkDeviceMemory` lifetime. `vkGetMemoryFdPropertiesKHR` is not
+/// valid for OPAQUE_FD and must not be added here.
+#[cfg(target_os = "linux")]
+pub fn create_shared_buffer(
+    gpu: &GpuContext,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> Result<SharedBuffer, CudaInteropError> {
+    use ash::vk;
+    use wgpu::hal::api::Vulkan;
+
+    let bytes_per_texel = format_bytes_per_pixel(format);
+    let row_bytes = width as usize * bytes_per_texel;
+    let pitch = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize)
+        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+    let size = pitch * height as usize;
+
+    let shared_mem = crate::interop::cuda::allocate_shared_memory(size)?;
+    let cuda_ptr = shared_mem.device_ptr;
+    let fd = shared_mem.shared_handle;
+
+    let (vk_buffer, device_memory, memory_size) = unsafe {
+        let hal_device_guard = gpu
+            .device
+            .as_hal::<Vulkan>()
+            .ok_or(CudaInteropError::NotVulkan)?;
+        let hal_device = &*hal_device_guard;
+        let raw_device = hal_device.raw_device();
+        let physical_device = hal_device.raw_physical_device();
+        let instance = hal_device.shared_instance().raw_instance();
+
+        let mut external_info = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut external_info);
+        let vk_buffer = match raw_device.create_buffer(&buffer_info, None) {
+            Ok(buffer) => buffer,
+            Err(e) => {
+                libc::close(fd);
+                return Err(CudaInteropError::VulkanError(format!(
+                    "vkCreateBuffer ({label}): {e:?}"
+                )));
+            }
+        };
+
+        let mem_reqs = raw_device.get_buffer_memory_requirements(vk_buffer);
+        let mem_props = instance.get_physical_device_memory_properties(physical_device);
+        let pick_memory_type = |required: vk::MemoryPropertyFlags| {
+            (0..mem_props.memory_type_count).find(|&i| {
+                (mem_reqs.memory_type_bits & (1 << i)) != 0
+                    && mem_props.memory_types[i as usize]
+                        .property_flags
+                        .contains(required)
+            })
+        };
+        let Some(memory_type_index) = pick_memory_type(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            .or_else(|| pick_memory_type(vk::MemoryPropertyFlags::empty()))
+        else {
+            raw_device.destroy_buffer(vk_buffer, None);
+            libc::close(fd);
+            return Err(CudaInteropError::VulkanError(format!(
+                "no compatible memory type for imported buffer {label}"
+            )));
+        };
+
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD)
+            .fd(fd);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import_info);
+        let device_memory = match raw_device.allocate_memory(&alloc_info, None) {
+            Ok(memory) => memory,
+            Err(e) => {
+                // Vulkan consumes the imported fd only when allocation succeeds.
+                raw_device.destroy_buffer(vk_buffer, None);
+                libc::close(fd);
+                return Err(CudaInteropError::VulkanError(format!(
+                    "vkAllocateMemory ({label} OPAQUE_FD): {e:?}"
+                )));
+            }
+        };
+
+        if let Err(e) = raw_device.bind_buffer_memory(vk_buffer, device_memory, 0) {
+            raw_device.destroy_buffer(vk_buffer, None);
+            raw_device.free_memory(device_memory, None);
+            return Err(CudaInteropError::VulkanError(format!(
+                "vkBindBufferMemory ({label}): {e:?}"
+            )));
+        }
+
+        log::info!(
+            "CUDA/Vulkan shared buffer {label}: {width}x{height} {format:?}, \
+             row_bytes={row_bytes}, pitch={pitch}, logical_size={size}, \
+             cuda_alloc_size={}, vk_mem_reqs_size={}, vk_alignment={}, \
+             allocationSize_used={}, memory_type_index={memory_type_index}",
+            shared_mem.alloc_size,
+            mem_reqs.size,
+            mem_reqs.alignment,
+            mem_reqs.size,
+        );
+
+        (vk_buffer, device_memory, mem_reqs.size)
+    };
+
+    let wgpu_buffer = unsafe {
+        let hal_device_guard = gpu
+            .device
+            .as_hal::<Vulkan>()
+            .ok_or(CudaInteropError::NotVulkan)?;
+        let hal_buffer = wgpu::hal::vulkan::Buffer::from_raw_managed(
+            vk_buffer,
+            device_memory,
+            0,
+            memory_size,
+        );
+        drop(hal_device_guard);
+        gpu.device.create_buffer_from_hal::<Vulkan>(
+            hal_buffer,
+            &wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size as u64,
+                usage: wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            },
+        )
+    };
+
+    Ok(SharedBuffer {
+        buffer: wgpu_buffer,
+        cuda_ptr,
+        pitch,
+        size,
+        _shared_mem: shared_mem,
+    })
+}
+
 /// Create a wgpu texture backed by CUDA shared memory.
 ///
 /// This is the main entry point for zero-copy interop. The returned texture
@@ -1219,6 +1386,30 @@ pub fn create_nv12_shared_texture(
         Nv12Plane::Uv => {
             create_shared_texture(gpu, width / 2, height / 2, pixel_format.uv_format())
         }
+    }
+}
+
+/// Create a shared buffer sized for one NV12/P010 plane.
+#[cfg(target_os = "linux")]
+pub fn create_nv12_shared_buffer(
+    gpu: &GpuContext,
+    width: u32,
+    height: u32,
+    plane: Nv12Plane,
+    pixel_format: crate::render::renderer::GpuPixelFormat,
+    label: &str,
+) -> Result<SharedBuffer, CudaInteropError> {
+    match plane {
+        Nv12Plane::Y => {
+            create_shared_buffer(gpu, width, height, pixel_format.y_format(), label)
+        }
+        Nv12Plane::Uv => create_shared_buffer(
+            gpu,
+            width / 2,
+            height / 2,
+            pixel_format.uv_format(),
+            label,
+        ),
     }
 }
 

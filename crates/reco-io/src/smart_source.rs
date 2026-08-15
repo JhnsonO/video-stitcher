@@ -305,7 +305,9 @@ impl SmartFileSource {
         left_rotation: i32,
         right_rotation: i32,
     ) -> Result<Self, SourceError> {
-        use reco_core::interop::vulkan::{Nv12Plane, create_nv12_shared_texture};
+        use reco_core::interop::vulkan::{
+            Nv12Plane, create_nv12_shared_buffer, create_nv12_shared_texture,
+        };
         use reco_core::interop::zero_copy::GpuBufInfo;
         use reco_core::session::SharedTextureSet;
 
@@ -354,6 +356,37 @@ impl SmartFileSource {
         let (right_y_0, right_uv_0) = create_pair("right[0]")?;
         let (right_y_1, right_uv_1) = create_pair("right[1]")?;
 
+        // Production-shaped option-2 proof: CUDA writes into externally
+        // shared VkBuffers. The legacy images remain allocated on this
+        // diagnostic branch only so the immediate (no-lookahead) path still
+        // has its existing resources while the buffer->VramPool primitive is
+        // proven against real footage.
+        let create_buffer_pair = |label: &str| -> Result<_, SourceError> {
+            let y = create_nv12_shared_buffer(
+                gpu,
+                input_width,
+                input_height,
+                Nv12Plane::Y,
+                pixel_format,
+                &format!("cuda_shared_{label}_y"),
+            )
+            .map_err(|e| map_err(format!("{label} Y buffer: {e}")))?;
+            let uv = create_nv12_shared_buffer(
+                gpu,
+                input_width,
+                input_height,
+                Nv12Plane::Uv,
+                pixel_format,
+                &format!("cuda_shared_{label}_uv"),
+            )
+            .map_err(|e| map_err(format!("{label} UV buffer: {e}")))?;
+            Ok((y, uv))
+        };
+        let (left_y_buf_0, left_uv_buf_0) = create_buffer_pair("left_0")?;
+        let (left_y_buf_1, left_uv_buf_1) = create_buffer_pair("left_1")?;
+        let (right_y_buf_0, right_uv_buf_0) = create_buffer_pair("right_0")?;
+        let (right_y_buf_1, right_uv_buf_1) = create_buffer_pair("right_1")?;
+
         // ZC_SEM (diagnostic, Ticket 2): one exportable VkSemaphore per
         // double-buffer slot -- [left_0, left_1, right_0, right_1],
         // matching the SharedTextureSet::vk_semaphores layout. Each is
@@ -383,25 +416,25 @@ impl SmartFileSource {
 
         log::info!(
             "SmartFileSource: GPU zero-copy ({input_width}x{input_height}, {pixel_format:?}), Y pitch={}/{}",
-            left_y_0.pitch,
-            left_y_1.pitch
+            left_y_buf_0.pitch,
+            left_y_buf_1.pitch
         );
 
         let left_buf = GpuBufInfo {
-            y_ptr: [left_y_0.cuda_ptr, left_y_1.cuda_ptr],
-            uv_ptr: [left_uv_0.cuda_ptr, left_uv_1.cuda_ptr],
-            y_pitch: [left_y_0.pitch, left_y_1.pitch],
-            uv_pitch: [left_uv_0.pitch, left_uv_1.pitch],
+            y_ptr: [left_y_buf_0.cuda_ptr, left_y_buf_1.cuda_ptr],
+            uv_ptr: [left_uv_buf_0.cuda_ptr, left_uv_buf_1.cuda_ptr],
+            y_pitch: [left_y_buf_0.pitch, left_y_buf_1.pitch],
+            uv_pitch: [left_uv_buf_0.pitch, left_uv_buf_1.pitch],
             width: input_width,
             height: input_height,
             pixel_format,
             sem_cuda: [left_cuda_sem_0, left_cuda_sem_1],
         };
         let right_buf = GpuBufInfo {
-            y_ptr: [right_y_0.cuda_ptr, right_y_1.cuda_ptr],
-            uv_ptr: [right_uv_0.cuda_ptr, right_uv_1.cuda_ptr],
-            y_pitch: [right_y_0.pitch, right_y_1.pitch],
-            uv_pitch: [right_uv_0.pitch, right_uv_1.pitch],
+            y_ptr: [right_y_buf_0.cuda_ptr, right_y_buf_1.cuda_ptr],
+            uv_ptr: [right_uv_buf_0.cuda_ptr, right_uv_buf_1.cuda_ptr],
+            y_pitch: [right_y_buf_0.pitch, right_y_buf_1.pitch],
+            uv_pitch: [right_uv_buf_0.pitch, right_uv_buf_1.pitch],
             width: input_width,
             height: input_height,
             pixel_format,
@@ -444,6 +477,16 @@ impl SmartFileSource {
             textures: [
                 left_y_0, left_uv_0, left_y_1, left_uv_1, right_y_0, right_uv_0, right_y_1,
                 right_uv_1,
+            ],
+            buffers: [
+                left_y_buf_0,
+                left_uv_buf_0,
+                left_y_buf_1,
+                left_uv_buf_1,
+                right_y_buf_0,
+                right_uv_buf_0,
+                right_y_buf_1,
+                right_uv_buf_1,
             ],
             left_buf,
             right_buf,
