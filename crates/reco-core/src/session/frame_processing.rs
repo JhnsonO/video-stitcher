@@ -79,7 +79,7 @@ impl StitchSession {
     /// Dispatches to the correct detection and render path per
     /// [`StereoFrame`] variant. Every variant gets the same five stages;
     /// the dispatch inside each stage takes platform shortcuts (CUDA
-    /// shared textures, Metal IOSurface import, D3D11 staging, etc.).
+    /// shared buffers, Metal IOSurface import, D3D11 staging, etc.).
     ///
     /// `decode_time` and `frame_t0` are measured by the caller so that
     /// telemetry captures the full frame timing including source decode.
@@ -92,6 +92,7 @@ impl StitchSession {
         frame: &StereoFrame,
         elapsed: std::time::Duration,
         decode_time: std::time::Duration,
+        staged_upload_time: std::time::Duration,
         frame_t0: std::time::Instant,
         ctx: &FrameLoopContext,
     ) -> Result<(), SessionError> {
@@ -134,23 +135,22 @@ impl StitchSession {
                             self.update_director(elapsed)?;
                             false
                         }
-                    } else if let Some(ref views) = self.gpu_shared_views {
+                    } else if let (Some(pool), Some(vram_slot)) =
+                        (self.vram_pool.as_ref(), self.current_vram_slot)
+                    {
                         if self.frame_count == 0 {
                             log::info!(
-                                "GpuResident detection: wgpu shared texture views (ORT/wgpu preprocess)"
+                                "GpuResident detection: VramPool texture views (ORT/wgpu preprocess)"
                             );
                         }
-                        let ls = *left_slot as usize;
-                        let rs = *right_slot as usize;
+                        let (left_y, left_uv, right_y, right_uv) =
+                            pool.plane_views(vram_slot);
                         let (w, h) = self.core.pipeline().source_info();
                         let lr = self.left_rotation;
                         let rr = self.right_rotation;
                         if scheduled_detection {
                             let detections = self.detection.run_detection_wgpu_nv12(
-                                &views[ls * 2],
-                                &views[ls * 2 + 1],
-                                &views[4 + rs * 2],
-                                &views[4 + rs * 2 + 1],
+                                left_y, left_uv, right_y, right_uv,
                                 w,
                                 h,
                                 lr,
@@ -163,7 +163,7 @@ impl StitchSession {
                     } else {
                         if self.frame_count == 0 {
                             log::warn!(
-                                "GpuResident frame but no shared views - detection disabled"
+                                "GpuResident frame but no VramPool slot - detection disabled"
                             );
                         }
                         self.update_director(elapsed)?;
@@ -226,7 +226,9 @@ impl StitchSession {
 
         // ── 3. Render + replay ─────────────────────────────────────
         #[allow(unused_mut)]
-        let mut upload_time = std::time::Duration::ZERO;
+        let mut upload_time = staged_upload_time;
+        #[allow(unused_mut)]
+        let mut render_included_upload_time = std::time::Duration::ZERO;
         let render_t0 = std::time::Instant::now();
         match frame {
             #[cfg(target_os = "linux")]
@@ -267,6 +269,7 @@ impl StitchSession {
                         *right_slice,
                     )?;
                     upload_time = staging_t0.elapsed();
+                    render_included_upload_time = upload_time;
                     if first {
                         return Ok(());
                     }
@@ -281,7 +284,7 @@ impl StitchSession {
 
         // ── 4. Telemetry (uniform for all paths) ───────────────────
         let stitch_time = render_time
-            .saturating_sub(upload_time)
+            .saturating_sub(render_included_upload_time)
             .saturating_sub(self.last_readback_time)
             .saturating_sub(self.last_submit_time);
         self.telemetry.record_frame(crate::telemetry::FrameTiming {
@@ -434,72 +437,52 @@ impl StitchSession {
         Ok(())
     }
 
-    /// Render a GpuResident frame: shared CUDA/Vulkan textures.
+    /// Render a Linux GPU-resident frame from its ordinary VramPool textures.
     ///
-    /// Renders from pre-built bind groups, packs replay from shared
-    /// texture views, and releases decode slots for thread reuse.
+    /// The CUDA-shared buffers are never sampled. The synchronized
+    /// buffer-to-texture copy has completed before this method runs, so the
+    /// existing renderer, replay packer, and wgpu detector all consume the
+    /// same normal wgpu textures.
     #[cfg(target_os = "linux")]
     fn render_gpu_resident(
         &mut self,
-        left_slot: u8,
-        right_slot: u8,
+        _left_slot: u8,
+        _right_slot: u8,
         yaw: f32,
         pitch: f32,
     ) -> Result<(), SessionError> {
-        // VRAM pool path: render from pool bind groups.
-        // Decode slots were already freed during produce.
-        if let Some(vram_idx) = self.current_vram_slot {
+        let vram_idx = self.current_vram_slot.ok_or_else(|| {
+            SessionError::ZeroCopy(
+                "no VramPool slot configured for Linux GPU-resident frame".into(),
+            )
+        })?;
+
+        let render_buf = {
             let pool = self
                 .vram_pool
                 .as_ref()
                 .expect("vram_pool must exist when current_vram_slot is set");
             let left_bg = pool.left_bind_group(vram_idx);
             let right_bg = pool.right_bind_group(vram_idx);
-            let render_buf = self
+            self
                 .core
                 .pipeline_mut()
-                .render_with_bind_groups(left_bg, right_bg, yaw, pitch);
-            self.submit_render_output(render_buf)?;
-            return Ok(());
-        }
-
-        // Shared texture path (non-buffered / immediate mode).
-        let bind_groups = self.gpu_bind_groups.as_ref().ok_or_else(|| {
-            SessionError::ZeroCopy(
-                "GPU bind groups not configured - call setup_gpu_source() before run()".into(),
-            )
-        })?;
-        let render_buf =
-            self.core
-                .render_gpu_frame_at_pose(bind_groups, left_slot, right_slot, yaw, pitch);
+                .render_with_bind_groups(left_bg, right_bg, yaw, pitch)
+        };
         self.submit_render_output(render_buf)?;
 
-        if let Some(ref views) = self.gpu_shared_views {
-            let ls = left_slot as usize;
-            let rs = right_slot as usize;
+        if let Some(pool) = self.vram_pool.as_ref() {
+            let (left_y, left_uv, right_y, right_uv) = pool.plane_views(vram_idx);
             self.core.pack_gpu_stacked_replay_from_views(
                 crate::gpu::yuv_stack_packer::StackedPackSource::Nv12 {
-                    y: &views[ls * 2],
-                    uv: &views[ls * 2 + 1],
+                    y: left_y,
+                    uv: left_uv,
                 },
                 crate::gpu::yuv_stack_packer::StackedPackSource::Nv12 {
-                    y: &views[4 + rs * 2],
-                    uv: &views[4 + rs * 2 + 1],
+                    y: right_y,
+                    uv: right_uv,
                 },
             );
-        }
-
-        if let Some((ref left_tx, ref right_tx)) = self.gpu_slot_free_tx {
-            if left_tx.send(left_slot).is_err() {
-                log::error!(
-                    "Failed to release left GPU slot {left_slot} - decode thread may have died"
-                );
-            }
-            if right_tx.send(right_slot).is_err() {
-                log::error!(
-                    "Failed to release right GPU slot {right_slot} - decode thread may have died"
-                );
-            }
         }
 
         Ok(())
@@ -686,14 +669,10 @@ impl StitchSession {
         Ok(nv12_data)
     }
 
-    /// Copy a GPU-resident frame to the VRAM pool if available.
-    ///
-    /// Returns `Some(slot)` if the frame was copied to the pool (the
-    /// decode surface can be freed). Returns `None` for CPU frames
-    /// or when no pool is configured.
     /// Copy a GPU-resident frame to a persistent buffer slot.
     ///
-    /// On Linux: copies from shared CUDA/Vulkan textures to VramPool.
+    /// On Linux: waits for CUDA and copies shared Vulkan buffers to VramPool
+    /// textures without a CPU pixel round-trip.
     /// On Windows: stages D3D11 frame to an expanded staging pool slot.
     /// Returns the slot index for rendering, or None for CPU frames.
     pub(crate) fn copy_to_vram_pool(
@@ -738,7 +717,7 @@ impl StitchSession {
     fn copy_to_vram_pool_platform(
         &mut self,
         frame: &StereoFrame,
-        _produce_index: u64,
+        produce_index: u64,
     ) -> Result<Option<usize>, SessionError> {
         let (ls, rs) = match frame {
             StereoFrame::GpuResident {
@@ -747,36 +726,85 @@ impl StitchSession {
             } => (*left_slot as usize, *right_slot as usize),
             _ => return Ok(None),
         };
-        {
-            if let (Some(pool), Some(shared_tex)) =
-                (self.vram_pool.as_mut(), self.gpu_shared_textures.as_ref())
-            {
-                let slot = pool.acquire().ok_or_else(|| {
-                    SessionError::Config(format!(
-                        "VRAM pool exhausted ({} slots, {} available)",
-                        pool.capacity(),
-                        pool.available()
-                    ))
-                })?;
-                let gpu = self.core.pipeline().gpu();
-                pool.copy_from_textures(
-                    gpu,
-                    slot,
-                    &shared_tex[ls * 2],
-                    &shared_tex[ls * 2 + 1],
-                    &shared_tex[4 + rs * 2],
-                    &shared_tex[4 + rs * 2 + 1],
-                );
-                let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
-                // NOTE: the decode slot is NOT released here. Detection
-                // reads it after this copy (see `produce_one`), so the
-                // slot must stay held until `release_gpu_decode_slot` is
-                // called post-detection. Releasing it now would let the
-                // decode thread overwrite the slot mid-detection.
-                return Ok(Some(slot));
+        let (left_y_pitch, left_uv_pitch, right_y_pitch, right_uv_pitch) = self
+            .gpu_buf_info
+            .as_ref()
+            .map(|(left, right)| {
+                (
+                    left.y_pitch[ls],
+                    left.uv_pitch[ls],
+                    right.y_pitch[rs],
+                    right.uv_pitch[rs],
+                )
+            })
+            .ok_or_else(|| {
+                SessionError::ZeroCopy("CUDA shared-buffer metadata is not configured".into())
+            })?;
+        let shared_buffers = self.gpu_shared_buffers.as_ref().ok_or_else(|| {
+            SessionError::ZeroCopy("CUDA/Vulkan shared buffers are not configured".into())
+        })?;
+        let vk_semaphores = self.gpu_vk_semaphores.ok_or_else(|| {
+            SessionError::ZeroCopy("CUDA/Vulkan external semaphores are not configured".into())
+        })?;
+        let pool = self.vram_pool.as_mut().ok_or_else(|| {
+            SessionError::ZeroCopy("VramPool is not configured for shared-buffer copy".into())
+        })?;
+        let slot = pool.acquire().ok_or_else(|| {
+            SessionError::Config(format!(
+                "VRAM pool exhausted ({} slots, {} available)",
+                pool.capacity(),
+                pool.available()
+            ))
+        })?;
+        let gpu = self.core.pipeline().gpu();
+
+        // Build and validate the exact submission before attaching binary
+        // semaphore waits. A wait must be consumed by the matching copy submit;
+        // returning early after adding it could stall an unrelated submission.
+        let command = match pool.encode_copy_from_buffers(
+            gpu,
+            slot,
+            &shared_buffers[ls * 2],
+            left_y_pitch,
+            &shared_buffers[ls * 2 + 1],
+            left_uv_pitch,
+            &shared_buffers[4 + rs * 2],
+            right_y_pitch,
+            &shared_buffers[4 + rs * 2 + 1],
+            right_uv_pitch,
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                pool.release(slot);
+                return Err(SessionError::ZeroCopy(error));
             }
+        };
+
+        if let Err(error) = crate::interop::vulkan::stage_cuda_semaphore_waits(
+            gpu,
+            &[vk_semaphores[ls], vk_semaphores[2 + rs]],
+        ) {
+            pool.release(slot);
+            return Err(SessionError::ZeroCopy(error.to_string()));
         }
-        Ok(None)
+
+        // CUDA has signalled both slot semaphores. This exact queue submission
+        // waits at TRANSFER and copies all four planes into ordinary wgpu
+        // textures; no CPU pixel path is involved.
+        gpu.queue.submit(std::iter::once(command));
+        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+
+        if produce_index == 0 {
+            log::info!(
+                "CUDA shared-buffer copy: synchronized VkBuffer -> VramPool textures complete \
+                 for left_slot={ls} right_slot={rs}"
+            );
+        }
+
+        // The decode slots remain owned until detection has finished reading
+        // the original CUDA pointers. The immediate and buffered loops release
+        // them after detection, independently of the VramPool slot lifetime.
+        Ok(Some(slot))
     }
 
     #[cfg(target_os = "windows")]

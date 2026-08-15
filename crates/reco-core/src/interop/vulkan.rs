@@ -1,13 +1,15 @@
 //! Vulkan side of CUDA/Vulkan interop.
 //!
-//! Imports CUDA-exported shared memory into Vulkan, then wraps the
-//! resulting `VkImage` into a [`wgpu::Texture`] via the HAL escape hatch.
+//! Imports CUDA-exported shared memory into Vulkan through the HAL escape
+//! hatch. The production Linux decode path uses shared `VkBuffer`s as copy
+//! sources for ordinary wgpu textures. The older shared-image helpers remain
+//! for callers that still require image interop.
 //!
 //! The flow:
 //! 1. CUDA allocates shareable memory and exports a POSIX fd
-//! 2. This module creates a `VkImage` with `VK_KHR_external_memory_fd`
-//! 3. Imports the fd as the backing memory for the image
-//! 4. Wraps the `VkImage` into `wgpu::Texture` via `create_texture_from_hal`
+//! 2. This module creates a Vulkan buffer or image with external-memory flags
+//! 3. Imports the fd as the backing memory
+//! 4. Wraps the resource into wgpu via the corresponding HAL constructor
 //!
 //! ## References
 //! - [Gyroflow](https://github.com/gyroflow/gyroflow) for the general CUDA/Vulkan interop approach
@@ -32,6 +34,324 @@ pub struct SharedTexture {
     pub pitch: usize,
     /// Keep the shared memory alive (dropped after texture).
     _shared_mem: CudaSharedMemory,
+}
+
+/// A Vulkan buffer backed by CUDA VMM memory and exposed to wgpu as COPY_SRC.
+///
+/// CUDA/NVDEC writes through `cuda_ptr`; Vulkan copies the bytes into ordinary
+/// wgpu textures after waiting on the slot's external semaphore.
+pub struct SharedBuffer {
+    pub buffer: wgpu::Buffer,
+    pub cuda_ptr: crate::interop::cuda::CUdeviceptr,
+    pub pitch: usize,
+    pub size: usize,
+    _shared_mem: CudaSharedMemory,
+}
+
+/// One binary semaphore shared between CUDA and Vulkan for a decode slot.
+#[cfg(target_os = "linux")]
+pub struct SharedSemaphore {
+    vk_semaphore: ash::vk::Semaphore,
+    cuda_semaphore: crate::interop::cuda::CudaExternalSemaphore,
+    raw_device: ash::Device,
+    _device: wgpu::Device,
+}
+
+#[cfg(target_os = "linux")]
+impl SharedSemaphore {
+    pub fn vk_semaphore(&self) -> ash::vk::Semaphore {
+        self.vk_semaphore
+    }
+
+    pub fn cuda_semaphore(&self) -> crate::interop::cuda::CudaExternalSemaphore {
+        self.cuda_semaphore
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SharedSemaphore {
+    fn drop(&mut self) {
+        // A decode thread may have exited after enqueueing its final signal but
+        // before the render loop received that frame. Complete CUDA work before
+        // destroying either API's handle.
+        if let Err(error) = crate::interop::cuda::cuda_synchronize() {
+            log::error!("synchronize before external semaphore destroy: {error}");
+        }
+        if let Err(error) =
+            crate::interop::cuda::cuda_destroy_external_semaphore(self.cuda_semaphore)
+        {
+            log::error!("destroy CUDA external semaphore: {error}");
+        }
+        unsafe {
+            self.raw_device.destroy_semaphore(self.vk_semaphore, None);
+        }
+    }
+}
+
+fn aligned_buffer_pitch(width: u32, format: wgpu::TextureFormat) -> usize {
+    let row_bytes = width as usize * format_bytes_per_pixel(format);
+    row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize)
+        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize
+}
+
+/// Attach CUDA-signalled binary-semaphore waits to the next wgpu submission.
+///
+/// Callers must submit immediately after this succeeds. The waits are staged
+/// inside wgpu-hal and are consumed by exactly the next queue submission.
+#[cfg(target_os = "linux")]
+pub fn stage_cuda_semaphore_waits(
+    gpu: &GpuContext,
+    semaphores: &[ash::vk::Semaphore],
+) -> Result<(), CudaInteropError> {
+    use wgpu::hal::api::Vulkan;
+
+    let hal_queue = unsafe { gpu.queue.as_hal::<Vulkan>() }.ok_or(CudaInteropError::NotVulkan)?;
+    for &semaphore in semaphores {
+        hal_queue.add_wait_semaphore(
+            semaphore,
+            None,
+            ash::vk::PipelineStageFlags::TRANSFER,
+        );
+    }
+    Ok(())
+}
+
+/// Consume signalled slot semaphores when a decoded frame is intentionally
+/// skipped instead of copied.
+///
+/// Binary semaphores must return to the unsignalled state before the decode
+/// slot can be reused. An empty Vulkan submission is sufficient to perform the
+/// waits; the device poll makes that consumption explicit before reuse.
+#[cfg(target_os = "linux")]
+pub fn consume_cuda_semaphore_signals(
+    gpu: &GpuContext,
+    semaphores: &[ash::vk::Semaphore],
+) -> Result<(), CudaInteropError> {
+    stage_cuda_semaphore_waits(gpu, semaphores)?;
+    gpu.queue
+        .submit(std::iter::empty::<wgpu::CommandBuffer>());
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|error| {
+            CudaInteropError::VulkanError(format!(
+                "wait for skipped-frame semaphore consumption: {error:?}"
+            ))
+        })?;
+    Ok(())
+}
+
+/// Create the byte-exact EXP7 primitive as a production wgpu copy source.
+///
+/// CUDA creates/exports the VMM allocation. Vulkan imports the `OPAQUE_FD`
+/// into a `VkBuffer` using exactly `memRequirements.size`; wgpu then owns the
+/// Vulkan buffer and memory lifetime. `vkGetMemoryFdPropertiesKHR` is invalid
+/// for `OPAQUE_FD` and must not be used here.
+#[cfg(target_os = "linux")]
+pub fn create_shared_buffer(
+    gpu: &GpuContext,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> Result<SharedBuffer, CudaInteropError> {
+    use ash::vk;
+    use wgpu::hal::api::Vulkan;
+
+    let pitch = aligned_buffer_pitch(width, format);
+    let size = pitch * height as usize;
+    let shared_mem = crate::interop::cuda::allocate_shared_memory(size)?;
+    let cuda_ptr = shared_mem.device_ptr;
+    let fd = shared_mem.shared_handle;
+
+    let (vk_buffer, device_memory, memory_size) = unsafe {
+        let hal_device_guard = gpu
+            .device
+            .as_hal::<Vulkan>()
+            .ok_or(CudaInteropError::NotVulkan)?;
+        let hal_device = &*hal_device_guard;
+        let raw_device = hal_device.raw_device();
+        let physical_device = hal_device.raw_physical_device();
+        let instance = hal_device.shared_instance().raw_instance();
+
+        let mut external_info = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut external_info);
+        let vk_buffer = match raw_device.create_buffer(&buffer_info, None) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                libc::close(fd);
+                return Err(CudaInteropError::VulkanError(format!(
+                    "vkCreateBuffer ({label}): {error:?}"
+                )));
+            }
+        };
+
+        let mem_reqs = raw_device.get_buffer_memory_requirements(vk_buffer);
+        if mem_reqs.size > shared_mem.alloc_size as u64 {
+            raw_device.destroy_buffer(vk_buffer, None);
+            libc::close(fd);
+            return Err(CudaInteropError::VulkanError(format!(
+                "{label} Vulkan buffer requires {} bytes but CUDA allocated {}",
+                mem_reqs.size, shared_mem.alloc_size
+            )));
+        }
+
+        let mem_props = instance.get_physical_device_memory_properties(physical_device);
+        let pick_memory_type = |required: vk::MemoryPropertyFlags| {
+            (0..mem_props.memory_type_count).find(|&index| {
+                (mem_reqs.memory_type_bits & (1 << index)) != 0
+                    && mem_props.memory_types[index as usize]
+                        .property_flags
+                        .contains(required)
+            })
+        };
+        let Some(memory_type_index) = pick_memory_type(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            .or_else(|| pick_memory_type(vk::MemoryPropertyFlags::empty()))
+        else {
+            raw_device.destroy_buffer(vk_buffer, None);
+            libc::close(fd);
+            return Err(CudaInteropError::VulkanError(format!(
+                "no compatible memory type for imported buffer {label}"
+            )));
+        };
+
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD)
+            .fd(fd);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import_info);
+        let device_memory = match raw_device.allocate_memory(&alloc_info, None) {
+            Ok(memory) => memory,
+            Err(error) => {
+                raw_device.destroy_buffer(vk_buffer, None);
+                libc::close(fd);
+                return Err(CudaInteropError::VulkanError(format!(
+                    "vkAllocateMemory ({label} OPAQUE_FD): {error:?}"
+                )));
+            }
+        };
+
+        if let Err(error) = raw_device.bind_buffer_memory(vk_buffer, device_memory, 0) {
+            raw_device.destroy_buffer(vk_buffer, None);
+            raw_device.free_memory(device_memory, None);
+            return Err(CudaInteropError::VulkanError(format!(
+                "vkBindBufferMemory ({label}): {error:?}"
+            )));
+        }
+
+        log::info!(
+            "CUDA/Vulkan shared buffer {label}: {width}x{height} {format:?}, \
+             pitch={pitch}, size={size}, cuda_alloc={}, vk_requirement={}",
+            shared_mem.alloc_size,
+            mem_reqs.size,
+        );
+        (vk_buffer, device_memory, mem_reqs.size)
+    };
+
+    let buffer = unsafe {
+        let hal_buffer = wgpu::hal::vulkan::Buffer::from_raw_managed(
+            vk_buffer,
+            device_memory,
+            0,
+            memory_size,
+        );
+        gpu.device.create_buffer_from_hal::<Vulkan>(
+            hal_buffer,
+            &wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size as u64,
+                usage: wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            },
+        )
+    };
+
+    Ok(SharedBuffer {
+        buffer,
+        cuda_ptr,
+        pitch,
+        size,
+        _shared_mem: shared_mem,
+    })
+}
+
+/// Create a Vulkan binary semaphore, export it as `OPAQUE_FD`, and import it
+/// into CUDA. The returned owner destroys both API handles in the right order.
+#[cfg(target_os = "linux")]
+pub fn create_shared_semaphore(gpu: &GpuContext) -> Result<SharedSemaphore, CudaInteropError> {
+    use ash::vk;
+    use wgpu::hal::api::Vulkan;
+
+    unsafe {
+        let hal_device_guard = gpu
+            .device
+            .as_hal::<Vulkan>()
+            .ok_or(CudaInteropError::NotVulkan)?;
+        let hal_device = &*hal_device_guard;
+        let raw_device = hal_device.raw_device();
+        let physical_device = hal_device.raw_physical_device();
+        let raw_instance = hal_device.shared_instance().raw_instance();
+
+        let supported_extensions = raw_instance
+            .enumerate_device_extension_properties(physical_device)
+            .map_err(|error| {
+                CudaInteropError::VulkanError(format!(
+                    "vkEnumerateDeviceExtensionProperties: {error:?}"
+                ))
+            })?;
+        if !supported_extensions.iter().any(|property| {
+            property.extension_name_as_c_str() == Ok(ash::khr::external_semaphore_fd::NAME)
+        }) {
+            return Err(CudaInteropError::VulkanError(
+                "VK_KHR_external_semaphore_fd is unavailable".into(),
+            ));
+        }
+
+        let mut export_info = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+        let semaphore_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+        let vk_semaphore = raw_device
+            .create_semaphore(&semaphore_info, None)
+            .map_err(|error| {
+                CudaInteropError::VulkanError(format!("vkCreateSemaphore: {error:?}"))
+            })?;
+
+        let fd_loader = ash::khr::external_semaphore_fd::Device::new(raw_instance, raw_device);
+        let fd_info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(vk_semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+        let fd = match fd_loader.get_semaphore_fd(&fd_info) {
+            Ok(fd) => fd,
+            Err(error) => {
+                raw_device.destroy_semaphore(vk_semaphore, None);
+                return Err(CudaInteropError::VulkanError(format!(
+                    "vkGetSemaphoreFdKHR: {error:?}"
+                )));
+            }
+        };
+
+        let cuda_semaphore =
+            match crate::interop::cuda::cuda_import_external_semaphore(fd) {
+                Ok(semaphore) => semaphore,
+                Err(error) => {
+                    raw_device.destroy_semaphore(vk_semaphore, None);
+                    return Err(error);
+                }
+            };
+
+        Ok(SharedSemaphore {
+            vk_semaphore,
+            cuda_semaphore,
+            raw_device: raw_device.clone(),
+            _device: gpu.device.clone(),
+        })
+    }
 }
 
 /// Create a wgpu texture backed by CUDA shared memory.
@@ -299,6 +619,28 @@ pub enum Nv12Plane {
     Uv,
 }
 
+/// Create one CUDA-shared NV12/P010 plane buffer.
+#[cfg(target_os = "linux")]
+pub fn create_nv12_shared_buffer(
+    gpu: &GpuContext,
+    width: u32,
+    height: u32,
+    plane: Nv12Plane,
+    pixel_format: crate::render::renderer::GpuPixelFormat,
+    label: &str,
+) -> Result<SharedBuffer, CudaInteropError> {
+    match plane {
+        Nv12Plane::Y => create_shared_buffer(gpu, width, height, pixel_format.y_format(), label),
+        Nv12Plane::Uv => create_shared_buffer(
+            gpu,
+            width / 2,
+            height / 2,
+            pixel_format.uv_format(),
+            label,
+        ),
+    }
+}
+
 /// Create a shared texture sized and formatted for an NV12 plane.
 ///
 /// This is a convenience wrapper around [`create_shared_texture`] that
@@ -327,6 +669,37 @@ pub fn create_nv12_shared_texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nv12_and_p010_plane_pitches_are_copy_aligned() {
+        assert_eq!(
+            aligned_buffer_pitch(3840, wgpu::TextureFormat::R8Unorm),
+            3840
+        );
+        assert_eq!(
+            aligned_buffer_pitch(1920, wgpu::TextureFormat::Rg8Unorm),
+            3840
+        );
+        assert_eq!(
+            aligned_buffer_pitch(3840, wgpu::TextureFormat::R16Unorm),
+            7680
+        );
+        assert_eq!(
+            aligned_buffer_pitch(1920, wgpu::TextureFormat::Rg16Unorm),
+            7680
+        );
+
+        // A width whose byte rows are not naturally 256-byte aligned must
+        // preserve tight CUDA copies while padding Vulkan's row stride.
+        assert_eq!(
+            aligned_buffer_pitch(1920, wgpu::TextureFormat::R8Unorm),
+            2048
+        );
+        assert_eq!(
+            aligned_buffer_pitch(960, wgpu::TextureFormat::Rg8Unorm),
+            2048
+        );
+    }
 
     #[test]
     fn test_create_shared_texture() {

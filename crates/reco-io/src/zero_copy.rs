@@ -9,7 +9,7 @@
 //! the frame loop; `reco-io` handles the decode threads.
 
 /// Spawn a single-video GPU decode thread that writes NV12 frames directly
-/// to CUDA/Vulkan shared textures via `cuMemcpy2D`.
+/// to CUDA/Vulkan shared buffers via `cuMemcpy2D`.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn spawn_single_decoder_gpu(
     input: crate::stitch_job::InputPath,
@@ -84,7 +84,7 @@ pub fn spawn_single_decoder_gpu(
                         let y_width_bytes = buf.width as usize * bps;
                         let uv_width_bytes = buf.width as usize * bps;
 
-                        // Copy Y plane: NVDEC -> shared texture
+                        // Copy Y plane: NVDEC -> shared buffer
                         if let Err(e) = reco_core::interop::cuda::cuda_2d_copy(
                             buf.y_ptr[s],
                             buf.y_pitch[s],
@@ -97,7 +97,7 @@ pub fn spawn_single_decoder_gpu(
                             break;
                         }
 
-                        // Copy UV plane: NVDEC -> shared texture
+                        // Copy UV plane: NVDEC -> shared buffer
                         if let Err(e) = reco_core::interop::cuda::cuda_2d_copy(
                             buf.uv_ptr[s],
                             buf.uv_pitch[s],
@@ -112,6 +112,14 @@ pub fn spawn_single_decoder_gpu(
 
                         if let Err(e) = reco_core::interop::cuda::cuda_synchronize() {
                             log::error!("{label} cuCtxSynchronize: {e}");
+                            break;
+                        }
+
+                        #[cfg(target_os = "linux")]
+                        if let Err(e) = reco_core::interop::cuda::cuda_signal_external_semaphore(
+                            buf.sem_cuda[s],
+                        ) {
+                            log::error!("{label} cuSignalExternalSemaphoresAsync: {e}");
                             break;
                         }
 

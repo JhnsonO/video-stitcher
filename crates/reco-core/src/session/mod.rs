@@ -124,10 +124,6 @@ pub struct StitchSession {
     pub(crate) last_readback_time: std::time::Duration,
     pub(crate) last_submit_time: std::time::Duration,
     // ── GPU-resident source state (populated by configure_from_source) ──
-    /// Bind groups for GPU-resident shared textures.
-    /// Created lazily from the source's textures at the start of run().
-    #[cfg(target_os = "linux")]
-    pub(crate) gpu_bind_groups: Option<crate::render::pipeline::GpuSourceBindGroups>,
     /// Slot-free senders for decode backpressure (GPU zero-copy).
     #[cfg(target_os = "linux")]
     pub(crate) gpu_slot_free_tx: Option<(
@@ -140,20 +136,15 @@ pub struct StitchSession {
         crate::interop::zero_copy::GpuBufInfo,
         crate::interop::zero_copy::GpuBufInfo,
     )>,
-    /// Texture views for the 8 shared zero-copy textures, layout
-    /// `[left_y_0, left_uv_0, left_y_1, left_uv_1, right_y_0,
-    /// right_uv_0, right_y_1, right_uv_1]`. Stashed at
-    /// `setup_gpu_source` time so `step_gpu_with_bufs` can hand
-    /// slot-indexed views to the GPU stacked-replay pack without
-    /// rebuilding views every frame. TextureView holds an Arc on
-    /// the underlying texture so the shared-memory lifetime is
-    /// still bound to the SharedTextureSet the source owns.
+    /// Eight CUDA/Vulkan shared plane buffers, ordered by camera, slot, then
+    /// Y/UV. Rendering never samples these directly; they are COPY_SRC inputs
+    /// for ordinary VramPool textures.
     #[cfg(target_os = "linux")]
-    pub(crate) gpu_shared_views: Option<[wgpu::TextureView; 8]>,
-    /// The 8 shared textures (2 slots x 2 cameras x Y/UV), cloned for
-    /// `copy_texture_to_texture` in the VRAM pool path. Cheap (Arc inside).
+    pub(crate) gpu_shared_buffers: Option<[wgpu::Buffer; 8]>,
+    /// Vulkan side of the four slot semaphores: [left_0, left_1, right_0,
+    /// right_1]. The source owns their lifetime.
     #[cfg(target_os = "linux")]
-    pub(crate) gpu_shared_textures: Option<[wgpu::Texture; 8]>,
+    pub(crate) gpu_vk_semaphores: Option<[ash::vk::Semaphore; 4]>,
 
     /// VRAM buffer pool for GPU-resident lookahead.
     pub(crate) vram_pool: Option<vram_pool::VramPool>,
@@ -280,15 +271,13 @@ impl StitchSession {
             last_readback_time: std::time::Duration::ZERO,
             last_submit_time: std::time::Duration::ZERO,
             #[cfg(target_os = "linux")]
-            gpu_bind_groups: None,
-            #[cfg(target_os = "linux")]
             gpu_slot_free_tx: None,
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             gpu_buf_info: None,
             #[cfg(target_os = "linux")]
-            gpu_shared_views: None,
+            gpu_shared_buffers: None,
             #[cfg(target_os = "linux")]
-            gpu_shared_textures: None,
+            gpu_vk_semaphores: None,
             vram_pool: None,
             current_vram_slot: None,
             #[cfg(any(target_os = "macos", target_os = "ios"))]

@@ -80,55 +80,38 @@ impl StitchSession {
 
     /// Configure the session for a GPU-resident source.
     ///
-    /// Creates bind groups from the source's shared textures and stores
-    /// slot-free senders for decode backpressure. Call this before
+    /// Stores shared buffers, external semaphores, CUDA metadata, and slot-free
+    /// senders for decode backpressure. Call this before
     /// [`run`](Self::run) when using a GPU-resident [`FrameSource`] like
     /// `SmartFileSource`.
     ///
-    /// The `run` loop uses these bind groups for GPU-resident
-    /// `StereoFrame::GpuResident` frames.
+    /// GPU-resident frames are copied into ordinary VramPool textures before
+    /// rendering or wgpu-based detection.
     #[cfg(target_os = "linux")]
     pub fn setup_gpu_source(&mut self, shared: &super::SharedTextureSet) {
-        let t = &shared.textures;
-        let bind_groups = self.core.pipeline_mut().configure_gpu_source(
-            [(&t[0], &t[1]), (&t[2], &t[3])],
-            [(&t[4], &t[5]), (&t[6], &t[7])],
-        );
-        self.gpu_bind_groups = Some(bind_groups);
         self.gpu_slot_free_tx = Some((
             shared.left_slot_free_tx.clone(),
             shared.right_slot_free_tx.clone(),
         ));
         self.gpu_buf_info = Some((shared.left_buf.clone(), shared.right_buf.clone()));
-        // Pre-build the 8 shared texture views for the GPU
-        // stacked-replay pack shader. Same order as `t` above so
-        // `step_gpu_with_bufs` can index per slot:
-        //   left  y: [ls * 2],     uv: [ls * 2 + 1]
-        //   right y: [4 + rs * 2], uv: [4 + rs * 2 + 1]
-        // Views hold Arcs to the underlying textures, so the
-        // SharedTextureSet still owns the lifetime.
-        let desc = wgpu::TextureViewDescriptor::default();
-        self.gpu_shared_views = Some([
-            t[0].texture.create_view(&desc),
-            t[1].texture.create_view(&desc),
-            t[2].texture.create_view(&desc),
-            t[3].texture.create_view(&desc),
-            t[4].texture.create_view(&desc),
-            t[5].texture.create_view(&desc),
-            t[6].texture.create_view(&desc),
-            t[7].texture.create_view(&desc),
+        let buffers = &shared.buffers;
+        self.gpu_shared_buffers = Some([
+            buffers[0].buffer.clone(),
+            buffers[1].buffer.clone(),
+            buffers[2].buffer.clone(),
+            buffers[3].buffer.clone(),
+            buffers[4].buffer.clone(),
+            buffers[5].buffer.clone(),
+            buffers[6].buffer.clone(),
+            buffers[7].buffer.clone(),
         ]);
-        self.gpu_shared_textures = Some([
-            t[0].texture.clone(),
-            t[1].texture.clone(),
-            t[2].texture.clone(),
-            t[3].texture.clone(),
-            t[4].texture.clone(),
-            t[5].texture.clone(),
-            t[6].texture.clone(),
-            t[7].texture.clone(),
+        self.gpu_vk_semaphores = Some([
+            shared.semaphores[0].vk_semaphore(),
+            shared.semaphores[1].vk_semaphore(),
+            shared.semaphores[2].vk_semaphore(),
+            shared.semaphores[3].vk_semaphore(),
         ]);
-        log::info!("Session configured for GPU-resident source");
+        log::info!("Session configured for CUDA shared-buffer source");
     }
 
     /// Batch-process frames from a source into the encoder.
@@ -139,7 +122,7 @@ impl StitchSession {
     ///
     /// Automatically handles CPU-resident and GPU-resident frames:
     /// - CPU frames (Yuv420p, Nv12): uploaded to GPU, rendered, encoded
-    /// - GPU frames (GpuResident): rendered directly from shared textures
+    /// - GPU frames (GpuResident): copied GPU-to-GPU into ordinary textures
     ///
     /// Does NOT call [`Self::finish`] - the caller must do that after this
     /// returns to flush the last frame and finalize encoding.
@@ -223,18 +206,20 @@ impl StitchSession {
         self.current_vram_slot = oldest.vram_slot;
 
         let frame_t0 = std::time::Instant::now();
-        self.process_frame_any(
+        let render_result = self.process_frame_any(
             &oldest.frame,
             start.elapsed(),
             oldest.decode_time,
+            oldest.upload_time,
             frame_t0,
             ctx,
-        )?;
+        );
 
         if let (Some(slot), Some(ref mut pool)) = (oldest.vram_slot, self.vram_pool.as_mut()) {
             pool.release(slot);
         }
         self.current_vram_slot = None;
+        render_result?;
 
         if let Some(cb) = on_progress.as_mut() {
             cb(&FrameProgress {
@@ -368,11 +353,31 @@ impl StitchSession {
             let decode_time = frame_t0.elapsed();
             let elapsed = start.elapsed();
 
-            // Stage GPU frames to persistent slots BEFORE detection,
-            // so detection can use the staged textures.
+            // Stage GPU frames to persistent slots BEFORE detection. CUDA
+            // detection keeps reading the original shared-buffer pointers;
+            // wgpu detection consumes the normal destination textures.
+            let upload_t0 = std::time::Instant::now();
             let vram_slot = session.copy_to_vram_pool(&frame, *produce_count)?;
+            let upload_time = if vram_slot.is_some() {
+                upload_t0.elapsed()
+            } else {
+                std::time::Duration::ZERO
+            };
 
-            let world_state = session.detect_and_track_only(&frame, elapsed, *produce_count)?;
+            session.current_vram_slot = vram_slot;
+            let detection_result =
+                session.detect_and_track_only(&frame, elapsed, *produce_count);
+            session.current_vram_slot = None;
+            let world_state = match detection_result {
+                Ok(world_state) => world_state,
+                Err(error) => {
+                    if let (Some(slot), Some(pool)) = (vram_slot, session.vram_pool.as_mut()) {
+                        pool.release(slot);
+                    }
+                    session.release_gpu_decode_slot(&frame);
+                    return Err(error);
+                }
+            };
             let detections = session.detection.last_detections.clone();
 
             // Detection has now read the decode slot; it is safe to hand
@@ -386,6 +391,7 @@ impl StitchSession {
                 detections,
                 elapsed_ms: elapsed.as_secs_f64() * 1000.0,
                 decode_time,
+                upload_time,
                 vram_slot,
             });
 
@@ -548,6 +554,28 @@ impl StitchSession {
     ) -> Result<u64, SessionError> {
         let start = std::time::Instant::now();
 
+        // Linux option 2 always renders from ordinary wgpu textures. Immediate
+        // mode needs one reusable destination slot; lookahead allocates its
+        // larger pool in `run_buffered` instead.
+        #[cfg(target_os = "linux")]
+        if source.is_gpu_resident()
+            && self.gpu_shared_buffers.is_some()
+            && self.vram_pool.is_none()
+        {
+            let (w, h) = self.core.pipeline().source_info();
+            self.vram_pool = Some(
+                super::vram_pool::VramPool::new(
+                    self.core.pipeline().gpu(),
+                    self.core.pipeline(),
+                    w,
+                    h,
+                    1,
+                    self.gpu_pixel_format,
+                )
+                .map_err(SessionError::Config)?,
+            );
+        }
+
         let ctx = crate::session::types::FrameLoopContext {
             #[cfg(target_os = "linux")]
             gpu_buf_info: self.gpu_buf_info.clone(),
@@ -565,6 +593,22 @@ impl StitchSession {
             };
             let decode_time = frame_t0.elapsed();
 
+            #[cfg(target_os = "linux")]
+            let (vram_slot, upload_time) = {
+                let upload_t0 = std::time::Instant::now();
+                let slot = self.copy_to_vram_pool(&frame, self.frame_count)?;
+                (
+                    slot,
+                    if slot.is_some() {
+                        upload_t0.elapsed()
+                    } else {
+                        std::time::Duration::ZERO
+                    },
+                )
+            };
+            #[cfg(not(target_os = "linux"))]
+            let (vram_slot, upload_time) = (None, std::time::Duration::ZERO);
+
             if let Some(sink) = self.event_sink.as_deref_mut() {
                 sink.emit(crate::detect::pipeline_event::PipelineEvent::FrameStart {
                     frame_index: self.frame_count,
@@ -572,7 +616,21 @@ impl StitchSession {
                 });
             }
 
-            self.process_frame_any(&frame, start.elapsed(), decode_time, frame_t0, &ctx)?;
+            self.current_vram_slot = vram_slot;
+            let process_result = self.process_frame_any(
+                &frame,
+                start.elapsed(),
+                decode_time,
+                upload_time,
+                frame_t0,
+                &ctx,
+            );
+            self.current_vram_slot = None;
+            if let (Some(slot), Some(pool)) = (vram_slot, self.vram_pool.as_mut()) {
+                pool.release(slot);
+            }
+            self.release_gpu_decode_slot(&frame);
+            process_result?;
 
             if let Some(cb) = on_progress.as_mut() {
                 cb(&FrameProgress {

@@ -19,6 +19,8 @@ pub(crate) struct BufferedFrame {
     pub detections: Vec<MappedDetection>,
     pub elapsed_ms: f64,
     pub decode_time: std::time::Duration,
+    /// GPU-resident source copy/staging time measured during produce.
+    pub upload_time: std::time::Duration,
     /// VRAM pool slot index (Some when GPU-resident, None for CPU frames).
     /// The pool slot is released after rendering.
     pub vram_slot: Option<usize>,
@@ -110,6 +112,7 @@ mod tests {
             detections: vec![],
             elapsed_ms: 0.0,
             decode_time: std::time::Duration::from_millis(3),
+            upload_time: std::time::Duration::ZERO,
             vram_slot: None,
         }
     }

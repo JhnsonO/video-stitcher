@@ -7,19 +7,19 @@
 
 /// CUDA buffer info passed to decode threads for `cuMemcpy2D` destination.
 ///
-/// Each camera has two slots (double-buffered) with Y and UV textures.
-/// The decode thread writes NVDEC output to these via CUDA, and the
-/// render thread reads them as wgpu textures via Vulkan shared memory.
+/// Each camera has two slots (double-buffered) with Y and UV buffers.
+/// The decode thread writes NVDEC output through CUDA. Vulkan waits on the
+/// matching semaphore and copies each buffer into an ordinary wgpu texture.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[derive(Clone)]
 pub struct GpuBufInfo {
-    /// CUDA device pointers for double-buffered Y textures.
+    /// CUDA device pointers for double-buffered Y planes.
     pub y_ptr: [u64; 2],
-    /// CUDA device pointers for double-buffered UV textures.
+    /// CUDA device pointers for double-buffered UV planes.
     pub uv_ptr: [u64; 2],
-    /// Row pitch of shared Y textures (may differ from width due to alignment).
+    /// Row pitch of shared Y buffers (may differ from width due to alignment).
     pub y_pitch: [usize; 2],
-    /// Row pitch of shared UV textures.
+    /// Row pitch of shared UV buffers.
     pub uv_pitch: [usize; 2],
     /// Frame width in pixels.
     pub width: u32,
@@ -28,6 +28,10 @@ pub struct GpuBufInfo {
     /// Pixel format (NV12 8-bit or P010 10-bit). Determines CUDA copy
     /// width via `GpuPixelFormat::bytes_per_sample()`.
     pub pixel_format: crate::render::renderer::GpuPixelFormat,
+    /// CUDA-imported binary semaphore for each decode slot. CUDA signals the
+    /// matching entry after both plane copies complete.
+    #[cfg(target_os = "linux")]
+    pub sem_cuda: [crate::interop::cuda::CudaExternalSemaphore; 2],
 }
 
 /// A pair of double-buffer slot indices from the decode threads.
@@ -48,13 +52,13 @@ pub struct GpuFrameSignal {
 /// The session drives the frame loop by receiving signals from
 /// `frame_rx`, rendering, and releasing slots. On shutdown, the
 /// session drops senders, then joins threads before dropping
-/// shared textures (ordering prevents CUDA error 700).
+/// shared buffers and semaphores (ordering prevents CUDA error 700).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub struct GpuDecodeHandles {
     /// Receives paired frame signals (slot indices).
     pub frame_rx: std::sync::mpsc::Receiver<GpuFrameSignal>,
     /// Join handles for the 2 decode threads + 1 pairing thread.
-    /// Must be joined before dropping shared textures to ensure
+    /// Must be joined before dropping shared allocations to ensure
     /// FFmpeg's CUDA context cleanup completes while shared memory
     /// is still valid.
     pub join_handles: Vec<std::thread::JoinHandle<()>>,

@@ -16,6 +16,10 @@ struct VramSlot {
     left_uv: wgpu::Texture,
     right_y: wgpu::Texture,
     right_uv: wgpu::Texture,
+    left_y_view: wgpu::TextureView,
+    left_uv_view: wgpu::TextureView,
+    right_y_view: wgpu::TextureView,
+    right_uv_view: wgpu::TextureView,
     left_bind_group: wgpu::BindGroup,
     right_bind_group: wgpu::BindGroup,
 }
@@ -26,6 +30,7 @@ pub(crate) struct VramPool {
     free: VecDeque<usize>,
     width: u32,
     height: u32,
+    bytes_per_sample: usize,
 }
 
 impl VramPool {
@@ -85,6 +90,11 @@ impl VramPool {
                 let right_y = create_tex(&format!("vram_R_Y_{i}"), y_format, width, height);
                 let right_uv =
                     create_tex(&format!("vram_R_UV_{i}"), uv_format, width / 2, height / 2);
+                let view_desc = wgpu::TextureViewDescriptor::default();
+                let left_y_view = left_y.create_view(&view_desc);
+                let left_uv_view = left_uv.create_view(&view_desc);
+                let right_y_view = right_y.create_view(&view_desc);
+                let right_uv_view = right_uv.create_view(&view_desc);
                 let left_bind_group =
                     pipeline.create_texture_bind_group(&left_y, &left_uv, &format!("vram_L_{i}"));
                 let right_bind_group =
@@ -94,6 +104,10 @@ impl VramPool {
                     left_uv,
                     right_y,
                     right_uv,
+                    left_y_view,
+                    left_uv_view,
+                    right_y_view,
+                    right_uv_view,
                     left_bind_group,
                     right_bind_group,
                 }
@@ -122,6 +136,7 @@ impl VramPool {
             free,
             width,
             height,
+            bytes_per_sample: pixel_format.bytes_per_sample(),
         })
     }
 
@@ -211,6 +226,130 @@ impl VramPool {
         gpu.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// Encode CUDA-shared buffer-to-texture copies for one stereo slot.
+    ///
+    /// The caller stages the matching Vulkan semaphore waits immediately
+    /// before submitting the returned command buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_copy_from_buffers(
+        &self,
+        gpu: &crate::gpu::GpuContext,
+        slot: usize,
+        src_left_y: &wgpu::Buffer,
+        left_y_pitch: usize,
+        src_left_uv: &wgpu::Buffer,
+        left_uv_pitch: usize,
+        src_right_y: &wgpu::Buffer,
+        right_y_pitch: usize,
+        src_right_uv: &wgpu::Buffer,
+        right_uv_pitch: usize,
+    ) -> Result<wgpu::CommandBuffer, String> {
+        let row_bytes = self.width as usize * self.bytes_per_sample;
+        let validate = |label: &str,
+                        buffer: &wgpu::Buffer,
+                        pitch: usize,
+                        rows: u32|
+         -> Result<u32, String> {
+            if pitch < row_bytes {
+                return Err(format!(
+                    "{label} pitch {pitch} is smaller than row bytes {row_bytes}"
+                ));
+            }
+            if pitch % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize != 0 {
+                return Err(format!(
+                    "{label} pitch {pitch} is not {}-byte aligned",
+                    wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+                ));
+            }
+            let required = pitch.checked_mul(rows as usize).ok_or_else(|| {
+                format!("{label} buffer size overflow: pitch={pitch}, rows={rows}")
+            })?;
+            if buffer.size() < required as u64 {
+                return Err(format!(
+                    "{label} buffer has {} bytes, requires {required}",
+                    buffer.size()
+                ));
+            }
+            u32::try_from(pitch).map_err(|_| format!("{label} pitch does not fit u32"))
+        };
+
+        let left_y_pitch = validate("left Y", src_left_y, left_y_pitch, self.height)?;
+        let left_uv_pitch = validate("left UV", src_left_uv, left_uv_pitch, self.height / 2)?;
+        let right_y_pitch = validate("right Y", src_right_y, right_y_pitch, self.height)?;
+        let right_uv_pitch =
+            validate("right UV", src_right_uv, right_uv_pitch, self.height / 2)?;
+
+        let dst = &self.slots[slot];
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cuda_buffer_to_vram_texture"),
+            });
+        let copy_plane = |encoder: &mut wgpu::CommandEncoder,
+                          src: &wgpu::Buffer,
+                          pitch: u32,
+                          dst: &wgpu::Texture,
+                          width: u32,
+                          height: u32| {
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: src,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(pitch),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: dst,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+
+        copy_plane(
+            &mut encoder,
+            src_left_y,
+            left_y_pitch,
+            &dst.left_y,
+            self.width,
+            self.height,
+        );
+        copy_plane(
+            &mut encoder,
+            src_left_uv,
+            left_uv_pitch,
+            &dst.left_uv,
+            self.width / 2,
+            self.height / 2,
+        );
+        copy_plane(
+            &mut encoder,
+            src_right_y,
+            right_y_pitch,
+            &dst.right_y,
+            self.width,
+            self.height,
+        );
+        copy_plane(
+            &mut encoder,
+            src_right_uv,
+            right_uv_pitch,
+            &dst.right_uv,
+            self.width / 2,
+            self.height / 2,
+        );
+
+        Ok(encoder.finish())
+    }
+
     /// Left bind group for rendering a pool slot.
     pub fn left_bind_group(&self, slot: usize) -> &wgpu::BindGroup {
         &self.slots[slot].left_bind_group
@@ -219,6 +358,24 @@ impl VramPool {
     /// Right bind group for rendering a pool slot.
     pub fn right_bind_group(&self, slot: usize) -> &wgpu::BindGroup {
         &self.slots[slot].right_bind_group
+    }
+
+    pub fn plane_views(
+        &self,
+        slot: usize,
+    ) -> (
+        &wgpu::TextureView,
+        &wgpu::TextureView,
+        &wgpu::TextureView,
+        &wgpu::TextureView,
+    ) {
+        let slot = &self.slots[slot];
+        (
+            &slot.left_y_view,
+            &slot.left_uv_view,
+            &slot.right_y_view,
+            &slot.right_uv_view,
+        )
     }
 
     /// Number of free slots available.
