@@ -28,9 +28,9 @@ use reco_core::source::{FrameSource, SourceError, SourceInfo, StereoFrame};
 /// on macOS, or CPU software decode as a fallback. The selection is
 /// transparent to the consumer.
 ///
-/// For GPU zero-copy paths, this source owns the shared textures and
-/// decode threads. The session creates bind groups from the source's
-/// textures at the start of `run()`.
+/// For the Linux GPU zero-copy path, this source owns the shared buffers,
+/// external semaphores, and decode threads. The session copies those buffers
+/// into ordinary rendering textures at the start of each frame.
 pub struct SmartFileSource {
     mode: SourceMode,
     info: SourceInfo,
@@ -121,8 +121,11 @@ struct LinuxZeroCopyState {
     /// Paired frame signal receiver. Made `Option` so Drop can take it
     /// early to unblock the pairing thread before joining decode threads.
     frame_rx: Option<std::sync::mpsc::Receiver<reco_core::interop::zero_copy::GpuFrameSignal>>,
-    /// Shared textures (kept alive until Drop).
+    /// Shared buffers and semaphores (kept alive until Drop).
     shared: reco_core::session::SharedTextureSet,
+    /// Retained queue/device used to consume semaphore signals for frames
+    /// skipped before the session frame loop starts.
+    gpu: reco_core::gpu::GpuContext,
     /// Decode thread join handles.
     join_handles: Vec<std::thread::JoinHandle<()>>,
     /// Shutdown flag checked by decode threads for graceful exit.
@@ -305,7 +308,9 @@ impl SmartFileSource {
         left_rotation: i32,
         right_rotation: i32,
     ) -> Result<Self, SourceError> {
-        use reco_core::interop::vulkan::{Nv12Plane, create_nv12_shared_texture};
+        use reco_core::interop::vulkan::{
+            Nv12Plane, create_nv12_shared_buffer, create_shared_semaphore,
+        };
         use reco_core::interop::zero_copy::GpuBufInfo;
         use reco_core::session::SharedTextureSet;
 
@@ -317,45 +322,48 @@ impl SmartFileSource {
         let input_width = info.width;
         let input_height = info.height;
 
-        // NVIDIA driver workaround for R16Unorm: see issue #134
-        let _warmup = if pixel_format == GpuPixelFormat::P010 {
-            let y = create_nv12_shared_texture(gpu, 16, 16, Nv12Plane::Y, pixel_format)
-                .map_err(|e| map_err(format!("warmup Y: {e}")))?;
-            let uv = create_nv12_shared_texture(gpu, 16, 16, Nv12Plane::Uv, pixel_format)
-                .map_err(|e| map_err(format!("warmup UV: {e}")))?;
-            Some((y, uv))
-        } else {
-            None
-        };
-
-        // Create double-buffered shared textures
+        // Create one shared Y/UV buffer pair per decode slot and camera.
         let create_pair = |label: &str| -> Result<_, SourceError> {
-            let y = create_nv12_shared_texture(
+            let y = create_nv12_shared_buffer(
                 gpu,
                 input_width,
                 input_height,
                 Nv12Plane::Y,
                 pixel_format,
+                &format!("cuda_shared_{label}_y"),
             )
-            .map_err(|e| map_err(format!("{label} Y: {e}")))?;
-            let uv = create_nv12_shared_texture(
+            .map_err(|e| map_err(format!("{label} Y buffer: {e}")))?;
+            let uv = create_nv12_shared_buffer(
                 gpu,
                 input_width,
                 input_height,
                 Nv12Plane::Uv,
                 pixel_format,
+                &format!("cuda_shared_{label}_uv"),
             )
-            .map_err(|e| map_err(format!("{label} UV: {e}")))?;
+            .map_err(|e| map_err(format!("{label} UV buffer: {e}")))?;
             Ok((y, uv))
         };
 
-        let (left_y_0, left_uv_0) = create_pair("left[0]")?;
-        let (left_y_1, left_uv_1) = create_pair("left[1]")?;
-        let (right_y_0, right_uv_0) = create_pair("right[0]")?;
-        let (right_y_1, right_uv_1) = create_pair("right[1]")?;
+        let (left_y_0, left_uv_0) = create_pair("left_0")?;
+        let (left_y_1, left_uv_1) = create_pair("left_1")?;
+        let (right_y_0, right_uv_0) = create_pair("right_0")?;
+        let (right_y_1, right_uv_1) = create_pair("right_1")?;
+
+        let semaphores = [
+            create_shared_semaphore(gpu)
+                .map_err(|e| map_err(format!("left slot 0 semaphore: {e}")))?,
+            create_shared_semaphore(gpu)
+                .map_err(|e| map_err(format!("left slot 1 semaphore: {e}")))?,
+            create_shared_semaphore(gpu)
+                .map_err(|e| map_err(format!("right slot 0 semaphore: {e}")))?,
+            create_shared_semaphore(gpu)
+                .map_err(|e| map_err(format!("right slot 1 semaphore: {e}")))?,
+        ];
 
         log::info!(
-            "SmartFileSource: GPU zero-copy ({input_width}x{input_height}, {pixel_format:?}), Y pitch={}/{}",
+            "SmartFileSource: CUDA shared-buffer zero-copy ({input_width}x{input_height}, \
+             {pixel_format:?}), Y pitch={}/{}",
             left_y_0.pitch,
             left_y_1.pitch
         );
@@ -368,6 +376,10 @@ impl SmartFileSource {
             width: input_width,
             height: input_height,
             pixel_format,
+            sem_cuda: [
+                semaphores[0].cuda_semaphore(),
+                semaphores[1].cuda_semaphore(),
+            ],
         };
         let right_buf = GpuBufInfo {
             y_ptr: [right_y_0.cuda_ptr, right_y_1.cuda_ptr],
@@ -377,6 +389,10 @@ impl SmartFileSource {
             width: input_width,
             height: input_height,
             pixel_format,
+            sem_cuda: [
+                semaphores[2].cuda_semaphore(),
+                semaphores[3].cuda_semaphore(),
+            ],
         };
 
         // Slot-free channels for backpressure
@@ -402,35 +418,25 @@ impl SmartFileSource {
             shutdown.clone(),
         );
 
-        // Build bind groups placeholder - session will create them from texture refs
-        // For now, we need a dummy bind group. Actually, the bind groups need the
-        // pipeline which we don't have. The session will create them via
-        // configure_gpu_source() when run() starts.
-        //
-        // Store textures in SharedTextureSet without bind groups.
-        // We'll need to split SharedTextureSet or use a different approach.
-        // For now, let's store the textures and bufs directly.
-
         let shared = SharedTextureSet {
-            textures: [
+            buffers: [
                 left_y_0, left_uv_0, left_y_1, left_uv_1, right_y_0, right_uv_0, right_y_1,
                 right_uv_1,
             ],
+            semaphores,
             left_buf,
             right_buf,
             left_slot_free_tx,
             right_slot_free_tx,
             left_slot_free_rx: None,
             right_slot_free_rx: None,
-            // Bind groups are created lazily by setup_gpu_source()
-            // when it sees None. The source doesn't have pipeline access.
-            bind_groups: None,
         };
 
         Ok(Self {
             mode: SourceMode::GpuZeroCopy(Box::new(LinuxZeroCopyState {
                 frame_rx: Some(decode_handles.frame_rx),
                 shared,
+                gpu: gpu.clone(),
                 join_handles: decode_handles.join_handles,
                 shutdown,
             })),
@@ -439,7 +445,7 @@ impl SmartFileSource {
             full_range,
             left_rotation,
             right_rotation,
-            decode_mode: "GPU zero-copy (CUDA/Vulkan)",
+            decode_mode: "GPU zero-copy (CUDA shared buffer/Vulkan)",
             exhausted: false,
         })
     }
@@ -543,10 +549,10 @@ impl SmartFileSource {
         self.decode_mode
     }
 
-    /// Access the shared texture set (GPU zero-copy only).
+    /// Access the shared-buffer set (GPU zero-copy only).
     ///
-    /// The session uses this to create bind groups at the start of `run()`.
-    /// Returns `None` for CPU-mode sources.
+    /// The session uses this to configure buffer copies, synchronization, and
+    /// CUDA detection pointers. Returns `None` for CPU-mode sources.
     #[cfg(target_os = "linux")]
     pub fn shared_texture_set(&self) -> Option<&reco_core::session::SharedTextureSet> {
         match &self.mode {
@@ -692,6 +698,20 @@ impl FrameSource for SmartFileSource {
                 for i in 0..count {
                     match rx.recv() {
                         Ok(signal) => {
+                            let semaphores = [
+                                state.shared.semaphores[signal.left_slot as usize].vk_semaphore(),
+                                state.shared.semaphores[2 + signal.right_slot as usize]
+                                    .vk_semaphore(),
+                            ];
+                            reco_core::interop::vulkan::consume_cuda_semaphore_signals(
+                                &state.gpu,
+                                &semaphores,
+                            )
+                            .map_err(|error| SourceError::Read {
+                                reason: format!(
+                                    "consume CUDA/Vulkan synchronization for skipped frame: {error}"
+                                ),
+                            })?;
                             let _ = left_tx.send(signal.left_slot);
                             let _ = right_tx.send(signal.right_slot);
                         }

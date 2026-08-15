@@ -139,6 +139,39 @@ type CUmemGenericAllocationHandle = u64;
 #[cfg(target_os = "windows")]
 type CUexternalMemory = *mut c_void;
 
+/// Opaque CUDA external semaphore handle (`CUexternalSemaphore`).
+#[cfg(target_os = "linux")]
+type CUexternalSemaphoreRaw = *mut c_void;
+
+#[cfg(target_os = "linux")]
+const CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD: u32 = 1;
+
+/// Linux opaque-fd branch of `CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC`.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct CudaExternalSemaphoreHandleDesc {
+    handle_type: u32,
+    _pad_before_union: u32,
+    fd: i32,
+    _union_pad: [u8; 12],
+    flags: u32,
+    reserved: [u32; 16],
+    _tail_pad: [u8; 4],
+}
+
+/// `CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS` for a binary semaphore.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct CudaExternalSemaphoreSignalParams {
+    fence_value: u64,
+    nv_sci_sync: u64,
+    keyed_mutex_key: u64,
+    params_reserved: [u32; 12],
+    flags: u32,
+    reserved: [u32; 16],
+    _tail_pad: [u8; 4],
+}
+
 /// External memory handle type: D3D11 resource shared via NT handle.
 #[cfg(target_os = "windows")]
 const CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_RESOURCE: u32 = 4;
@@ -251,6 +284,22 @@ struct CudaFunctions {
     ) -> CUresult,
     #[cfg(target_os = "windows")]
     cu_destroy_external_memory: unsafe extern "C" fn(CUexternalMemory) -> CUresult,
+
+    // CUDA signals Vulkan-exported binary semaphores after decode copies.
+    #[cfg(target_os = "linux")]
+    cu_import_external_semaphore: unsafe extern "C" fn(
+        *mut CUexternalSemaphoreRaw,
+        *const CudaExternalSemaphoreHandleDesc,
+    ) -> CUresult,
+    #[cfg(target_os = "linux")]
+    cu_signal_external_semaphores_async: unsafe extern "C" fn(
+        *const CUexternalSemaphoreRaw,
+        *const CudaExternalSemaphoreSignalParams,
+        u32,
+        CUstream,
+    ) -> CUresult,
+    #[cfg(target_os = "linux")]
+    cu_destroy_external_semaphore: unsafe extern "C" fn(CUexternalSemaphoreRaw) -> CUresult,
 
     // Module / kernel launch
     cu_module_load_data: unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult,
@@ -366,6 +415,15 @@ impl CudaFunctions {
                 ),
                 #[cfg(target_os = "windows")]
                 cu_destroy_external_memory: load_sym!(lib_cuda, "cuDestroyExternalMemory"),
+                #[cfg(target_os = "linux")]
+                cu_import_external_semaphore: load_sym!(lib_cuda, "cuImportExternalSemaphore"),
+                #[cfg(target_os = "linux")]
+                cu_signal_external_semaphores_async: load_sym!(
+                    lib_cuda,
+                    "cuSignalExternalSemaphoresAsync"
+                ),
+                #[cfg(target_os = "linux")]
+                cu_destroy_external_semaphore: load_sym!(lib_cuda, "cuDestroyExternalSemaphore"),
                 cu_module_load_data: load_sym!(lib_cuda, "cuModuleLoadData"),
                 cu_module_unload: load_sym!(lib_cuda, "cuModuleUnload"),
                 cu_module_get_function: load_sym!(lib_cuda, "cuModuleGetFunction"),
@@ -449,7 +507,7 @@ impl Drop for CudaSharedMemory {
         }
         // Note: shared_handle (fd) is NOT closed here. Vulkan's vkAllocateMemory
         // with VkImportMemoryFdInfoKHR takes ownership of the fd per the spec.
-        // It is closed when vkFreeMemory runs (via the SharedTexture drop_callback).
+        // It is closed when the imported Vulkan memory is freed.
     }
 }
 
@@ -601,6 +659,100 @@ pub fn cuda_synchronize() -> Result<(), CudaInteropError> {
         check_cuda("cuCtxSynchronize", (cuda.cu_ctx_synchronize)())?;
     }
     Ok(())
+}
+
+/// CUDA's imported handle for a Vulkan binary semaphore.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+pub struct CudaExternalSemaphore(CUexternalSemaphoreRaw);
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for CudaExternalSemaphore {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for CudaExternalSemaphore {}
+
+/// Import a Vulkan `OPAQUE_FD` semaphore into CUDA.
+///
+/// CUDA consumes `fd` on success. This function closes it on every error path.
+#[cfg(target_os = "linux")]
+pub fn cuda_import_external_semaphore(
+    fd: std::os::raw::c_int,
+) -> Result<CudaExternalSemaphore, CudaInteropError> {
+    if let Err(error) = cuda_ensure_context() {
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+
+    let desc = CudaExternalSemaphoreHandleDesc {
+        handle_type: CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD,
+        _pad_before_union: 0,
+        fd,
+        _union_pad: [0; 12],
+        flags: 0,
+        reserved: [0; 16],
+        _tail_pad: [0; 4],
+    };
+    let cuda = match cuda() {
+        Ok(cuda) => cuda,
+        Err(error) => {
+            unsafe { libc::close(fd) };
+            return Err(error);
+        }
+    };
+    let mut semaphore: CUexternalSemaphoreRaw = std::ptr::null_mut();
+    unsafe {
+        if let Err(error) = check_cuda(
+            "cuImportExternalSemaphore",
+            (cuda.cu_import_external_semaphore)(&mut semaphore, &desc),
+        ) {
+            libc::close(fd);
+            return Err(error);
+        }
+    }
+    Ok(CudaExternalSemaphore(semaphore))
+}
+
+/// Signal a Vulkan-imported binary semaphore on CUDA's default stream.
+#[cfg(target_os = "linux")]
+pub fn cuda_signal_external_semaphore(
+    semaphore: CudaExternalSemaphore,
+) -> Result<(), CudaInteropError> {
+    let params = CudaExternalSemaphoreSignalParams {
+        fence_value: 0,
+        nv_sci_sync: 0,
+        keyed_mutex_key: 0,
+        params_reserved: [0; 12],
+        flags: 0,
+        reserved: [0; 16],
+        _tail_pad: [0; 4],
+    };
+    let cuda = cuda()?;
+    unsafe {
+        check_cuda(
+            "cuSignalExternalSemaphoresAsync",
+            (cuda.cu_signal_external_semaphores_async)(
+                &semaphore.0,
+                &params,
+                1,
+                std::ptr::null_mut(),
+            ),
+        )
+    }
+}
+
+/// Destroy CUDA's imported external-semaphore handle.
+#[cfg(target_os = "linux")]
+pub fn cuda_destroy_external_semaphore(
+    semaphore: CudaExternalSemaphore,
+) -> Result<(), CudaInteropError> {
+    cuda_ensure_context()?;
+    let cuda = cuda()?;
+    unsafe {
+        check_cuda(
+            "cuDestroyExternalSemaphore",
+            (cuda.cu_destroy_external_semaphore)(semaphore.0),
+        )
+    }
 }
 
 /// Query (free, total) device memory in bytes via the CUDA driver.

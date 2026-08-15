@@ -37,5 +37,11 @@ tracing-log = "0.2"
 strip = true
 lto = "thin"
 
-# SPIKE: wgpu 28 interop with Slint. Fork removed; if wgpu 28 doesn't
-# have the shaderDrawParameters regression, no patch is needed.
+# Linux CUDA/Vulkan shared-buffer interop needs the Vulkan queue wait
+# backport plus VK_KHR_external_semaphore_fd enablement. Keep the tightly
+# coupled wgpu quartet on one source/revision to avoid duplicate wgpu-types.
+[patch.crates-io]
+wgpu       = { git = "https://github.com/JhnsonO/wgpu", rev = "d74e00f2415e55c0f09a87b0497d66d8192a44bb" }
+wgpu-core  = { git = "https://github.com/JhnsonO/wgpu", rev = "d74e00f2415e55c0f09a87b0497d66d8192a44bb" }
+wgpu-hal   = { git = "https://github.com/JhnsonO/wgpu", rev = "d74e00f2415e55c0f09a87b0497d66d8192a44bb" }
+wgpu-types = { git = "https://github.com/JhnsonO/wgpu", rev = "d74e00f2415e55c0f09a87b0497d66d8192a44bb" }

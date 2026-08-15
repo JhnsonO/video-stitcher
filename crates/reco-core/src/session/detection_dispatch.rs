@@ -64,15 +64,16 @@ impl StitchSession {
                         } else {
                             vec![]
                         }
-                    } else if let Some(ref views) = self.gpu_shared_views {
-                        let ls = *left_slot as usize;
-                        let rs = *right_slot as usize;
+                    } else if let (Some(pool), Some(vram_slot)) =
+                        (self.vram_pool.as_ref(), self.current_vram_slot)
+                    {
+                        let (left_y, left_uv, right_y, right_uv) = pool.plane_views(vram_slot);
                         let (w, h) = self.core.pipeline().source_info();
                         self.detection.run_detection_wgpu_nv12(
-                            &views[ls * 2],
-                            &views[ls * 2 + 1],
-                            &views[4 + rs * 2],
-                            &views[4 + rs * 2 + 1],
+                            left_y,
+                            left_uv,
+                            right_y,
+                            right_uv,
                             w,
                             h,
                             self.left_rotation,
