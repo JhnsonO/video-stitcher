@@ -4,7 +4,7 @@
 //! into a clean [`WorldState`](reco_core::detect::tracker::WorldState) with
 //! stable identities and lifecycle flags; [`panners`] turn that world
 //! state into a virtual-camera [`ViewportPosition`](reco_core::detect::director::ViewportPosition).
-//! Detector backends live in [`reco_detect`] and are re-exported at
+//! Detector backends live in reco-detect and are re-exported at
 //! crate root for convenience but are not owned here.
 //!
 //! # What this crate owns
@@ -75,6 +75,8 @@ pub use tracking_mode::TrackingMode;
 use std::io;
 use std::path::Path;
 
+const MAX_TEST_FRAME_STRIDE: u64 = 64;
+
 /// Verify that an AI model file or model directory exists.
 ///
 /// Call this at user-input boundaries before opening video sources. Regular
@@ -87,6 +89,58 @@ pub fn validate_model_path(path: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Testing-only full-pipeline stride shared with `SmartFileSource`.
+/// Invalid values fail closed to 1 so production behavior cannot be changed
+/// accidentally by a malformed environment value.
+fn test_frame_stride_from_env() -> u64 {
+    let Ok(raw) = std::env::var("RECO_TEST_FRAME_STRIDE") else {
+        return 1;
+    };
+    match raw.parse::<u64>() {
+        Ok(value @ 1..=MAX_TEST_FRAME_STRIDE) => value,
+        _ => {
+            log::warn!(
+                "Autocam ignoring invalid RECO_TEST_FRAME_STRIDE={raw:?}; expected integer 1..={MAX_TEST_FRAME_STRIDE}. Using stride 1."
+            );
+            1
+        }
+    }
+}
+
+/// Rebase an EMA alpha from one source-frame step to `stride` source-frame
+/// steps while preserving its continuous-time response.
+fn stride_alpha(alpha: f32, stride: u64) -> f32 {
+    if stride <= 1 {
+        return alpha;
+    }
+    1.0 - (1.0 - alpha).powf(stride as f32)
+}
+
+/// Rebase FieldPanner parameters whose units are explicitly "per frame".
+/// Geometric thresholds/weights stay unchanged; max velocity is handled by
+/// constructing the panner with the effective processed FPS below.
+fn rebase_panner_config_for_stride(
+    mut config: crate::panners::FieldPannerConfig,
+    stride: u64,
+) -> crate::panners::FieldPannerConfig {
+    if stride <= 1 {
+        return config;
+    }
+    config.cluster_alpha = stride_alpha(config.cluster_alpha, stride);
+    config.fov_alpha = stride_alpha(config.fov_alpha, stride);
+    config.velocity_alpha = stride_alpha(config.velocity_alpha, stride);
+    config.lead_alpha = stride_alpha(config.lead_alpha, stride);
+    config.ball_presence_attack = stride_alpha(config.ball_presence_attack, stride);
+    config.ball_presence_decay = config.ball_presence_decay.powf(stride as f32);
+    config
+}
+
+fn coast_frames_for_stride(stride: u64) -> u32 {
+    let stride = stride.max(1);
+    let base = crate::trackers::ball::DEFAULT_COAST_FRAMES as u64;
+    base.div_ceil(stride).max(1) as u32
 }
 
 /// Set up automatic camera control on any [`DetectionTarget`](reco_core::detect::DetectionTarget).
@@ -216,6 +270,15 @@ pub fn setup_autocam(
     let tracking_mode = config.tracking_mode;
     let field_roi = config.field_roi.as_ref();
     let is_10bit = config.is_10bit;
+    let test_frame_stride = test_frame_stride_from_env();
+    let panner_fps = fps / test_frame_stride as f32;
+    let coast_frames = coast_frames_for_stride(test_frame_stride);
+    if test_frame_stride > 1 {
+        log::info!(
+            "Autocam test stride timing: source_fps={fps:.3}, stride={test_frame_stride}, \
+             effective_processed_fps={panner_fps:.3}, ball_coast_frames={coast_frames}"
+        );
+    }
 
     let mut detection_active = false;
 
@@ -508,8 +571,9 @@ pub fn setup_autocam(
 
         match tracking_mode {
             TrackingMode::Field => {
-                let ball_tracker =
-                    crate::trackers::BallTracker::new(ball_id).with_max_jump_rad(0.8);
+                let ball_tracker = crate::trackers::BallTracker::new(ball_id)
+                    .with_max_jump_rad(0.8)
+                    .with_max_coast_frames(coast_frames);
                 target.set_ball_tracker(Box::new(ball_tracker));
 
                 // Attach the player provider only when the model actually
@@ -539,18 +603,20 @@ pub fn setup_autocam(
                         ..Default::default()
                     },
                 );
+                let fp_config = rebase_panner_config_for_stride(fp_config, test_frame_stride);
                 log::info!(
                     "FieldPanner: framing={:?}, confidence_weighted={}, lock_pitch={}",
                     fp_config.framing,
                     fp_config.confidence_weighted,
                     fp_config.lock_pitch,
                 );
-                let field_panner = crate::panners::FieldPanner::with_config(fps, fp_config);
+                let field_panner = crate::panners::FieldPanner::with_config(panner_fps, fp_config);
                 target.set_panner(Box::new(field_panner));
             }
             TrackingMode::Ball => {
-                let ball_tracker =
-                    crate::trackers::BallTracker::new(ball_id).with_max_jump_rad(0.5);
+                let ball_tracker = crate::trackers::BallTracker::new(ball_id)
+                    .with_max_jump_rad(0.5)
+                    .with_max_coast_frames(coast_frames);
                 // No player provider - ball-only mode, even if the model
                 // has a player class (the user asked to track the ball).
                 target.set_ball_tracker(Box::new(ball_tracker));
@@ -564,7 +630,8 @@ pub fn setup_autocam(
                 // still comes from the supplied override.
                 let mut fp_config = config.field_panner_config.clone().unwrap_or_default();
                 fp_config.ball_weight = 1.0;
-                let panner = crate::panners::FieldPanner::with_config(fps, fp_config);
+                let fp_config = rebase_panner_config_for_stride(fp_config, test_frame_stride);
+                let panner = crate::panners::FieldPanner::with_config(panner_fps, fp_config);
 
                 log::info!(
                     "Tracking mode: ball-only (BallTracker + FieldPanner, \
@@ -632,5 +699,33 @@ mod tests {
             validate_model_path(Path::new("")).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn stride_one_panner_rebase_is_identity() {
+        let config = crate::panners::FieldPannerConfig::broadcast();
+        assert_eq!(rebase_panner_config_for_stride(config.clone(), 1), config);
+        assert_eq!(coast_frames_for_stride(1), crate::trackers::ball::DEFAULT_COAST_FRAMES);
+    }
+
+    #[test]
+    fn stride_rebase_preserves_per_source_time_constants() {
+        let mut config = crate::panners::FieldPannerConfig::broadcast();
+        config.cluster_alpha = 0.10;
+        config.fov_alpha = 0.20;
+        config.velocity_alpha = 0.30;
+        config.lead_alpha = 0.40;
+        config.ball_presence_attack = 0.15;
+        config.ball_presence_decay = 0.90;
+        let rebased = rebase_panner_config_for_stride(config, 2);
+        assert!((rebased.cluster_alpha - 0.19).abs() < 1e-6);
+        assert!((rebased.fov_alpha - 0.36).abs() < 1e-6);
+        assert!((rebased.velocity_alpha - 0.51).abs() < 1e-6);
+        assert!((rebased.lead_alpha - 0.64).abs() < 1e-6);
+        assert!((rebased.ball_presence_attack - 0.2775).abs() < 1e-6);
+        assert!((rebased.ball_presence_decay - 0.81).abs() < 1e-6);
+        assert_eq!(coast_frames_for_stride(2), 10);
+        assert_eq!(coast_frames_for_stride(3), 7);
+        assert_eq!(coast_frames_for_stride(4), 5);
     }
 }
