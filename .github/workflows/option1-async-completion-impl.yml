@@ -45,7 +45,7 @@ jobs:
         run: cargo check --release --locked -p reco-cli --features cuda
 
       - name: Targeted NV12 P010 copy alignment test
-        run: cargo test --locked -p reco-core --features cuda nv12_and_p010_plane_pitches_are_copy_aligned -- --nocapture
+        run: cargo test --locked -p reco-core nv12_and_p010_plane_pitches_are_copy_aligned -- --nocapture
 
       - name: Commit proven source changes
         run: |
