@@ -783,6 +783,14 @@ impl StitchSession {
                 // --lookahead. See docs/ai-project-state.md for the full
                 // chain.
                 if produce_index == 0 && std::env::var("RECO_DEBUG_DUMP_FRAME").is_ok() {
+                    // ZC_EXP6 (diagnostic-only, avenue 1): validate the
+                    // ZC_EXP4 readback mechanism itself against
+                    // Vulkan/wgpu-NATIVE textures (not CUDA-imported)
+                    // holding a known deterministic pattern, on the same
+                    // device/queue, at the same call site, via the exact
+                    // same helper. If these come back zero/wrong, every
+                    // prior zero readback is unmeasured, not evidence.
+                    zc_exp6_native_readback_control(&gpu.device, &gpu.queue);
                     zc_exp4_readback_texture(
                         &gpu.device,
                         &gpu.queue,
@@ -1068,4 +1076,91 @@ fn zc_exp4_readback_texture(
         Err(e) => log::error!("ZC_EXP4: {label} map channel recv failed: {e}"),
     }
     staging.unmap();
+}
+
+/// ZC_EXP6 (diagnostic-only, avenue 1): control experiment for the
+/// ZC_EXP4 readback mechanism. Two sub-controls, both on plain
+/// wgpu-native textures (created via `device.create_texture`, never
+/// imported/shared):
+///   A. `zc_exp6_control_native`  — write a deterministic pattern
+///      (`i % 256`) via `queue.write_texture`, read it back through the
+///      exact same `zc_exp4_readback_texture` helper.
+///   B. `zc_exp6_control_copy_dst` — additionally route the pattern
+///      through `copy_texture_to_texture` (one encoder, one submit, one
+///      `device.poll(wait_indefinitely())` — mirroring
+///      `VramPool::copy_from_textures`) into a second native texture,
+///      then read THAT back via the same helper.
+/// Expected for both: min=0 max=255 mean=127.50, and a byte-exact match
+/// against the pattern in the dumped `.raw` (verified by the remote
+/// script). Read-only w.r.t. the real pipeline; no shared/external
+/// memory code touched.
+#[cfg(target_os = "linux")]
+fn zc_exp6_native_readback_control(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let w: u32 = 256;
+    let h: u32 = 64;
+    let extent = wgpu::Extent3d {
+        width: w,
+        height: h,
+        depth_or_array_layers: 1,
+    };
+    let desc = |label: &'static str| wgpu::TextureDescriptor {
+        label: Some(label),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    };
+    let tex_a = device.create_texture(&desc("zc_exp6_control_native"));
+    let pattern: Vec<u8> = (0..(w * h) as usize).map(|i| (i % 256) as u8).collect();
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex_a,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pattern,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w),
+            rows_per_image: Some(h),
+        },
+        extent,
+    );
+    log::warn!(
+        "ZC_EXP6: wrote i%256 pattern to native R8Unorm {w}x{h}; expected readback min=0 max=255 mean=127.50 nonzero_bytes={}/{}",
+        (w * h) as usize - (w * h) as usize / 256,
+        (w * h) as usize
+    );
+    // Sub-control A: direct readback of the written native texture.
+    zc_exp4_readback_texture(device, queue, &tex_a, "zc_exp6_control_native");
+
+    // Sub-control B: native->native copy_texture_to_texture, mirroring
+    // the copy_from_textures() encode/submit/poll shape, then readback
+    // of the destination.
+    let tex_b = device.create_texture(&desc("zc_exp6_control_copy_dst"));
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("zc_exp6_control_copy_encoder"),
+    });
+    encoder.copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex_a,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex_b,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        extent,
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    zc_exp4_readback_texture(device, queue, &tex_b, "zc_exp6_control_copy_dst");
 }
