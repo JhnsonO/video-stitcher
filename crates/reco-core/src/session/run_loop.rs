@@ -88,7 +88,16 @@ fn bridge_ball(
 ) {
     use crate::detect::tracker::{TrackState, TrackedEntity};
 
-    if frame.world_state.ball.is_none() {
+    // Bridge candidates: no detection this frame (`None`), or the coast
+    // budget already froze the position (`Coasting`). Never re-bridge an
+    // already-`Bridged` value and never touch `Tracking` (a genuine
+    // detection this frame needs no help).
+    let needs_bridge = match frame.world_state.ball {
+        None => true,
+        Some(b) => b.state == TrackState::Coasting,
+    };
+
+    if needs_bridge {
         if let Some((anchor_index, anchor_yaw, anchor_pitch)) = *anchor {
             let found = lookahead.iter().enumerate().find_map(|(k, ws)| {
                 ws.ball
