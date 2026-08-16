@@ -118,9 +118,10 @@ impl CameraRecoveryState {
             return;
         };
         if let Some((last_x, last_y)) = self.last_center {
+            let elapsed = self.misses.saturating_add(1) as f32;
             self.velocity = (
-                (chosen.center_x - last_x).clamp(-0.08, 0.08),
-                (chosen.center_y - last_y).clamp(-0.08, 0.08),
+                ((chosen.center_x - last_x) / elapsed).clamp(-0.08, 0.08),
+                ((chosen.center_y - last_y) / elapsed).clamp(-0.08, 0.08),
             );
         }
         self.last_center = Some((chosen.center_x, chosen.center_y));
@@ -846,5 +847,17 @@ mod tests {
         let predicted = state.predicted_center().unwrap();
         assert!((predicted.0 - 0.43).abs() < 1e-6);
         assert!((predicted.1 - 0.44).abs() < 1e-6);
+    }
+
+    #[test]
+    fn recovery_velocity_is_normalized_by_elapsed_frames() {
+        let mut state = CameraRecoveryState {
+            last_center: Some((0.4, 0.5)),
+            velocity: (0.0, 0.0),
+            misses: 3,
+        };
+        state.observe(&[detection(0.44, 0.46, 0.8)], 32);
+        assert!((state.velocity.0 - 0.01).abs() < 1e-6);
+        assert!((state.velocity.1 + 0.01).abs() < 1e-6);
     }
 }
