@@ -663,9 +663,7 @@ impl OrtGpuDetector {
                             break;
                         }
                     }
-                    if !recovered
-                        && let Some(recovery) = self.ball_recovery.as_mut()
-                    {
+                    if !recovered && let Some(recovery) = self.ball_recovery.as_mut() {
                         let state = recovery.state_mut(camera);
                         state.misses = state.misses.saturating_add(1);
                         recovery.stats.exhausted += 1;
