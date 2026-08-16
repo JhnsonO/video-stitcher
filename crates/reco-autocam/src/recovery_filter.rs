@@ -126,11 +126,7 @@ fn choose_candidate<'a>(
         .copied()
 }
 
-fn observe_provisional(
-    state: &mut ProvisionalState,
-    candidate: (f32, f32),
-    call_index: u64,
-) {
+fn observe_provisional(state: &mut ProvisionalState, candidate: (f32, f32), call_index: u64) {
     // A raw outside-ROI candidate can be followed by a forced native-crop
     // candidate in the same detector call. Those are two observations of the
     // same source frame, not temporal confirmation. Keep the freshest point
