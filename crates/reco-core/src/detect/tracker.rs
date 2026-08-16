@@ -53,6 +53,15 @@ pub enum TrackState {
     /// [`WorldState`] next frame. Singletons (e.g. ball) use this as
     /// a not-present signal; panners typically recenter on `Lost`.
     Lost,
+    /// No fresh detection this frame and the coast budget was already
+    /// exhausted (would otherwise be `Lost`), but a genuine detection both
+    /// before and after this frame made a plausible interpolated position
+    /// available. Position is linearly interpolated between two real,
+    /// non-predicted detections -- never extrapolated or velocity-based.
+    /// Additive on top of the coast state machine; entities never
+    /// transition through this state internally, it is only assigned by
+    /// backward-bridging in the buffered lookahead loop.
+    Bridged,
 }
 
 /// A single entity (ball, player, referee, …) tracked across frames.
