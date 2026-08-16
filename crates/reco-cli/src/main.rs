@@ -220,6 +220,11 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         frame_stride: u64,
 
+        /// When the normal detector pass has no ball, retry native-resolution
+        /// crops around the predicted ball position (CUDA ORT backend only).
+        #[arg(long)]
+        high_res_ball_recovery: bool,
+
         /// Lookahead buffer in seconds. Decodes N frames ahead so the
         /// panner can lead the play and the loop can centered-smooth the
         /// pose lag-free. The validated dead-zone/reactivity defaults
@@ -798,6 +803,7 @@ fn main() -> anyhow::Result<()> {
             model,
             detection_interval,
             frame_stride,
+            high_res_ball_recovery,
             lookahead,
             tracking,
             quality_value,
@@ -835,6 +841,7 @@ fn main() -> anyhow::Result<()> {
                 model_path: model.as_deref(),
                 detection_interval,
                 frame_stride,
+                high_res_ball_recovery,
                 lookahead,
                 tracking_mode: &tracking,
                 quality_value,

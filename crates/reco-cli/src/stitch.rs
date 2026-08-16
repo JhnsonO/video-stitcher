@@ -40,6 +40,8 @@ pub struct StitchArgs<'a> {
     pub model_path: Option<&'a str>,
     pub detection_interval: u64,
     pub frame_stride: u64,
+    /// Retry missing balls using native-resolution CUDA crops.
+    pub high_res_ball_recovery: bool,
     pub lookahead: f64,
     pub tracking_mode: &'a str,
     pub quality_value: Option<u8>,
@@ -304,6 +306,7 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
         let model_path = model_path.to_owned();
         let interval = args.detection_interval;
         let frame_stride = args.frame_stride;
+        let high_res_ball_recovery = args.high_res_ball_recovery;
         let mode_str = args.tracking_mode.to_owned();
         let allow_fallback = args.allow_no_tracking;
         let tracking_failed = Arc::clone(&tracking_failed);
@@ -362,6 +365,7 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
                 .with_tracking_mode(mode)
                 .with_detection_interval(interval)
                 .with_frame_stride(frame_stride)
+                .with_high_res_ball_recovery(high_res_ball_recovery)
                 .with_10bit(is_10bit);
             if mode == reco_autocam::TrackingMode::Ball {
                 autocam_config.confidence_threshold = Some(0.25);
