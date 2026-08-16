@@ -25,6 +25,7 @@ struct ProvisionalState {
     last: Option<(f32, f32)>,
     confirmations: u8,
     stationary: u8,
+    last_call_index: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -125,6 +126,39 @@ fn choose_candidate<'a>(
         .copied()
 }
 
+fn observe_provisional(
+    state: &mut ProvisionalState,
+    candidate: (f32, f32),
+    call_index: u64,
+) {
+    // A raw outside-ROI candidate can be followed by a forced native-crop
+    // candidate in the same detector call. Those are two observations of the
+    // same source frame, not temporal confirmation. Keep the freshest point
+    // for the next frame, but never advance confirmation/stationary counters
+    // twice within one analysis call.
+    if state.last_call_index == call_index {
+        state.last = Some(candidate);
+        return;
+    }
+
+    match state.last {
+        Some(last) if distance(last, candidate) <= PROVISIONAL_LINK_DISTANCE => {
+            state.confirmations = state.confirmations.saturating_add(1);
+            if distance(last, candidate) <= PROVISIONAL_MIN_MOTION {
+                state.stationary = state.stationary.saturating_add(1);
+            } else {
+                state.stationary = 0;
+            }
+        }
+        _ => {
+            state.confirmations = 1;
+            state.stationary = 0;
+        }
+    }
+    state.last = Some(candidate);
+    state.last_call_index = call_index;
+}
+
 /// Decorator used only for the opt-in CUDA high-resolution ball recovery path.
 /// Candidate generation stays in `OrtGpuDetector`; trusted state mutation only
 /// happens after this layer accepts a candidate.
@@ -210,26 +244,11 @@ impl ValidatedBallRecoveryDetector {
         }
 
         let state = &mut self.provisional[idx];
-        match state.last {
-            Some(last)
-                if distance(last, (candidate.center_x, candidate.center_y))
-                    <= PROVISIONAL_LINK_DISTANCE =>
-            {
-                state.confirmations = state.confirmations.saturating_add(1);
-                if distance(last, (candidate.center_x, candidate.center_y))
-                    <= PROVISIONAL_MIN_MOTION
-                {
-                    state.stationary = state.stationary.saturating_add(1);
-                } else {
-                    state.stationary = 0;
-                }
-            }
-            _ => {
-                state.confirmations = 1;
-                state.stationary = 0;
-            }
-        }
-        state.last = Some((candidate.center_x, candidate.center_y));
+        observe_provisional(
+            state,
+            (candidate.center_x, candidate.center_y),
+            self.call_index,
+        );
 
         if state.stationary >= STATIONARY_OUTSIDE_LIMIT {
             *state = ProvisionalState::default();
@@ -351,6 +370,19 @@ mod tests {
         let candidates = [far, near];
         let chosen = choose_candidate(candidates.iter(), Some((0.50, 0.50))).unwrap();
         assert!((chosen.center_x - near.center_x).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn same_analysis_call_cannot_double_confirm_provisional_ball() {
+        let mut state = ProvisionalState::default();
+        observe_provisional(&mut state, (0.50, 0.10), 7);
+        assert_eq!(state.confirmations, 1);
+        observe_provisional(&mut state, (0.51, 0.10), 7);
+        assert_eq!(state.confirmations, 1);
+        assert_eq!(state.last, Some((0.51, 0.10)));
+
+        observe_provisional(&mut state, (0.52, 0.10), 9);
+        assert_eq!(state.confirmations, 2);
     }
 
     #[test]
