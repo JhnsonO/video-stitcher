@@ -407,8 +407,7 @@ pub fn setup_autocam(
             is_10bit,
         ) {
             Ok(Some(gpu_det)) => {
-                let gpu_det = gpu_det
-                    .with_high_res_ball_recovery(config.high_res_ball_recovery);
+                let gpu_det = gpu_det.with_high_res_ball_recovery(config.high_res_ball_recovery);
                 let detector: Box<dyn reco_core::detect::detector::UnifiedDetector> =
                     if let Some(roi) = effective_roi.clone() {
                         wrap_with_roi(Box::new(gpu_det), roi)
