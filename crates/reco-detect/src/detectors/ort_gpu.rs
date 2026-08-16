@@ -83,14 +83,35 @@ impl CropRegion {
     fn tiled_2x2(width: u32, height: u32) -> [Self; 4] {
         let even_size = |value: u32| value.max(2) & !1;
         let crop_width = even_size(((width as f32 * TILED_CROP_RATIO).round() as u32).min(width));
-        let crop_height = even_size(((height as f32 * TILED_CROP_RATIO).round() as u32).min(height));
+        let crop_height =
+            even_size(((height as f32 * TILED_CROP_RATIO).round() as u32).min(height));
         let max_x = width.saturating_sub(crop_width) & !1;
         let max_y = height.saturating_sub(crop_height) & !1;
         [
-            Self { x: 0, y: 0, width: crop_width, height: crop_height },
-            Self { x: max_x, y: 0, width: crop_width, height: crop_height },
-            Self { x: 0, y: max_y, width: crop_width, height: crop_height },
-            Self { x: max_x, y: max_y, width: crop_width, height: crop_height },
+            Self {
+                x: 0,
+                y: 0,
+                width: crop_width,
+                height: crop_height,
+            },
+            Self {
+                x: max_x,
+                y: 0,
+                width: crop_width,
+                height: crop_height,
+            },
+            Self {
+                x: 0,
+                y: max_y,
+                width: crop_width,
+                height: crop_height,
+            },
+            Self {
+                x: max_x,
+                y: max_y,
+                width: crop_width,
+                height: crop_height,
+            },
         ]
     }
 
@@ -484,7 +505,8 @@ impl OrtGpuDetector {
             return;
         };
         let previous_misses = recovery.cameras[camera_index(camera)].misses;
-        recovery.state_mut(camera).observe(accepted, recovery.class_id);
+        let class_id = recovery.class_id;
+        recovery.state_mut(camera).observe(accepted, class_id);
         recovery.stats.commits += 1;
         if previous_misses > 0 {
             log::info!(
@@ -497,10 +519,8 @@ impl OrtGpuDetector {
         let Some(recovery) = self.ball_recovery.as_mut() else {
             return;
         };
-        recovery.state_mut(camera).misses = recovery
-            .state_mut(camera)
-            .misses
-            .saturating_add(1);
+        let state = recovery.state_mut(camera);
+        state.misses = state.misses.saturating_add(1);
         recovery.stats.rejects += 1;
     }
 
@@ -529,7 +549,9 @@ impl OrtGpuDetector {
                 frame.width,
                 frame.height / 2,
             )
-            .map_err(|e| DetectorError::InferenceFailed(format!("P010->NV12 UV conversion: {e}")))?;
+            .map_err(|e| {
+                DetectorError::InferenceFailed(format!("P010->NV12 UV conversion: {e}"))
+            })?;
             Ok((
                 self.nv12_8bit_y,
                 frame.width as usize,
@@ -620,7 +642,10 @@ impl OrtGpuDetector {
                         region.width,
                         region.height,
                         recovered_balls.len(),
-                        recovered_balls.iter().map(|d| d.confidence).fold(0.0f32, f32::max),
+                        recovered_balls
+                            .iter()
+                            .map(|d| d.confidence)
+                            .fold(0.0f32, f32::max),
                     );
                     return Ok(recovered_balls);
                 }
@@ -676,7 +701,10 @@ impl OrtGpuDetector {
                         region.width,
                         region.height,
                         recovered_balls.len(),
-                        recovered_balls.iter().map(|d| d.confidence).fold(0.0f32, f32::max),
+                        recovered_balls
+                            .iter()
+                            .map(|d| d.confidence)
+                            .fold(0.0f32, f32::max),
                     );
                     return Ok(recovered_balls);
                 }
@@ -882,8 +910,24 @@ mod tests {
     #[test]
     fn tiled_search_covers_full_frame_with_overlap() {
         let tiles = CropRegion::tiled_2x2(3840, 2160);
-        assert_eq!(tiles[0], CropRegion { x: 0, y: 0, width: 2560, height: 1440 });
-        assert_eq!(tiles[3], CropRegion { x: 1280, y: 720, width: 2560, height: 1440 });
+        assert_eq!(
+            tiles[0],
+            CropRegion {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440
+            }
+        );
+        assert_eq!(
+            tiles[3],
+            CropRegion {
+                x: 1280,
+                y: 720,
+                width: 2560,
+                height: 1440
+            }
+        );
         assert!(tiles[0].x + tiles[0].width > tiles[1].x);
         assert!(tiles[0].y + tiles[0].height > tiles[2].y);
     }

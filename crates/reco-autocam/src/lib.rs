@@ -27,8 +27,8 @@ pub use reco_detect::TrtGpuDetector;
 
 pub use roi_filter::{RoiAnchor, RoiFilteredDetector};
 pub mod wgpu_detector;
-pub use wgpu_detector::WgpuPreprocessingDetector;
 pub use tracking_mode::TrackingMode;
+pub use wgpu_detector::WgpuPreprocessingDetector;
 
 use std::io;
 use std::path::Path;
@@ -266,19 +266,21 @@ pub fn setup_autocam(
         ) {
             Ok(Some(gpu_det)) => {
                 let gpu_det = gpu_det.with_high_res_ball_recovery(config.high_res_ball_recovery);
-                let detector: Box<dyn reco_core::detect::detector::UnifiedDetector> =
-                    if config.high_res_ball_recovery && gpu_det.recovery_ball_class_id().is_some() {
-                        Box::new(recovery_filter::ValidatedBallRecoveryDetector::new(
-                            gpu_det,
-                            effective_roi.clone(),
-                            ball_id_for_recovery,
-                            person_id_for_roi,
-                        ))
-                    } else if let Some(roi) = effective_roi.clone() {
-                        wrap_with_roi(Box::new(gpu_det), roi)
-                    } else {
-                        Box::new(gpu_det)
-                    };
+                let detector: Box<dyn reco_core::detect::detector::UnifiedDetector> = if config
+                    .high_res_ball_recovery
+                    && gpu_det.recovery_ball_class_id().is_some()
+                {
+                    Box::new(recovery_filter::ValidatedBallRecoveryDetector::new(
+                        gpu_det,
+                        effective_roi.clone(),
+                        ball_id_for_recovery,
+                        person_id_for_roi,
+                    ))
+                } else if let Some(roi) = effective_roi.clone() {
+                    wrap_with_roi(Box::new(gpu_det), roi)
+                } else {
+                    Box::new(gpu_det)
+                };
                 target.set_detector(detector);
                 detection_active = true;
                 log::info!("Autocam: GPU YOLO ball tracking enabled (model: {model_path})");

@@ -6,7 +6,9 @@
 //! state or reach the tracker.
 
 use reco_core::calibration::FieldRoi;
-use reco_core::detect::detector::{CameraId, Detection, DetectorError, DetectorFrame, UnifiedDetector};
+use reco_core::detect::detector::{
+    CameraId, Detection, DetectorError, DetectorFrame, UnifiedDetector,
+};
 use reco_core::projection::point_in_polygon;
 use reco_detect::OrtGpuDetector;
 
@@ -161,9 +163,9 @@ impl ValidatedBallRecoveryDetector {
     ) -> (Option<Detection>, BallDecision) {
         let predicted = self.inner.recovery_prediction(camera);
         let inside = choose_candidate(
-            candidates
-                .iter()
-                .filter(|d| d.class_id == self.ball_class_id && ball_inside_roi(d, self.roi.as_ref())),
+            candidates.iter().filter(|d| {
+                d.class_id == self.ball_class_id && ball_inside_roi(d, self.roi.as_ref())
+            }),
             predicted,
         );
 
@@ -179,9 +181,9 @@ impl ValidatedBallRecoveryDetector {
         }
 
         let outside = choose_candidate(
-            candidates
-                .iter()
-                .filter(|d| d.class_id == self.ball_class_id && !ball_inside_roi(d, self.roi.as_ref())),
+            candidates.iter().filter(|d| {
+                d.class_id == self.ball_class_id && !ball_inside_roi(d, self.roi.as_ref())
+            }),
             predicted,
         );
         let Some(candidate) = outside else {
@@ -209,9 +211,14 @@ impl ValidatedBallRecoveryDetector {
 
         let state = &mut self.provisional[idx];
         match state.last {
-            Some(last) if distance(last, (candidate.center_x, candidate.center_y)) <= PROVISIONAL_LINK_DISTANCE => {
+            Some(last)
+                if distance(last, (candidate.center_x, candidate.center_y))
+                    <= PROVISIONAL_LINK_DISTANCE =>
+            {
                 state.confirmations = state.confirmations.saturating_add(1);
-                if distance(last, (candidate.center_x, candidate.center_y)) <= PROVISIONAL_MIN_MOTION {
+                if distance(last, (candidate.center_x, candidate.center_y))
+                    <= PROVISIONAL_MIN_MOTION
+                {
                     state.stationary = state.stationary.saturating_add(1);
                 } else {
                     state.stationary = 0;
@@ -257,9 +264,7 @@ impl ValidatedBallRecoveryDetector {
                 candidate.center_x,
                 candidate.center_y,
             ),
-            None => log::debug!(
-                "BALL_CANDIDATE_DECISION camera={camera} decision={decision:?}"
-            ),
+            None => log::debug!("BALL_CANDIDATE_DECISION camera={camera} decision={decision:?}"),
         }
     }
 }
@@ -329,8 +334,14 @@ mod tests {
             left: vec![[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8]],
             right: vec![],
         };
-        assert!(ball_inside_roi(&ball(CameraId::Left, 0.5, 0.5, 0.8), Some(&roi)));
-        assert!(!ball_inside_roi(&ball(CameraId::Left, 0.5, 0.1, 0.8), Some(&roi)));
+        assert!(ball_inside_roi(
+            &ball(CameraId::Left, 0.5, 0.5, 0.8),
+            Some(&roi)
+        ));
+        assert!(!ball_inside_roi(
+            &ball(CameraId::Left, 0.5, 0.1, 0.8),
+            Some(&roi)
+        ));
     }
 
     #[test]
