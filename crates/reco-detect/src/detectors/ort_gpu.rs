@@ -32,6 +32,126 @@ use reco_core::interop::cuda::{
 
 use super::postprocess;
 
+const RECOVERY_CROP_RATIOS: [f32; 3] = [0.5, 2.0 / 3.0, 5.0 / 6.0];
+const MAX_RECOVERY_MISSES: u32 = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CropRegion {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl CropRegion {
+    fn full(width: u32, height: u32) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    fn centered(width: u32, height: u32, ratio: f32, center: (f32, f32)) -> Self {
+        let even_size = |value: u32| value.max(2) & !1;
+        let crop_width = even_size(((width as f32 * ratio).round() as u32).min(width));
+        let crop_height = even_size(((height as f32 * ratio).round() as u32).min(height));
+        let max_x = width.saturating_sub(crop_width);
+        let max_y = height.saturating_sub(crop_height);
+        let target_x = center.0.clamp(0.0, 1.0) * width as f32 - crop_width as f32 / 2.0;
+        let target_y = center.1.clamp(0.0, 1.0) * height as f32 - crop_height as f32 / 2.0;
+        let x = (target_x.round().clamp(0.0, max_x as f32) as u32 & !1).min(max_x & !1);
+        let y = (target_y.round().clamp(0.0, max_y as f32) as u32 & !1).min(max_y & !1);
+        Self {
+            x,
+            y,
+            width: crop_width,
+            height: crop_height,
+        }
+    }
+
+    fn remap(self, mut detection: Detection, frame_width: u32, frame_height: u32) -> Detection {
+        detection.center_x =
+            (self.x as f32 + detection.center_x * self.width as f32) / frame_width as f32;
+        detection.center_y =
+            (self.y as f32 + detection.center_y * self.height as f32) / frame_height as f32;
+        detection.width *= self.width as f32 / frame_width as f32;
+        detection.height *= self.height as f32 / frame_height as f32;
+        detection
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct CameraRecoveryState {
+    last_center: Option<(f32, f32)>,
+    velocity: (f32, f32),
+    misses: u32,
+}
+
+impl CameraRecoveryState {
+    fn predicted_center(&self) -> Option<(f32, f32)> {
+        let (x, y) = self.last_center?;
+        let horizon = self.misses.saturating_add(1) as f32;
+        Some((
+            (x + self.velocity.0 * horizon).clamp(0.0, 1.0),
+            (y + self.velocity.1 * horizon).clamp(0.0, 1.0),
+        ))
+    }
+
+    fn observe(&mut self, detections: &[Detection], ball_class_id: u16) {
+        let expected = self.predicted_center();
+        let chosen = detections
+            .iter()
+            .filter(|d| d.class_id == ball_class_id)
+            .min_by(|a, b| {
+                let score = |d: &&Detection| {
+                    if let Some((x, y)) = expected {
+                        (d.center_x - x).powi(2) + (d.center_y - y).powi(2)
+                    } else {
+                        1.0 - d.confidence
+                    }
+                };
+                score(a).total_cmp(&score(b))
+            });
+        let Some(chosen) = chosen else {
+            return;
+        };
+        if let Some((last_x, last_y)) = self.last_center {
+            self.velocity = (
+                (chosen.center_x - last_x).clamp(-0.08, 0.08),
+                (chosen.center_y - last_y).clamp(-0.08, 0.08),
+            );
+        }
+        self.last_center = Some((chosen.center_x, chosen.center_y));
+        self.misses = 0;
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecoveryStats {
+    attempts: [u64; 3],
+    hits: [u64; 3],
+    exhausted: u64,
+    errors: u64,
+}
+
+#[derive(Debug)]
+struct BallRecovery {
+    class_id: u16,
+    cameras: [CameraRecoveryState; 2],
+    stats: RecoveryStats,
+}
+
+impl BallRecovery {
+    fn state_mut(&mut self, camera: CameraId) -> &mut CameraRecoveryState {
+        &mut self.cameras[match camera {
+            CameraId::Left => 0,
+            CameraId::Right => 1,
+        }]
+    }
+}
+
 /// YOLO detector that operates on GPU-resident NV12 frames via ORT.
 ///
 /// Pre-allocates GPU scratch buffers for the preprocessing pipeline and
@@ -71,9 +191,122 @@ pub struct OrtGpuDetector {
     // lifetime; constructing one per inference showed up on the
     // per-frame alloc audit (plan M7 item 5).
     cuda_memory_info: SendMemoryInfo,
+    frame_width: u32,
+    frame_height: u32,
+    ball_recovery: Option<BallRecovery>,
 }
 
 impl OrtGpuDetector {
+    #[allow(clippy::too_many_arguments)]
+    fn infer_region(
+        &mut self,
+        camera: CameraId,
+        nv12_y: CUdeviceptr,
+        nv12_y_pitch: usize,
+        nv12_uv: CUdeviceptr,
+        nv12_uv_pitch: usize,
+        frame_width: u32,
+        frame_height: u32,
+        rotation: i32,
+        region: CropRegion,
+    ) -> Result<Vec<Detection>, DetectorError> {
+        // Crop coordinates are expressed in the detector's oriented image
+        // space. For a 180-degree source, translate the crop back into raw
+        // plane coordinates before offsetting the CUDA pointers; the kernel
+        // then applies its normal 180-degree mapping within that crop.
+        let (raw_x, raw_y) = if rotation == 180 {
+            (
+                frame_width.saturating_sub(region.x + region.width),
+                frame_height.saturating_sub(region.y + region.height),
+            )
+        } else {
+            (region.x, region.y)
+        };
+        let y_offset = u64::from(raw_y)
+            .checked_mul(nv12_y_pitch as u64)
+            .and_then(|v| v.checked_add(u64::from(raw_x)))
+            .ok_or_else(|| DetectorError::InferenceFailed("NV12 Y crop offset overflow".into()))?;
+        let uv_offset = u64::from(raw_y / 2)
+            .checked_mul(nv12_uv_pitch as u64)
+            .and_then(|v| v.checked_add(u64::from(raw_x)))
+            .ok_or_else(|| DetectorError::InferenceFailed("NV12 UV crop offset overflow".into()))?;
+        let crop_y_ptr = nv12_y
+            .checked_add(y_offset)
+            .ok_or_else(|| DetectorError::InferenceFailed("NV12 Y pointer overflow".into()))?;
+        let crop_uv_ptr = nv12_uv
+            .checked_add(uv_offset)
+            .ok_or_else(|| DetectorError::InferenceFailed("NV12 UV pointer overflow".into()))?;
+
+        let (scale, pad_x, pad_y) = if region == CropRegion::full(frame_width, frame_height) {
+            (self.scale, self.pad_x, self.pad_y)
+        } else {
+            let input = self.input_size as f32;
+            let scale = (input / region.width as f32).min(input / region.height as f32);
+            let new_w = (region.width as f32 * scale).round() as u32;
+            let new_h = (region.height as f32 * scale).round() as u32;
+            (
+                scale,
+                (self.input_size - new_w) as f32 / 2.0,
+                (self.input_size - new_h) as f32 / 2.0,
+            )
+        };
+
+        {
+            reco_core::profile_scope!("nv12_to_rgb_chw");
+            crate::cuda_kernels::nv12_to_rgb_chw_fullrange(
+                crop_y_ptr,
+                crop_uv_ptr,
+                self.tensor_f32,
+                nv12_y_pitch as u32,
+                region.width,
+                region.height,
+                self.input_size,
+                self.input_size,
+                pad_x as u32,
+                pad_y as u32,
+                scale,
+                rotation,
+            )
+            .map_err(|e| DetectorError::InferenceFailed(format!("NV12->RGB CHW: {e}")))?;
+        }
+
+        let outputs = {
+            reco_core::profile_scope!("gpu_ort_inference");
+            let sz = self.input_size as i64;
+            let tensor: TensorRefMut<'_, f32> = unsafe {
+                TensorRefMut::from_raw(
+                    self.cuda_memory_info.0.clone(),
+                    self.tensor_f32 as *mut c_void,
+                    Shape::new([1i64, 3, sz, sz]),
+                )
+            }
+            .map_err(|e| DetectorError::InferenceFailed(format!("GPU tensor wrap: {e}")))?;
+            self.session
+                .run(ort::inputs![tensor])
+                .map_err(|e| DetectorError::InferenceFailed(format!("ort run: {e}")))?
+        };
+
+        let (shape, slice) = outputs[0]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| DetectorError::InferenceFailed(format!("output extract: {e}")))?;
+        let detections = postprocess(
+            slice,
+            shape[1] as usize,
+            camera,
+            self.confidence_threshold,
+            scale,
+            pad_x,
+            pad_y,
+            region.width,
+            region.height,
+        )
+        .into_iter()
+        .map(|detection| region.remap(detection, frame_width, frame_height))
+        .collect();
+        drop(outputs);
+        Ok(detections)
+    }
+
     /// Try to create a GPU YOLO detector.
     ///
     /// Returns `Ok(None)` if NPP libraries are not available (e.g. on systems
@@ -198,6 +431,9 @@ impl OrtGpuDetector {
             nv12_8bit_y,
             nv12_8bit_uv,
             cuda_memory_info,
+            frame_width,
+            frame_height,
+            ball_recovery: None,
         };
 
         // Warmup: force TRT EP to eagerly build the engine and initialize
@@ -212,6 +448,34 @@ impl OrtGpuDetector {
         }
 
         Ok(Some(detector))
+    }
+
+    /// Enable native-resolution crop retries when the full-frame pass has no
+    /// ball detection. The ball class is resolved from ONNX metadata; if the
+    /// model has no `ball`/`sports ball` label, recovery remains disabled.
+    pub fn with_high_res_ball_recovery(mut self, enabled: bool) -> Self {
+        if !enabled {
+            return self;
+        }
+        let class_id = self.labels.iter().position(|label| {
+            label.eq_ignore_ascii_case("ball") || label.eq_ignore_ascii_case("sports ball")
+        });
+        match class_id.and_then(|id| u16::try_from(id).ok()) {
+            Some(class_id) => {
+                self.ball_recovery = Some(BallRecovery {
+                    class_id,
+                    cameras: [CameraRecoveryState::default(); 2],
+                    stats: RecoveryStats::default(),
+                });
+                log::info!(
+                    "OrtGpuDetector: high-resolution ball recovery enabled (class_id={class_id}, crop_ratios={RECOVERY_CROP_RATIOS:?}, max_misses={MAX_RECOVERY_MISSES})"
+                );
+            }
+            None => log::warn!(
+                "OrtGpuDetector: high-resolution ball recovery requested, but model labels contain neither 'ball' nor 'sports ball'; recovery disabled"
+            ),
+        }
+        self
     }
 }
 
@@ -244,6 +508,13 @@ impl OrtGpuDetector {
         } = *frame;
         reco_core::profile_scope!("gpu_yolo_detect");
 
+        if width != self.frame_width || height != self.frame_height {
+            return Err(DetectorError::InferenceFailed(format!(
+                "GPU detector frame dimensions changed: configured={}x{}, received={}x{}",
+                self.frame_width, self.frame_height, width, height
+            )));
+        }
+
         // Ensure a CUDA context is current on this thread. The zero-copy
         // frame loop may not have one after NVDEC decode pushes/pops its
         // own context.
@@ -253,7 +524,7 @@ impl OrtGpuDetector {
         // Step 0: Convert P010 (10-bit) to 8-bit NV12 if needed.
         // NPP's NV12->RGB expects 8-bit samples, so we must down-convert
         // first by extracting the high byte of each u16 sample.
-        let (nv12_y, nv12_y_pitch, nv12_uv, _nv12_uv_pitch) = if is_10bit {
+        let (nv12_y, nv12_y_pitch, nv12_uv, nv12_uv_pitch) = if is_10bit {
             reco_core::profile_scope!("p010_to_nv12");
             if self.nv12_8bit_y == 0 || self.nv12_8bit_uv == 0 {
                 return Err(DetectorError::InferenceFailed(
@@ -292,70 +563,116 @@ impl OrtGpuDetector {
             (y_ptr, y_pitch, uv_ptr, uv_pitch)
         };
 
-        // Combined NV12 -> float32 RGB CHW in one kernel pass.
-        // Uses BT.709 full-range coefficients matching GoPro/action-cam
-        // yuvj420p output. Replaces the NPP NV12-to-RGB (BT.601
-        // video-range) + NPP resize + normalize pipeline that was
-        // producing a 10x detection count difference vs CPU ORT (#284).
-        {
-            reco_core::profile_scope!("nv12_to_rgb_chw");
-            crate::cuda_kernels::nv12_to_rgb_chw_fullrange(
-                nv12_y,
-                nv12_uv,
-                self.tensor_f32,
-                nv12_y_pitch as u32,
-                width,
-                height,
-                self.input_size,
-                self.input_size,
-                self.pad_x as u32,
-                self.pad_y as u32,
-                self.scale,
-                rotation,
-            )
-            .map_err(|e| DetectorError::InferenceFailed(format!("NV12->RGB CHW: {e}")))?;
-        }
-
-        // Step 4: Wrap GPU buffer as ORT tensor and run inference.
-        let outputs = {
-            reco_core::profile_scope!("gpu_ort_inference");
-
-            let sz = self.input_size as i64;
-            let tensor: TensorRefMut<'_, f32> = unsafe {
-                TensorRefMut::from_raw(
-                    self.cuda_memory_info.0.clone(),
-                    self.tensor_f32 as *mut c_void,
-                    Shape::new([1i64, 3, sz, sz]),
-                )
-            }
-            .map_err(|e| DetectorError::InferenceFailed(format!("GPU tensor wrap: {e}")))?;
-
-            self.session
-                .run(ort::inputs![tensor])
-                .map_err(|e| DetectorError::InferenceFailed(format!("ort run: {e}")))?
-        };
-
-        // Step 5: Extract output and postprocess on CPU without
-        // materializing an intermediate Vec<f32>. `outputs` owns the
-        // backing buffer; `slice` borrows from it. Postprocess runs
-        // to completion before we drop `outputs`.
-        let (shape, slice) = outputs[0]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| DetectorError::InferenceFailed(format!("output extract: {e}")))?;
-        let n = shape[1] as usize;
-
-        let detections = postprocess(
-            slice,
-            n,
+        let mut detections = self.infer_region(
             camera,
-            self.confidence_threshold,
-            self.scale,
-            self.pad_x,
-            self.pad_y,
+            nv12_y,
+            nv12_y_pitch,
+            nv12_uv,
+            nv12_uv_pitch,
             width,
             height,
-        );
-        drop(outputs);
+            rotation,
+            CropRegion::full(width, height),
+        )?;
+
+        if let Some(ball_class_id) = self.ball_recovery.as_ref().map(|r| r.class_id) {
+            if detections.iter().any(|d| d.class_id == ball_class_id) {
+                if let Some(recovery) = self.ball_recovery.as_mut() {
+                    recovery
+                        .state_mut(camera)
+                        .observe(&detections, ball_class_id);
+                }
+            } else {
+                let predicted = self.ball_recovery.as_ref().and_then(|recovery| {
+                    let state = recovery.cameras[match camera {
+                        CameraId::Left => 0,
+                        CameraId::Right => 1,
+                    }];
+                    (state.misses < MAX_RECOVERY_MISSES)
+                        .then(|| state.predicted_center())
+                        .flatten()
+                });
+
+                if let Some(predicted) = predicted {
+                    let mut recovered = false;
+                    for (stage, ratio) in RECOVERY_CROP_RATIOS.into_iter().enumerate() {
+                        let region = CropRegion::centered(width, height, ratio, predicted);
+                        if region == CropRegion::full(width, height) {
+                            continue;
+                        }
+                        if let Some(recovery) = self.ball_recovery.as_mut() {
+                            recovery.stats.attempts[stage] += 1;
+                        }
+                        log::debug!(
+                            "BALL_RECOVERY_ATTEMPT camera={camera} stage={} crop={}x{}+{},{} predicted={:.4},{:.4}",
+                            stage + 1,
+                            region.width,
+                            region.height,
+                            region.x,
+                            region.y,
+                            predicted.0,
+                            predicted.1,
+                        );
+                        let crop_detections = match self.infer_region(
+                            camera,
+                            nv12_y,
+                            nv12_y_pitch,
+                            nv12_uv,
+                            nv12_uv_pitch,
+                            width,
+                            height,
+                            rotation,
+                            region,
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                if let Some(recovery) = self.ball_recovery.as_mut() {
+                                    recovery.stats.errors += 1;
+                                }
+                                log::warn!(
+                                    "BALL_RECOVERY_ERROR camera={camera} stage={} error={error}",
+                                    stage + 1
+                                );
+                                break;
+                            }
+                        };
+                        let recovered_balls: Vec<_> = crop_detections
+                            .into_iter()
+                            .filter(|d| d.class_id == ball_class_id)
+                            .collect();
+                        if !recovered_balls.is_empty() {
+                            if let Some(recovery) = self.ball_recovery.as_mut() {
+                                recovery.stats.hits[stage] += 1;
+                                recovery
+                                    .state_mut(camera)
+                                    .observe(&recovered_balls, ball_class_id);
+                            }
+                            log::info!(
+                                "BALL_RECOVERY_HIT camera={camera} stage={} crop={}x{} count={} best_confidence={:.3}",
+                                stage + 1,
+                                region.width,
+                                region.height,
+                                recovered_balls.len(),
+                                recovered_balls
+                                    .iter()
+                                    .map(|d| d.confidence)
+                                    .fold(0.0f32, f32::max),
+                            );
+                            detections.extend(recovered_balls);
+                            recovered = true;
+                            break;
+                        }
+                    }
+                    if !recovered
+                        && let Some(recovery) = self.ball_recovery.as_mut()
+                    {
+                        let state = recovery.state_mut(camera);
+                        state.misses = state.misses.saturating_add(1);
+                        recovery.stats.exhausted += 1;
+                    }
+                }
+            }
+        }
 
         if !detections.is_empty() {
             log::debug!(
@@ -416,6 +733,15 @@ impl UnifiedDetector for OrtGpuDetector {
 
 impl Drop for OrtGpuDetector {
     fn drop(&mut self) {
+        if let Some(recovery) = &self.ball_recovery {
+            log::info!(
+                "BALL_RECOVERY_SUMMARY attempts={:?} hits={:?} exhausted={} errors={}",
+                recovery.stats.attempts,
+                recovery.stats.hits,
+                recovery.stats.exhausted,
+                recovery.stats.errors,
+            );
+        }
         // Ensure a CUDA context is current before freeing GPU memory.
         // Drop may run on a different thread than the one that allocated.
         if let Err(e) = cuda_ensure_context() {
@@ -437,5 +763,90 @@ impl Drop for OrtGpuDetector {
                 log::warn!("Failed to free GPU buffer {name}: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detection(center_x: f32, center_y: f32, confidence: f32) -> Detection {
+        Detection {
+            camera: CameraId::Left,
+            class_id: 32,
+            confidence,
+            center_x,
+            center_y,
+            width: 0.1,
+            height: 0.2,
+        }
+    }
+
+    #[test]
+    fn centered_crop_is_even_and_clamped_at_frame_edges() {
+        let top_left = CropRegion::centered(3840, 2160, 0.5, (0.0, 0.0));
+        assert_eq!(
+            top_left,
+            CropRegion {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }
+        );
+
+        let bottom_right = CropRegion::centered(3840, 2160, 0.5, (1.0, 1.0));
+        assert_eq!(
+            bottom_right,
+            CropRegion {
+                x: 1920,
+                y: 1080,
+                width: 1920,
+                height: 1080,
+            }
+        );
+        assert_eq!(bottom_right.x % 2, 0);
+        assert_eq!(bottom_right.y % 2, 0);
+    }
+
+    #[test]
+    fn crop_detection_remaps_to_full_frame_coordinates() {
+        let crop = CropRegion {
+            x: 960,
+            y: 540,
+            width: 1920,
+            height: 1080,
+        };
+        let mapped = crop.remap(detection(0.5, 0.5, 0.8), 3840, 2160);
+        assert!((mapped.center_x - 0.5).abs() < 1e-6);
+        assert!((mapped.center_y - 0.5).abs() < 1e-6);
+        assert!((mapped.width - 0.05).abs() < 1e-6);
+        assert!((mapped.height - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn recovery_state_prefers_candidate_nearest_prediction() {
+        let mut state = CameraRecoveryState {
+            last_center: Some((0.25, 0.5)),
+            velocity: (0.01, 0.0),
+            misses: 0,
+        };
+        let nearby = detection(0.27, 0.5, 0.6);
+        let distant_high_confidence = detection(0.9, 0.5, 0.99);
+        state.observe(&[distant_high_confidence, nearby], 32);
+        assert_eq!(state.last_center, Some((nearby.center_x, nearby.center_y)));
+        assert_eq!(state.misses, 0);
+    }
+
+    #[test]
+    fn recovery_prediction_advances_across_misses() {
+        let state = CameraRecoveryState {
+            last_center: Some((0.4, 0.5)),
+            velocity: (0.01, -0.02),
+            misses: 2,
+        };
+        let predicted = state.predicted_center().unwrap();
+        assert!((predicted.0 - 0.43).abs() < 1e-6);
+        assert!((predicted.1 - 0.44).abs() < 1e-6);
     }
 }
