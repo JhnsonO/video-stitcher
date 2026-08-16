@@ -171,6 +171,9 @@ pub struct AutocamConfig {
     /// Detector confidence threshold override. When set, replaces
     /// the default 0.10 threshold. Ball-only models need 0.25+.
     pub confidence_threshold: Option<f32>,
+    /// Retry a missing ball with progressively wider native-resolution
+    /// crops around its predicted position. CUDA ORT backend only.
+    pub high_res_ball_recovery: bool,
 }
 
 impl AutocamConfig {
@@ -185,6 +188,7 @@ impl AutocamConfig {
             is_10bit: false,
             field_panner_config: None,
             confidence_threshold: None,
+            high_res_ball_recovery: false,
         }
     }
 
@@ -219,6 +223,12 @@ impl AutocamConfig {
     /// samples to 8-bit before NPP color conversion.
     pub fn with_10bit(mut self, is_10bit: bool) -> Self {
         self.is_10bit = is_10bit;
+        self
+    }
+
+    /// Enable native-resolution crop retries for missing ball detections.
+    pub fn with_high_res_ball_recovery(mut self, enabled: bool) -> Self {
+        self.high_res_ball_recovery = enabled;
         self
     }
 }
@@ -397,6 +407,8 @@ pub fn setup_autocam(
             is_10bit,
         ) {
             Ok(Some(gpu_det)) => {
+                let gpu_det = gpu_det
+                    .with_high_res_ball_recovery(config.high_res_ball_recovery);
                 let detector: Box<dyn reco_core::detect::detector::UnifiedDetector> =
                     if let Some(roi) = effective_roi.clone() {
                         wrap_with_roi(Box::new(gpu_det), roi)
