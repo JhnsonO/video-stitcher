@@ -2,17 +2,15 @@ name: Recovery branch fixup
 
 on:
   push:
-    branches:
-      - agent/high-res-ball-roi-recovery
-    paths:
-      - .github/workflows/recovery-branch-fixup.yml
+    branches: [agent/high-res-ball-roi-recovery]
 
 permissions:
   contents: write
 
 jobs:
-  fixup:
-    runs-on: ubuntu-24.04
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[recovery-fix-clean]') }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
@@ -20,44 +18,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.92.0
         with:
           components: rustfmt
-      - name: Fix borrow boundaries
+      - name: Apply compile cleanup
+        run: python3 tools/fix_recovery_branch.py
+      - name: Format and verify diff
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('crates/reco-detect/src/detectors/ort_gpu.rs')
-          text = path.read_text()
-          old = """        let previous_misses = recovery.cameras[camera_index(camera)].misses;
-          recovery.state_mut(camera).observe(accepted, recovery.class_id);
-          recovery.stats.commits += 1;"""
-          new = """        let previous_misses = recovery.cameras[camera_index(camera)].misses;
-          let class_id = recovery.class_id;
-          recovery.state_mut(camera).observe(accepted, class_id);
-          recovery.stats.commits += 1;"""
-          if old not in text:
-              raise SystemExit('commit_ball_recovery target not found')
-          text = text.replace(old, new, 1)
-          old = """        recovery.state_mut(camera).misses = recovery
-              .state_mut(camera)
-              .misses
-              .saturating_add(1);
-          recovery.stats.rejects += 1;"""
-          new = """        let state = recovery.state_mut(camera);
-          state.misses = state.misses.saturating_add(1);
-          recovery.stats.rejects += 1;"""
-          if old not in text:
-              raise SystemExit('reject_ball_recovery target not found')
-          text = text.replace(old, new, 1)
-          path.write_text(text)
-          PY
-      - name: Format
-        run: cargo fmt --all
-      - name: Commit fixup
+          cargo fmt --all
+          cargo fmt --all -- --check
+          git diff --check
+      - name: Commit cleanup
         run: |
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add crates/reco-detect/src/detectors/ort_gpu.rs crates/reco-autocam/src/lib.rs crates/reco-autocam/src/recovery_filter.rs
-          git diff --cached --check
-          if ! git diff --cached --quiet; then
-            git commit -m "fix: compile recovery commit boundary"
-            git push origin HEAD:agent/high-res-ball-roi-recovery
-          fi
+          git commit -m "fix: compile recovery commit boundary [recovery-fix-clean]"
+          git push origin HEAD:agent/high-res-ball-roi-recovery
