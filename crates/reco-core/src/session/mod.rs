@@ -102,6 +102,11 @@ pub struct StitchSession {
     /// Future WorldStates from the lookahead buffer, passed to the
     /// panner via `decide_with_lookahead`. Empty when lookahead is off.
     pub(crate) lookahead_world_states: Vec<crate::detect::tracker::WorldState>,
+    /// Last genuinely-detected (`TrackState::Tracking`) ball position seen,
+    /// for backward-bridge interpolation in the buffered lookahead loop.
+    /// Updated only from real detections, never from a bridged or coasted
+    /// value, so bridges never chain off each other.
+    pub(crate) last_bridge_anchor: Option<(u64, f32, f32)>,
     /// Last WorldState produced by dispatch, captured for the buffer.
     pub(crate) last_world_state: crate::detect::tracker::WorldState,
     /// When true, `process_frame_any` skips detection (the produce phase
@@ -262,6 +267,7 @@ impl StitchSession {
             panner: None,
             previous_panner_pose: ViewportPosition::default(),
             lookahead_world_states: Vec::new(),
+            last_bridge_anchor: None,
             last_world_state: crate::detect::tracker::WorldState::default(),
             skip_detection: false,
             lookahead_frames: 0,

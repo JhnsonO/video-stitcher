@@ -53,6 +53,105 @@ fn queue_sparse_segment(
     }
 }
 
+/// Maximum implied ball speed (degrees/second) considered plausible for
+/// backward bridging. Derived empirically from control run `31939820386`'s
+/// raw trusted-to-trusted ball speed distribution (p90 of <=3-frame hops x
+/// 4x safety margin); a documented starting default for this footage/rig,
+/// not a physical constant -- flag as tunable if a future clip's real ball
+/// speeds differ.
+const MAX_BRIDGE_SPEED_DEG_PER_S: f32 = 178.0;
+
+/// Backward-bridge `frame.world_state.ball` when it is `None` but a genuine
+/// (`Tracking`) detection exists both behind (`anchor`) and ahead
+/// (somewhere in `lookahead`) of the current frame, by linearly
+/// interpolating between them. Purely additive on top of the existing
+/// coast state machine: never reads or writes `DEFAULT_COAST_FRAMES` or any
+/// coaster state, and never runs constant-velocity/motion prediction --
+/// only interpolation between two real, non-predicted detections.
+///
+/// `lookahead` is `session.lookahead_world_states` as already populated by
+/// the caller (nearest-to-farthest). Its entries carry no frame index of
+/// their own, so the source-frame index of the future genuine detection at
+/// vector position `k` is derived from the buffer's known push cadence:
+/// `frame.source_frame_index + (k + 1) * stride_frames`, where
+/// `stride_frames` is `1` for the dense (`future_world_states`) path and
+/// `session.frame_stride` for the sparse (`future_analysis_world_states`)
+/// path. Leaves `ball` as `None` (an unchanged, genuine blackout) whenever
+/// there is nothing to bridge from, nothing plausible to bridge to, or the
+/// speed gate rejects the pair.
+fn bridge_ball(
+    frame: &mut super::frame_buffer::BufferedFrame,
+    lookahead: &[crate::detect::tracker::WorldState],
+    stride_frames: u64,
+    anchor: &mut Option<(u64, f32, f32)>,
+    fps: f64,
+) {
+    use crate::detect::tracker::{TrackState, TrackedEntity};
+
+    // Bridge candidates: no detection this frame (`None`), or the coast
+    // budget already froze the position (`Coasting`). Never re-bridge an
+    // already-`Bridged` value and never touch `Tracking` (a genuine
+    // detection this frame needs no help).
+    let needs_bridge = match frame.world_state.ball {
+        None => true,
+        Some(b) => b.state == TrackState::Coasting,
+    };
+
+    if needs_bridge {
+        if let Some((anchor_index, anchor_yaw, anchor_pitch)) = *anchor {
+            let found = lookahead.iter().enumerate().find_map(|(k, ws)| {
+                ws.ball
+                    .filter(|b| b.state == TrackState::Tracking)
+                    .map(|b| (k, b))
+            });
+            if let Some((k, future)) = found {
+                let future_frame_index =
+                    frame.source_frame_index + (k as u64 + 1) * stride_frames.max(1);
+                let gap_frames = future_frame_index.saturating_sub(anchor_index);
+                if gap_frames > 0 && fps > 0.0 {
+                    let gap_seconds = gap_frames as f64 / fps;
+                    let d_yaw = (future.yaw - anchor_yaw) as f64;
+                    let d_pitch = (future.pitch - anchor_pitch) as f64;
+                    let angular_distance_deg = d_yaw.hypot(d_pitch).to_degrees();
+                    let implied_speed_deg_per_s = angular_distance_deg / gap_seconds;
+
+                    if implied_speed_deg_per_s <= MAX_BRIDGE_SPEED_DEG_PER_S as f64 {
+                        let elapsed_frames = frame.source_frame_index.saturating_sub(anchor_index);
+                        let frac = elapsed_frames as f32 / gap_frames as f32;
+                        let bridged_yaw = anchor_yaw + (future.yaw - anchor_yaw) * frac;
+                        let bridged_pitch = anchor_pitch + (future.pitch - anchor_pitch) * frac;
+                        frame.world_state.ball = Some(TrackedEntity {
+                            id: future.id,
+                            class_id: future.class_id,
+                            yaw: bridged_yaw,
+                            pitch: bridged_pitch,
+                            // Sentinel, not a fabricated high value: the
+                            // real future detection's own confidence. The
+                            // anchor's confidence isn't retained in
+                            // `last_bridge_anchor` (index + position only).
+                            confidence: future.confidence,
+                            state: TrackState::Bridged,
+                            // Frames since the last genuine detection.
+                            age_frames: elapsed_frames,
+                            origin: future.origin,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Update the anchor from a genuine detection this frame -- pre- or
+    // post-bridge, whichever the frame ends up with -- but only from
+    // `Tracking`, never from `Coasting` or `Bridged`, so bridges never
+    // chain off each other.
+    if let Some(b) = frame.world_state.ball {
+        if b.state == TrackState::Tracking {
+            *anchor = Some((frame.source_frame_index, b.yaw, b.pitch));
+        }
+    }
+}
+
 /// Centered moving-average of a pose over the past + current + ahead
 /// window. Averages yaw, pitch, AND fov, so the zoom is smoothed the
 /// same lag-free way the angles are - otherwise FOV jitter survives the
@@ -519,6 +618,7 @@ impl StitchSession {
         // Run the panner only on analysis frames. Render-only frames are
         // queued between adjacent analysis anchors and receive an
         // interpolated pose once the next anchor is known.
+        let bridge_fps = source.info().fps.max(1.0);
         let run_panner_once =
             |session: &mut StitchSession,
              buffer: &mut FrameBuffer,
@@ -531,9 +631,16 @@ impl StitchSession {
                 crate::detect::director::ViewportPosition,
             )>,
              sparse_between: &mut std::collections::VecDeque<BufferedFrame>| {
-                if let Some(frame) = buffer.pop() {
+                if let Some(mut frame) = buffer.pop() {
                     if session.frame_stride <= 1 {
                         session.lookahead_world_states = buffer.future_world_states();
+                        bridge_ball(
+                            &mut frame,
+                            &session.lookahead_world_states,
+                            1,
+                            &mut session.last_bridge_anchor,
+                            bridge_fps,
+                        );
                         let pose = if let Some(panner) = session.panner.as_mut() {
                             let pan_ctx = crate::detect::panner::PanContext {
                                 frame_index: frame.source_frame_index,
@@ -554,6 +661,13 @@ impl StitchSession {
                         pose_queue.push_back((frame, pose));
                     } else if frame.analysis_frame {
                         session.lookahead_world_states = buffer.future_analysis_world_states();
+                        bridge_ball(
+                            &mut frame,
+                            &session.lookahead_world_states,
+                            session.frame_stride,
+                            &mut session.last_bridge_anchor,
+                            bridge_fps,
+                        );
                         let analysis_index = frame.source_frame_index / session.frame_stride;
                         let pose = if let Some(panner) = session.panner.as_mut() {
                             let pan_ctx = crate::detect::panner::PanContext {
