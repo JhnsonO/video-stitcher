@@ -237,7 +237,7 @@ pub enum BallRecoveryDecision {
     NotTriggered,
     Invoked {
         backend: String,
-        request: BallRecoveryRequest,
+        request: Box<BallRecoveryRequest>,
         hypothesis: BallRecoveryHypothesis,
         validation: BallRecoveryValidation,
         accepted_candidate: Option<BallRecoveryCandidate>,
@@ -301,7 +301,7 @@ impl BallRecoveryEngine {
             Err(error) => {
                 return BallRecoveryDecision::Invoked {
                     backend,
-                    request,
+                    request: Box::new(request),
                     hypothesis: BallRecoveryHypothesis::none(),
                     validation: BallRecoveryValidation {
                         accepted: false,
@@ -316,7 +316,7 @@ impl BallRecoveryEngine {
         let (validation, accepted_candidate) = self.validate(&request, &hypothesis);
         BallRecoveryDecision::Invoked {
             backend,
-            request,
+            request: Box::new(request),
             hypothesis,
             validation,
             accepted_candidate,
