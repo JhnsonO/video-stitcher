@@ -359,14 +359,20 @@ impl BallRecoveryEngine {
                 || candidate.pitch < bounds.pitch_min
                 || candidate.pitch > bounds.pitch_max)
         {
-            return (rejected(Some(candidate_id), "candidate outside panorama bounds"), None);
+            return (
+                rejected(Some(candidate_id), "candidate outside panorama bounds"),
+                None,
+            );
         }
 
         if self.config.stationary_reject_observations > 0
             && candidate.stationary_observations >= self.config.stationary_reject_observations
         {
             return (
-                rejected(Some(candidate_id), "stationary/spare-ball candidate rejected"),
+                rejected(
+                    Some(candidate_id),
+                    "stationary/spare-ball candidate rejected",
+                ),
                 None,
             );
         }
@@ -384,7 +390,10 @@ impl BallRecoveryEngine {
             )
         {
             return (
-                rejected(Some(candidate_id), "trajectory from previous trusted ball is implausible"),
+                rejected(
+                    Some(candidate_id),
+                    "trajectory from previous trusted ball is implausible",
+                ),
                 None,
             );
         }
@@ -402,7 +411,10 @@ impl BallRecoveryEngine {
             )
         {
             return (
-                rejected(Some(candidate_id), "trajectory to future trusted ball is implausible"),
+                rejected(
+                    Some(candidate_id),
+                    "trajectory to future trusted ball is implausible",
+                ),
                 None,
             );
         }
@@ -416,15 +428,14 @@ impl BallRecoveryEngine {
                 / (future.frame_index - previous.frame_index) as f32;
             let expected_yaw = previous.yaw + (future.yaw - previous.yaw) * fraction;
             let expected_pitch = previous.pitch + (future.pitch - previous.pitch) * fraction;
-            let error_deg = angular_distance_deg(
-                candidate.yaw,
-                candidate.pitch,
-                expected_yaw,
-                expected_pitch,
-            );
+            let error_deg =
+                angular_distance_deg(candidate.yaw, candidate.pitch, expected_yaw, expected_pitch);
             if error_deg > self.config.max_interpolation_error_deg {
                 return (
-                    rejected(Some(candidate_id), "candidate inconsistent with bidirectional trajectory"),
+                    rejected(
+                        Some(candidate_id),
+                        "candidate inconsistent with bidirectional trajectory",
+                    ),
                     None,
                 );
             }
@@ -450,8 +461,7 @@ fn rejected(candidate_id: Option<u32>, reason: &str) -> BallRecoveryValidation {
 }
 
 fn angular_distance_deg(yaw_a: f32, pitch_a: f32, yaw_b: f32, pitch_b: f32) -> f32 {
-    let dyaw = (yaw_b - yaw_a + std::f32::consts::PI)
-        .rem_euclid(std::f32::consts::TAU)
+    let dyaw = (yaw_b - yaw_a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
         - std::f32::consts::PI;
     let dpitch = pitch_b - pitch_a;
     dyaw.hypot(dpitch).to_degrees()
