@@ -152,6 +152,186 @@ fn bridge_ball(
     }
 }
 
+/// Consult the opt-in contextual reasoner only after deterministic tracking
+/// and backward bridging have both left the current ball genuinely unknown.
+/// Candidate generation is pure and separate from the final WorldState
+/// mutation; an accepted candidate is marked `Bridged` so it can guide the
+/// panner without ever becoming a genuine anchor for future bridges.
+fn maybe_recover_ball(
+    session: &mut StitchSession,
+    frame: &mut super::frame_buffer::BufferedFrame,
+    stride_frames: u64,
+    fps: f64,
+) {
+    use crate::detect::ball_recovery::{
+        BallRecoveryAnchor, BallRecoveryBounds, BallRecoveryDecision, BallRecoveryFrameContext,
+        BallRecoveryFrameRelation, BallRecoveryRequest, BallRecoveryVisualRef,
+        generate_ball_candidates,
+    };
+    use crate::detect::tracker::{TrackState, TrackedEntity};
+
+    if session.ball_recovery.is_none() {
+        return;
+    }
+
+    let Some(ball_class_id) = session.ball_tracker.as_ref().map(|tracker| tracker.class_id()) else {
+        return;
+    };
+
+    let previous_trusted = session.last_bridge_anchor.map(|(frame_index, yaw, pitch)| {
+        BallRecoveryAnchor {
+            frame_index,
+            yaw,
+            pitch,
+        }
+    });
+
+    let future_trusted = session
+        .lookahead_world_states
+        .iter()
+        .enumerate()
+        .find_map(|(k, world)| {
+            world
+                .ball
+                .filter(|ball| ball.state == TrackState::Tracking)
+                .map(|ball| BallRecoveryAnchor {
+                    frame_index: frame.source_frame_index
+                        + (k as u64 + 1) * stride_frames.max(1),
+                    yaw: ball.yaw,
+                    pitch: ball.pitch,
+                })
+        });
+
+    let bounds = session.panorama_extent().map(|extent| BallRecoveryBounds {
+        yaw_min: extent.yaw_min,
+        yaw_max: extent.yaw_max,
+        pitch_min: extent.pitch_min,
+        pitch_max: extent.pitch_max,
+    });
+
+    let candidates = generate_ball_candidates(
+        frame.source_frame_index,
+        &frame.detections,
+        ball_class_id,
+    );
+
+    let mut context_frames = Vec::new();
+    if let Some(anchor) = previous_trusted {
+        context_frames.push(BallRecoveryFrameContext {
+            frame_index: anchor.frame_index,
+            relation: BallRecoveryFrameRelation::Past,
+            trusted_ball: Some(anchor),
+            players: Vec::new(),
+        });
+    }
+    context_frames.push(BallRecoveryFrameContext {
+        frame_index: frame.source_frame_index,
+        relation: BallRecoveryFrameRelation::Current,
+        trusted_ball: frame
+            .world_state
+            .ball
+            .filter(|ball| ball.state == TrackState::Tracking)
+            .map(|ball| BallRecoveryAnchor {
+                frame_index: frame.source_frame_index,
+                yaw: ball.yaw,
+                pitch: ball.pitch,
+            }),
+        players: frame.world_state.players.clone(),
+    });
+    for (k, world) in session.lookahead_world_states.iter().take(3).enumerate() {
+        let frame_index =
+            frame.source_frame_index + (k as u64 + 1) * stride_frames.max(1);
+        context_frames.push(BallRecoveryFrameContext {
+            frame_index,
+            relation: BallRecoveryFrameRelation::Future,
+            trusted_ball: world
+                .ball
+                .filter(|ball| ball.state == TrackState::Tracking)
+                .map(|ball| BallRecoveryAnchor {
+                    frame_index,
+                    yaw: ball.yaw,
+                    pitch: ball.pitch,
+                }),
+            players: world.players.clone(),
+        });
+    }
+
+    let mut visuals = context_frames
+        .iter()
+        .map(|context| BallRecoveryVisualRef::FullFrame {
+            frame_index: context.frame_index,
+        })
+        .collect::<Vec<_>>();
+    visuals.extend(candidates.iter().map(|candidate| {
+        BallRecoveryVisualRef::CandidateCrop {
+            frame_index: candidate.frame_index,
+            candidate_id: candidate.id,
+            camera: candidate.camera,
+            high_resolution: true,
+        }
+    }));
+
+    let request = BallRecoveryRequest {
+        current_frame_index: frame.source_frame_index,
+        fps,
+        uncertain_frames: 0,
+        previous_trusted,
+        future_trusted,
+        bounds,
+        context_frames,
+        visuals,
+        candidates,
+    };
+
+    let trigger_world = frame.world_state.clone();
+    let decision = session
+        .ball_recovery
+        .as_mut()
+        .expect("checked ball_recovery above")
+        .consider(&trigger_world, request);
+
+    if let BallRecoveryDecision::Invoked {
+        backend,
+        request,
+        hypothesis,
+        validation,
+        accepted_candidate,
+    } = decision
+    {
+        let resulting_ball = accepted_candidate.as_ref().map(|candidate| TrackedEntity {
+            id: 0,
+            class_id: ball_class_id,
+            yaw: candidate.yaw,
+            pitch: candidate.pitch,
+            confidence: candidate.detector_confidence,
+            // Synthetic but validated. Reusing Bridged preserves the crucial
+            // invariant that recovery output cannot become a genuine anchor.
+            state: TrackState::Bridged,
+            age_frames: previous_trusted
+                .map(|anchor| frame.source_frame_index.saturating_sub(anchor.frame_index))
+                .unwrap_or(0),
+            origin: candidate.camera,
+        });
+
+        if let Some(ball) = resulting_ball {
+            frame.world_state.ball = Some(ball);
+        }
+
+        let trace = serde_json::json!({
+            "event": "ball_recovery",
+            "frame_index": frame.source_frame_index,
+            "backend": backend,
+            "uncertain_frames": request.uncertain_frames,
+            "context_frames": request.context_frames.iter().map(|ctx| ctx.frame_index).collect::<Vec<_>>(),
+            "candidates": request.candidates,
+            "response": hypothesis,
+            "validation": validation,
+            "resulting_ball": resulting_ball,
+        });
+        log::info!("BALL_RECOVERY {}", trace);
+    }
+}
+
 /// Centered moving-average of a pose over the past + current + ahead
 /// window. Averages yaw, pitch, AND fov, so the zoom is smoothed the
 /// same lag-free way the angles are - otherwise FOV jitter survives the
@@ -641,6 +821,7 @@ impl StitchSession {
                             &mut session.last_bridge_anchor,
                             bridge_fps,
                         );
+                        maybe_recover_ball(session, &mut frame, 1, bridge_fps);
                         let pose = if let Some(panner) = session.panner.as_mut() {
                             let pan_ctx = crate::detect::panner::PanContext {
                                 frame_index: frame.source_frame_index,
@@ -666,6 +847,12 @@ impl StitchSession {
                             &session.lookahead_world_states,
                             session.frame_stride,
                             &mut session.last_bridge_anchor,
+                            bridge_fps,
+                        );
+                        maybe_recover_ball(
+                            session,
+                            &mut frame,
+                            session.frame_stride,
                             bridge_fps,
                         );
                         let analysis_index = frame.source_frame_index / session.frame_stride;
