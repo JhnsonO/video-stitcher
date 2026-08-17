@@ -1,0 +1,8 @@
+[
+  {
+    "frame_index": 120,
+    "candidate_id": 1,
+    "confidence": 0.93,
+    "rationale": "candidate 1 follows the trusted before/after trajectory"
+  }
+]
