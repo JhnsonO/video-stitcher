@@ -174,33 +174,39 @@ fn maybe_recover_ball(
         return;
     }
 
-    let Some(ball_class_id) = session.ball_tracker.as_ref().map(|tracker| tracker.class_id()) else {
+    let Some(ball_class_id) = session
+        .ball_tracker
+        .as_ref()
+        .map(|tracker| tracker.class_id())
+    else {
         return;
     };
 
-    let previous_trusted = session.last_bridge_anchor.map(|(frame_index, yaw, pitch)| {
-        BallRecoveryAnchor {
-            frame_index,
-            yaw,
-            pitch,
-        }
-    });
+    let previous_trusted =
+        session
+            .last_bridge_anchor
+            .map(|(frame_index, yaw, pitch)| BallRecoveryAnchor {
+                frame_index,
+                yaw,
+                pitch,
+            });
 
-    let future_trusted = session
-        .lookahead_world_states
-        .iter()
-        .enumerate()
-        .find_map(|(k, world)| {
-            world
-                .ball
-                .filter(|ball| ball.state == TrackState::Tracking)
-                .map(|ball| BallRecoveryAnchor {
-                    frame_index: frame.source_frame_index
-                        + (k as u64 + 1) * stride_frames.max(1),
-                    yaw: ball.yaw,
-                    pitch: ball.pitch,
-                })
-        });
+    let future_trusted =
+        session
+            .lookahead_world_states
+            .iter()
+            .enumerate()
+            .find_map(|(k, world)| {
+                world
+                    .ball
+                    .filter(|ball| ball.state == TrackState::Tracking)
+                    .map(|ball| BallRecoveryAnchor {
+                        frame_index: frame.source_frame_index
+                            + (k as u64 + 1) * stride_frames.max(1),
+                        yaw: ball.yaw,
+                        pitch: ball.pitch,
+                    })
+            });
 
     let bounds = session.panorama_extent().map(|extent| BallRecoveryBounds {
         yaw_min: extent.yaw_min,
@@ -209,11 +215,8 @@ fn maybe_recover_ball(
         pitch_max: extent.pitch_max,
     });
 
-    let candidates = generate_ball_candidates(
-        frame.source_frame_index,
-        &frame.detections,
-        ball_class_id,
-    );
+    let candidates =
+        generate_ball_candidates(frame.source_frame_index, &frame.detections, ball_class_id);
 
     let mut context_frames = Vec::new();
     if let Some(anchor) = previous_trusted {
@@ -239,8 +242,7 @@ fn maybe_recover_ball(
         players: frame.world_state.players.clone(),
     });
     for (k, world) in session.lookahead_world_states.iter().take(3).enumerate() {
-        let frame_index =
-            frame.source_frame_index + (k as u64 + 1) * stride_frames.max(1);
+        let frame_index = frame.source_frame_index + (k as u64 + 1) * stride_frames.max(1);
         context_frames.push(BallRecoveryFrameContext {
             frame_index,
             relation: BallRecoveryFrameRelation::Future,
@@ -262,14 +264,16 @@ fn maybe_recover_ball(
             frame_index: context.frame_index,
         })
         .collect::<Vec<_>>();
-    visuals.extend(candidates.iter().map(|candidate| {
-        BallRecoveryVisualRef::CandidateCrop {
-            frame_index: candidate.frame_index,
-            candidate_id: candidate.id,
-            camera: candidate.camera,
-            high_resolution: true,
-        }
-    }));
+    visuals.extend(
+        candidates
+            .iter()
+            .map(|candidate| BallRecoveryVisualRef::CandidateCrop {
+                frame_index: candidate.frame_index,
+                candidate_id: candidate.id,
+                camera: candidate.camera,
+                high_resolution: true,
+            }),
+    );
 
     let request = BallRecoveryRequest {
         current_frame_index: frame.source_frame_index,
@@ -849,12 +853,8 @@ impl StitchSession {
                             &mut session.last_bridge_anchor,
                             bridge_fps,
                         );
-                        maybe_recover_ball(
-                            session,
-                            &mut frame,
-                            session.frame_stride,
-                            bridge_fps,
-                        );
+                        let recovery_stride = session.frame_stride;
+                        maybe_recover_ball(session, &mut frame, recovery_stride, bridge_fps);
                         let analysis_index = frame.source_frame_index / session.frame_stride;
                         let pose = if let Some(panner) = session.panner.as_mut() {
                             let pan_ctx = crate::detect::panner::PanContext {
