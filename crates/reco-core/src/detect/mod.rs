@@ -4,6 +4,7 @@
 //! chain. Implementations live in reco-detect (detector backends) and reco-autocam
 //! (trackers, panners).
 
+pub mod ball_recovery;
 pub mod detector;
 pub mod director;
 pub mod panner;
