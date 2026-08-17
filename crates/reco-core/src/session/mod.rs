@@ -107,6 +107,9 @@ pub struct StitchSession {
     /// Updated only from real detections, never from a bridged or coasted
     /// value, so bridges never chain off each other.
     pub(crate) last_bridge_anchor: Option<(u64, f32, f32)>,
+    /// Optional VLM/context recovery fallback. `None` is the production
+    /// default; callers must explicitly attach a reasoner to enable it.
+    pub(crate) ball_recovery: Option<crate::detect::ball_recovery::BallRecoveryEngine>,
     /// Last WorldState produced by dispatch, captured for the buffer.
     pub(crate) last_world_state: crate::detect::tracker::WorldState,
     /// When true, `process_frame_any` skips detection (the produce phase
@@ -268,6 +271,7 @@ impl StitchSession {
             previous_panner_pose: ViewportPosition::default(),
             lookahead_world_states: Vec::new(),
             last_bridge_anchor: None,
+            ball_recovery: None,
             last_world_state: crate::detect::tracker::WorldState::default(),
             skip_detection: false,
             lookahead_frames: 0,
