@@ -45,6 +45,15 @@ use reco_core::detect::tracker::{TrackState, TrackedEntity, Tracker};
 
 use crate::trackers::filters::{CoastStatus, Coaster};
 
+/// Diagnostic-only window gate for the 134–139s hard-case instrumentation
+/// (task: OEV/Reco hard-case ledger). Purely additive — controls only
+/// whether `OEV_DIAG` log lines fire, never tracker decisions. Safe to
+/// leave in place; negligible cost (one f64 range check per call).
+#[inline]
+fn in_diag_window(ts_ms: f64) -> bool {
+    (133_500.0..=139_500.0).contains(&ts_ms)
+}
+
 /// Default angular gate on jumps between frames (radians).
 ///
 /// ~20° — a ball can legitimately cross a significant chunk of the
@@ -194,6 +203,16 @@ impl Tracker for BallTracker {
             if det.class_id != self.class_id {
                 continue;
             }
+            if in_diag_window(timestamp_ms) {
+                log::debug!(
+                    "OEV_DIAG ts={:.0} event=raw_candidate cam={:?} conf={:.3} yaw={:?} pitch={:?}",
+                    timestamp_ms,
+                    det.camera,
+                    det.confidence,
+                    det.position.map(|p| p.yaw),
+                    det.position.map(|p| p.pitch)
+                );
+            }
             let Some(pos) = det.position else {
                 log::trace!(
                     "BallTracker: drop — projection failed (class={} conf={:.2})",
@@ -211,7 +230,39 @@ impl Tracker for BallTracker {
                 );
                 continue;
             }
+            if in_diag_window(timestamp_ms) {
+                log::debug!(
+                    "OEV_DIAG ts={:.0} event=survivor cam={:?} conf={:.3} yaw={:.3} pitch={:.3}",
+                    timestamp_ms,
+                    det.camera,
+                    det.confidence,
+                    pos.yaw,
+                    pos.pitch
+                );
+            }
             survivors.push(det);
+        }
+
+        if in_diag_window(timestamp_ms) {
+            for det in &survivors {
+                if let Some(pos) = det.position {
+                    if let Some(last) = self.last {
+                        let dy = pos.yaw - last.yaw;
+                        let dp = pos.pitch - last.pitch;
+                        let dist = (dy * dy + dp * dp).sqrt();
+                        if dist > self.max_jump_rad {
+                            log::debug!(
+                                "OEV_DIAG ts={:.0} event=candidate_rejected_jump cam={:?} conf={:.3} dist_rad={:.4} max_jump_rad={:.3}",
+                                timestamp_ms,
+                                det.camera,
+                                det.confidence,
+                                dist,
+                                self.max_jump_rad
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // Step 5: nearest-to-last selection.
@@ -220,6 +271,30 @@ impl Tracker for BallTracker {
             .filter_map(|d| self.score(d).map(|s| (s, *d)))
             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(_, d)| d);
+
+        if in_diag_window(timestamp_ms) {
+            if let Some(det) = best {
+                if let Some(pos) = det.position {
+                    log::debug!(
+                        "OEV_DIAG ts={:.0} event=selected cam={:?} conf={:.3} yaw={:.3} pitch={:.3} n_raw={} n_survivors={}",
+                        timestamp_ms,
+                        det.camera,
+                        det.confidence,
+                        pos.yaw,
+                        pos.pitch,
+                        detections.len(),
+                        survivors.len()
+                    );
+                }
+            } else {
+                log::debug!(
+                    "OEV_DIAG ts={:.0} event=selected outcome=none n_raw={} n_survivors={}",
+                    timestamp_ms,
+                    detections.len(),
+                    survivors.len()
+                );
+            }
+        }
 
         // Step 6: lifecycle.
         if let Some(det) = best {
@@ -253,6 +328,16 @@ impl Tracker for BallTracker {
                 );
             }
 
+            if in_diag_window(timestamp_ms) {
+                log::debug!(
+                    "OEV_DIAG ts={:.0} event=frame_summary state=Tracking yaw={:.3} pitch={:.3} conf={:.3}",
+                    timestamp_ms,
+                    pos.yaw,
+                    pos.pitch,
+                    det.confidence
+                );
+            }
+
             return vec![TrackedEntity {
                 id: 0,
                 class_id: self.class_id,
@@ -276,6 +361,15 @@ impl Tracker for BallTracker {
                         self.coaster.frames_coasting()
                     );
                     self.age_frames = self.age_frames.saturating_add(1);
+                    if in_diag_window(timestamp_ms) {
+                        log::debug!(
+                            "OEV_DIAG ts={:.0} event=frame_summary state=Coasting yaw={:.3} pitch={:.3} conf=0.000 frames_coasting={}",
+                            timestamp_ms,
+                            last.yaw,
+                            last.pitch,
+                            self.coaster.frames_coasting()
+                        );
+                    }
                     vec![TrackedEntity {
                         id: 0,
                         class_id: self.class_id,
@@ -306,6 +400,14 @@ impl Tracker for BallTracker {
                     // Age resets on full loss so the next acquisition
                     // starts a fresh count.
                     self.age_frames = 0;
+                    if in_diag_window(timestamp_ms) {
+                        log::debug!(
+                            "OEV_DIAG ts={:.0} event=frame_summary state=Lost yaw={:.3} pitch={:.3} conf=0.000",
+                            timestamp_ms,
+                            last.yaw,
+                            last.pitch
+                        );
+                    }
                     vec![TrackedEntity {
                         id: 0,
                         class_id: self.class_id,
