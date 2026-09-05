@@ -115,7 +115,7 @@ fn bridge_ball(
                     .map(|b| (k, b))
             });
             if diag && found.is_none() {
-                log::debug!(
+                log::info!(
                     "OEV_DIAG ts={:.0} event=bridge_attempt outcome=no_future_tracking",
                     frame.elapsed_ms
                 );
@@ -133,7 +133,7 @@ fn bridge_ball(
                     let bridge_applied = implied_speed_deg_per_s <= MAX_BRIDGE_SPEED_DEG_PER_S as f64;
 
                     if diag {
-                        log::debug!(
+                        log::info!(
                             "OEV_DIAG ts={:.0} event=bridge_attempt anchor_idx={} gap_frames={} implied_speed={:.1} max_speed={:.1} outcome={}",
                             frame.elapsed_ms,
                             anchor_index,
@@ -168,7 +168,7 @@ fn bridge_ball(
                 }
             }
         } else if diag {
-            log::debug!(
+            log::info!(
                 "OEV_DIAG ts={:.0} event=bridge_attempt outcome=no_anchor",
                 frame.elapsed_ms
             );
