@@ -204,7 +204,7 @@ impl Tracker for BallTracker {
                 continue;
             }
             if in_diag_window(timestamp_ms) {
-                log::debug!(
+                log::info!(
                     "OEV_DIAG ts={:.0} event=raw_candidate cam={:?} conf={:.3} yaw={:?} pitch={:?}",
                     timestamp_ms,
                     det.camera,
@@ -231,7 +231,7 @@ impl Tracker for BallTracker {
                 continue;
             }
             if in_diag_window(timestamp_ms) {
-                log::debug!(
+                log::info!(
                     "OEV_DIAG ts={:.0} event=survivor cam={:?} conf={:.3} yaw={:.3} pitch={:.3}",
                     timestamp_ms,
                     det.camera,
@@ -251,7 +251,7 @@ impl Tracker for BallTracker {
                         let dp = pos.pitch - last.pitch;
                         let dist = (dy * dy + dp * dp).sqrt();
                         if dist > self.max_jump_rad {
-                            log::debug!(
+                            log::info!(
                                 "OEV_DIAG ts={:.0} event=candidate_rejected_jump cam={:?} conf={:.3} dist_rad={:.4} max_jump_rad={:.3}",
                                 timestamp_ms,
                                 det.camera,
@@ -275,7 +275,7 @@ impl Tracker for BallTracker {
         if in_diag_window(timestamp_ms) {
             if let Some(det) = best {
                 if let Some(pos) = det.position {
-                    log::debug!(
+                    log::info!(
                         "OEV_DIAG ts={:.0} event=selected cam={:?} conf={:.3} yaw={:.3} pitch={:.3} n_raw={} n_survivors={}",
                         timestamp_ms,
                         det.camera,
@@ -287,7 +287,7 @@ impl Tracker for BallTracker {
                     );
                 }
             } else {
-                log::debug!(
+                log::info!(
                     "OEV_DIAG ts={:.0} event=selected outcome=none n_raw={} n_survivors={}",
                     timestamp_ms,
                     detections.len(),
@@ -329,7 +329,7 @@ impl Tracker for BallTracker {
             }
 
             if in_diag_window(timestamp_ms) {
-                log::debug!(
+                log::info!(
                     "OEV_DIAG ts={:.0} event=frame_summary state=Tracking yaw={:.3} pitch={:.3} conf={:.3}",
                     timestamp_ms,
                     pos.yaw,
@@ -362,7 +362,7 @@ impl Tracker for BallTracker {
                     );
                     self.age_frames = self.age_frames.saturating_add(1);
                     if in_diag_window(timestamp_ms) {
-                        log::debug!(
+                        log::info!(
                             "OEV_DIAG ts={:.0} event=frame_summary state=Coasting yaw={:.3} pitch={:.3} conf=0.000 frames_coasting={}",
                             timestamp_ms,
                             last.yaw,
@@ -401,7 +401,7 @@ impl Tracker for BallTracker {
                     // starts a fresh count.
                     self.age_frames = 0;
                     if in_diag_window(timestamp_ms) {
-                        log::debug!(
+                        log::info!(
                             "OEV_DIAG ts={:.0} event=frame_summary state=Lost yaw={:.3} pitch={:.3} conf=0.000",
                             timestamp_ms,
                             last.yaw,
