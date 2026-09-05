@@ -61,6 +61,14 @@ fn queue_sparse_segment(
 /// speeds differ.
 const MAX_BRIDGE_SPEED_DEG_PER_S: f32 = 178.0;
 
+/// Diagnostic-only window gate for the 134–139s hard-case instrumentation
+/// (task: OEV/Reco hard-case ledger). Purely additive — controls only
+/// whether `OEV_DIAG` log lines fire, never bridging decisions.
+#[inline]
+fn in_diag_window(ts_ms: f64) -> bool {
+    (133_500.0..=139_500.0).contains(&ts_ms)
+}
+
 /// Backward-bridge `frame.world_state.ball` when it is `None` but a genuine
 /// (`Tracking`) detection exists both behind (`anchor`) and ahead
 /// (somewhere in `lookahead`) of the current frame, by linearly
@@ -97,6 +105,8 @@ fn bridge_ball(
         Some(b) => b.state == TrackState::Coasting,
     };
 
+    let diag = in_diag_window(frame.elapsed_ms);
+
     if needs_bridge {
         if let Some((anchor_index, anchor_yaw, anchor_pitch)) = *anchor {
             let found = lookahead.iter().enumerate().find_map(|(k, ws)| {
@@ -104,6 +114,12 @@ fn bridge_ball(
                     .filter(|b| b.state == TrackState::Tracking)
                     .map(|b| (k, b))
             });
+            if diag && found.is_none() {
+                log::debug!(
+                    "OEV_DIAG ts={:.0} event=bridge_attempt outcome=no_future_tracking",
+                    frame.elapsed_ms
+                );
+            }
             if let Some((k, future)) = found {
                 let future_frame_index =
                     frame.source_frame_index + (k as u64 + 1) * stride_frames.max(1);
@@ -114,6 +130,19 @@ fn bridge_ball(
                     let d_pitch = (future.pitch - anchor_pitch) as f64;
                     let angular_distance_deg = d_yaw.hypot(d_pitch).to_degrees();
                     let implied_speed_deg_per_s = angular_distance_deg / gap_seconds;
+                    let bridge_applied = implied_speed_deg_per_s <= MAX_BRIDGE_SPEED_DEG_PER_S as f64;
+
+                    if diag {
+                        log::debug!(
+                            "OEV_DIAG ts={:.0} event=bridge_attempt anchor_idx={} gap_frames={} implied_speed={:.1} max_speed={:.1} outcome={}",
+                            frame.elapsed_ms,
+                            anchor_index,
+                            gap_frames,
+                            implied_speed_deg_per_s,
+                            MAX_BRIDGE_SPEED_DEG_PER_S,
+                            if bridge_applied { "applied" } else { "rejected_speed" }
+                        );
+                    }
 
                     if implied_speed_deg_per_s <= MAX_BRIDGE_SPEED_DEG_PER_S as f64 {
                         let elapsed_frames = frame.source_frame_index.saturating_sub(anchor_index);
@@ -138,6 +167,11 @@ fn bridge_ball(
                     }
                 }
             }
+        } else if diag {
+            log::debug!(
+                "OEV_DIAG ts={:.0} event=bridge_attempt outcome=no_anchor",
+                frame.elapsed_ms
+            );
         }
     }
 
