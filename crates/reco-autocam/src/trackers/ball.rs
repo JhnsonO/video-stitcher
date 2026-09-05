@@ -39,6 +39,8 @@
 //!
 //! [`MappedDetection::position`]: reco_core::detect::director::MappedDetection::position
 
+use std::collections::VecDeque;
+
 use reco_core::detect::detector::CameraId;
 use reco_core::detect::director::MappedDetection;
 use reco_core::detect::tracker::{TrackState, TrackedEntity, Tracker};
@@ -64,6 +66,29 @@ pub const DEFAULT_COAST_FRAMES: u32 = 20;
 /// the POC's 250-500 px pixel threshold on a 3840-wide frame.
 pub const DEFAULT_PLAYER_ANCHOR_RAD: f32 = 0.20;
 
+/// Number of most-recent trusted (freshly-accepted `Tracking`)
+/// positions retained for coast-time motion prediction.
+const COAST_PREDICTION_HISTORY_LEN: usize = 4;
+
+/// Minimum trusted history points required before a coast-time
+/// motion prediction is attempted. Below this, coasting falls back
+/// to the original hold-last-position behavior.
+const COAST_PREDICTION_MIN_HISTORY: usize = 2;
+
+/// Coast-time motion prediction fully decays to zero (falls back to
+/// hold-last-position) once this many ms have elapsed since the last
+/// trusted detection. ~1.25s — within the 1-1.5s window: long enough
+/// to bridge a real detector blackout, short enough that a genuinely
+/// stopped/lost ball doesn't keep sliding indefinitely.
+const COAST_PREDICTION_EXPIRE_MS: f64 = 1250.0;
+
+/// Hard cap on total predicted displacement from the last trusted
+/// position (radians), regardless of estimated velocity. Matches
+/// [`DEFAULT_MAX_JUMP_RAD`] — a coast prediction should never claim
+/// more per-coast displacement than a real detection jump would be
+/// allowed to make in one step.
+const COAST_PREDICTION_MAX_DISPLACEMENT_RAD: f32 = DEFAULT_MAX_JUMP_RAD;
+
 /// Singleton ball tracker emitting at most one
 /// [`TrackedEntity`] per frame.
 ///
@@ -85,6 +110,15 @@ pub struct BallTracker {
     /// Persistent age counter; singleton ball so `id` is always 0
     /// but `age_frames` ticks every frame we're actively tracking.
     age_frames: u64,
+    /// Most-recent trusted (freshly-accepted `Tracking`) positions,
+    /// oldest first, capped at [`COAST_PREDICTION_HISTORY_LEN`].
+    /// Used only to estimate coast-time motion prediction — never
+    /// consulted by [`score`](Self::score)'s jump-gating, which
+    /// continues to gate against `last` exactly as before.
+    history: VecDeque<(f64, f32, f32)>,
+    /// Timestamp (ms) of the last freshly-accepted `Tracking`
+    /// detection. `None` when there is no current track.
+    last_accept_ts: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +140,8 @@ impl BallTracker {
             player_anchor_max_rad: DEFAULT_PLAYER_ANCHOR_RAD,
             current_players: Vec::new(),
             age_frames: 0,
+            history: VecDeque::new(),
+            last_accept_ts: None,
         }
     }
 
@@ -184,6 +220,47 @@ impl BallTracker {
             (dy * dy + dp * dp).sqrt() <= self.player_anchor_max_rad
         })
     }
+
+    /// Estimate a decayed, capped (yaw, pitch) offset to apply on top
+    /// of the last trusted position while coasting, based on recent
+    /// trusted-detection history. Returns `None` when there isn't
+    /// enough history or the coast has run past
+    /// [`COAST_PREDICTION_EXPIRE_MS`] — callers fall back to holding
+    /// the exact last position in that case, matching the original
+    /// (pre-B2a) behavior.
+    fn predict_coast_offset(&self, elapsed_ms: f64) -> Option<(f32, f32)> {
+        if self.history.len() < COAST_PREDICTION_MIN_HISTORY {
+            return None;
+        }
+        if elapsed_ms <= 0.0 || elapsed_ms >= COAST_PREDICTION_EXPIRE_MS {
+            return None;
+        }
+        let (t0, y0, p0) = *self.history.front()?;
+        let (t1, y1, p1) = *self.history.back()?;
+        let dt = t1 - t0;
+        if dt <= 0.0 {
+            return None;
+        }
+        // Angular velocity from oldest to newest trusted point in
+        // the retained window (rad/ms).
+        let vel_yaw = (y1 - y0) as f64 / dt;
+        let vel_pitch = (p1 - p0) as f64 / dt;
+
+        // Linear decay to zero at COAST_PREDICTION_EXPIRE_MS — a
+        // stale prediction should shrink toward "hold position"
+        // rather than keep extrapolating at full confidence.
+        let decay = (1.0 - elapsed_ms / COAST_PREDICTION_EXPIRE_MS).max(0.0);
+        let mut offset_yaw = (vel_yaw * elapsed_ms * decay) as f32;
+        let mut offset_pitch = (vel_pitch * elapsed_ms * decay) as f32;
+
+        let mag = (offset_yaw * offset_yaw + offset_pitch * offset_pitch).sqrt();
+        if mag > COAST_PREDICTION_MAX_DISPLACEMENT_RAD {
+            let scale = COAST_PREDICTION_MAX_DISPLACEMENT_RAD / mag;
+            offset_yaw *= scale;
+            offset_pitch *= scale;
+        }
+        Some((offset_yaw, offset_pitch))
+    }
 }
 
 impl Tracker for BallTracker {
@@ -232,7 +309,11 @@ impl Tracker for BallTracker {
                 pitch: pos.pitch,
                 origin: det.camera,
             });
-            let _ = timestamp_ms;
+            self.history.push_back((timestamp_ms, pos.yaw, pos.pitch));
+            if self.history.len() > COAST_PREDICTION_HISTORY_LEN {
+                self.history.pop_front();
+            }
+            self.last_accept_ts = Some(timestamp_ms);
             self.age_frames = self.age_frames.saturating_add(1);
 
             if was_new_track {
@@ -269,18 +350,28 @@ impl Tracker for BallTracker {
         match self.coaster.step_without_fresh() {
             CoastStatus::Coasting => {
                 if let Some(last) = self.last {
+                    let elapsed_ms = self
+                        .last_accept_ts
+                        .map(|t0| timestamp_ms - t0)
+                        .unwrap_or(0.0);
+                    let (yaw, pitch) = match self.predict_coast_offset(elapsed_ms) {
+                        Some((oy, op)) => (last.yaw + oy, last.pitch + op),
+                        None => (last.yaw, last.pitch),
+                    };
                     log::trace!(
-                        "BallTracker: coasting — held yaw={:.3} pitch={:.3} ({} frames)",
+                        "BallTracker: coasting — held yaw={:.3} pitch={:.3} predicted yaw={:.3} pitch={:.3} ({} frames)",
                         last.yaw,
                         last.pitch,
+                        yaw,
+                        pitch,
                         self.coaster.frames_coasting()
                     );
                     self.age_frames = self.age_frames.saturating_add(1);
                     vec![TrackedEntity {
                         id: 0,
                         class_id: self.class_id,
-                        yaw: last.yaw,
-                        pitch: last.pitch,
+                        yaw,
+                        pitch,
                         confidence: 0.0,
                         state: TrackState::Coasting,
                         age_frames: self.age_frames,
@@ -304,8 +395,12 @@ impl Tracker for BallTracker {
                         last.pitch
                     );
                     // Age resets on full loss so the next acquisition
-                    // starts a fresh count.
+                    // starts a fresh count. History/last_accept_ts also
+                    // reset so a future acquisition doesn't inherit a
+                    // stale velocity estimate from the previous track.
                     self.age_frames = 0;
+                    self.history.clear();
+                    self.last_accept_ts = None;
                     vec![TrackedEntity {
                         id: 0,
                         class_id: self.class_id,
@@ -417,6 +512,42 @@ mod tests {
         let d4 = det(CameraId::Left, 0.21, 0.11, 0.7, 0.51, 0.51);
         let out4 = t.update(&[d4], 50.0);
         assert_eq!(out4[0].state, TrackState::Tracking);
+    }
+
+    #[test]
+    fn coast_predicts_motion_from_trusted_history() {
+        let mut t = BallTracker::new(0).with_max_coast_frames(10);
+        // Two trusted detections establishing rightward motion.
+        let d1 = det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5);
+        t.update(&[d1], 0.0);
+        let d2 = det(CameraId::Left, 0.05, 0.0, 0.9, 0.5, 0.5);
+        t.update(&[d2], 16.6);
+        // Coast one step — prediction should continue the motion
+        // past the last trusted position (0.05), not freeze there.
+        let out = t.update(&[], 33.2);
+        assert_eq!(out[0].state, TrackState::Coasting);
+        assert!(
+            out[0].yaw > 0.05,
+            "expected coast prediction to extrapolate motion, got yaw={}",
+            out[0].yaw
+        );
+        // Displacement from the last trusted position stays within
+        // the hard cap.
+        assert!((out[0].yaw - 0.05).abs() <= DEFAULT_MAX_JUMP_RAD);
+    }
+
+    #[test]
+    fn coast_prediction_expires_to_hold_position() {
+        let mut t = BallTracker::new(0).with_max_coast_frames(1000);
+        let d1 = det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5);
+        t.update(&[d1], 0.0);
+        let d2 = det(CameraId::Left, 0.05, 0.0, 0.9, 0.5, 0.5);
+        t.update(&[d2], 16.6);
+        // Coast well past COAST_PREDICTION_EXPIRE_MS — prediction
+        // should have fully decayed back to holding last position.
+        let out = t.update(&[], 16.6 + COAST_PREDICTION_EXPIRE_MS + 100.0);
+        assert_eq!(out[0].state, TrackState::Coasting);
+        assert_eq!(out[0].yaw, 0.05);
     }
 
     #[test]
