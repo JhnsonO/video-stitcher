@@ -22,6 +22,10 @@
 //! 4. **Nearest-to-last with max-jump** — among survivors, pick the
 //!    one whose panorama position is closest to the last accepted
 //!    tracked position, provided the jump is below `max_jump_rad`.
+//!    On reacquisition after a coast, when a velocity estimate from
+//!    consecutive genuine detections is available, ranking is instead
+//!    performed against the time-projected position while the same
+//!    static last-position `max_jump_rad` safety envelope remains in force.
 //!    Cross-camera yaw/pitch is meaningful because the
 //!    projection already unifies the coordinate frame, so same-cam
 //!    vs cross-cam are scored identically (unlike the Python POC
@@ -75,6 +79,10 @@ pub struct BallTracker {
     class_id: u16,
     coaster: Coaster,
     last: Option<LastKnown>,
+    /// Velocity estimated only from consecutive fresh Tracking detections,
+    /// in panorama radians per millisecond. Never updated from coast/bridge
+    /// output and cleared after a coast reacquisition or full loss.
+    last_velocity: Option<(f32, f32)>,
     max_jump_rad: f32,
     player_anchor_max_rad: f32,
     /// Current-frame player anchors in panorama yaw/pitch. Populated each
@@ -92,6 +100,7 @@ struct LastKnown {
     yaw: f32,
     pitch: f32,
     origin: CameraId,
+    timestamp_ms: f64,
 }
 
 impl BallTracker {
@@ -102,6 +111,7 @@ impl BallTracker {
             class_id,
             coaster: Coaster::new(DEFAULT_COAST_FRAMES),
             last: None,
+            last_velocity: None,
             max_jump_rad: DEFAULT_MAX_JUMP_RAD,
             player_anchor_max_rad: DEFAULT_PLAYER_ANCHOR_RAD,
             current_players: Vec::new(),
@@ -173,6 +183,35 @@ impl BallTracker {
         }
     }
 
+    /// Score a coast-time reacquisition candidate against a time-projected
+    /// position while preserving the existing static last-position jump gate.
+    ///
+    /// This is only called when a velocity estimate exists. A candidate can
+    /// rank highly because it matches the projected trajectory, but it still
+    /// cannot escape the same `max_jump_rad` envelope around the last genuine
+    /// accepted observation that normal tracking uses.
+    fn score_predicted(&self, det: &MappedDetection, timestamp_ms: f64) -> Option<f32> {
+        let pos = det.position?;
+        let last = self.last?;
+        let (vy, vp) = self.last_velocity?;
+
+        let static_dy = pos.yaw - last.yaw;
+        let static_dp = pos.pitch - last.pitch;
+        let static_dist = (static_dy * static_dy + static_dp * static_dp).sqrt();
+        if static_dist > self.max_jump_rad {
+            return None;
+        }
+
+        let elapsed_ms = (timestamp_ms - last.timestamp_ms).max(0.0) as f32;
+        let predicted_yaw = last.yaw + vy * elapsed_ms;
+        let predicted_pitch = last.pitch + vp * elapsed_ms;
+        let dy = pos.yaw - predicted_yaw;
+        let dp = pos.pitch - predicted_pitch;
+        let predicted_dist = (dy * dy + dp * dp).sqrt();
+
+        Some(predicted_dist - 0.1 * det.confidence)
+    }
+
     /// Decide whether this detection survives the player-anchor gate.
     fn passes_player_anchor(&self, pos_yaw: f32, pos_pitch: f32) -> bool {
         if self.current_players.is_empty() {
@@ -214,25 +253,54 @@ impl Tracker for BallTracker {
             survivors.push(det);
         }
 
-        // Step 5: nearest-to-last selection.
+        // Step 5: normal tracking stays nearest-to-static-last. Only a
+        // reacquisition after one or more coast frames may rank against the
+        // velocity-projected position, and only when velocity is available.
+        let was_coasting = self.coaster.frames_coasting() > 0;
+        let use_predicted = was_coasting && self.last_velocity.is_some();
         let best: Option<&MappedDetection> = survivors
             .iter()
-            .filter_map(|d| self.score(d).map(|s| (s, *d)))
+            .filter_map(|d| {
+                let score = if use_predicted {
+                    self.score_predicted(d, timestamp_ms)
+                } else {
+                    self.score(d)
+                };
+                score.map(|s| (s, *d))
+            })
             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(_, d)| d);
 
         // Step 6: lifecycle.
         if let Some(det) = best {
             let pos = det.position.expect("score() guarantees Some");
-            let was_coasting = self.coaster.frames_coasting() > 0;
             let was_new_track = self.last.is_none();
+            let previous_last = self.last;
+
+            // Velocity is learned only from consecutive genuine accepted
+            // detections. A coast-time reacquisition may use the pre-gap
+            // velocity to rank candidates, but that velocity is discarded as
+            // soon as the reacquisition is accepted so it cannot leak across
+            // the observation gap.
+            if was_coasting {
+                self.last_velocity = None;
+            } else if let Some(last) = previous_last {
+                let dt_ms = timestamp_ms - last.timestamp_ms;
+                self.last_velocity = if dt_ms > 0.0 {
+                    let dt = dt_ms as f32;
+                    Some(((pos.yaw - last.yaw) / dt, (pos.pitch - last.pitch) / dt))
+                } else {
+                    None
+                };
+            }
+
             self.coaster.accept_fresh();
             self.last = Some(LastKnown {
                 yaw: pos.yaw,
                 pitch: pos.pitch,
                 origin: det.camera,
+                timestamp_ms,
             });
-            let _ = timestamp_ms;
             self.age_frames = self.age_frames.saturating_add(1);
 
             if was_new_track {
@@ -296,6 +364,7 @@ impl Tracker for BallTracker {
                 }
             }
             CoastStatus::Lost => {
+                self.last_velocity = None;
                 if let Some(last) = self.last.take() {
                     log::info!(
                         "BallTracker: track lost after {} coast frames (last yaw={:.3} pitch={:.3})",
@@ -569,5 +638,87 @@ mod tests {
             "expected near, got {}",
             out[0].yaw
         );
+    }
+
+    #[test]
+    fn coast_reacquire_prefers_velocity_consistent_ball_over_stationary_spare() {
+        let mut t = BallTracker::new(0).with_max_jump_rad(0.35);
+        // Two genuine consecutive observations establish +0.001 rad/ms yaw velocity.
+        t.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 0.0);
+        t.update(&[det(CameraId::Left, 0.1, 0.0, 0.9, 0.5, 0.5)], 100.0);
+
+        // One missed observation starts a coast; last genuine yaw remains 0.1.
+        let coast = t.update(&[], 200.0);
+        assert_eq!(coast[0].state, TrackState::Coasting);
+
+        // At 300 ms the projected yaw is 0.3. The spare is much closer to
+        // static last=0.1, but the moving real ball should win on trajectory.
+        let spare = det(CameraId::Left, 0.11, 0.0, 0.95, 0.5, 0.5);
+        let real = det(CameraId::Left, 0.30, 0.0, 0.70, 0.5, 0.5);
+        let out = t.update(&[spare, real], 300.0);
+        assert_eq!(out[0].state, TrackState::Tracking);
+        assert!((out[0].yaw - 0.30).abs() < 1e-6, "expected moving ball");
+    }
+
+    #[test]
+    fn normal_tracking_still_scores_against_static_last() {
+        let mut t = BallTracker::new(0).with_max_jump_rad(1.0);
+        t.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 0.0);
+        t.update(&[det(CameraId::Left, 0.1, 0.0, 0.9, 0.5, 0.5)], 100.0);
+
+        // Velocity exists, but with no coast the existing static-last scoring
+        // path must remain active: 0.15 is closer to last=0.1 than 0.30.
+        let near_static = det(CameraId::Left, 0.15, 0.0, 0.60, 0.5, 0.5);
+        let along_velocity = det(CameraId::Left, 0.30, 0.0, 0.95, 0.5, 0.5);
+        let out = t.update(&[near_static, along_velocity], 200.0);
+        assert!((out[0].yaw - 0.15).abs() < 1e-6, "normal path changed");
+    }
+
+    #[test]
+    fn coast_reacquire_without_velocity_falls_back_to_static_last() {
+        let mut t = BallTracker::new(0).with_max_jump_rad(1.0);
+        // Only one genuine detection: no velocity can be established.
+        t.update(&[det(CameraId::Left, 0.2, 0.0, 0.9, 0.5, 0.5)], 0.0);
+        t.update(&[], 100.0);
+
+        let near = det(CameraId::Left, 0.21, 0.0, 0.55, 0.5, 0.5);
+        let far = det(CameraId::Left, 0.40, 0.0, 0.95, 0.5, 0.5);
+        let out = t.update(&[near, far], 200.0);
+        assert!((out[0].yaw - 0.21).abs() < 1e-6, "fallback path changed");
+    }
+
+    #[test]
+    fn predicted_reacquire_still_obeys_static_max_jump_envelope() {
+        let mut t = BallTracker::new(0).with_max_jump_rad(0.1);
+        t.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 0.0);
+        // Establish a deliberately high velocity: +0.005 rad/ms.
+        t.update(&[det(CameraId::Left, 0.05, 0.0, 0.9, 0.5, 0.5)], 10.0);
+        t.update(&[], 20.0);
+
+        // Prediction at 100ms is yaw=0.5, but that is 0.45rad from the
+        // last real observation and must be rejected by the unchanged gate.
+        let near_prediction = det(CameraId::Left, 0.50, 0.0, 0.99, 0.5, 0.5);
+        let out = t.update(&[near_prediction], 100.0);
+        assert_eq!(out[0].state, TrackState::Coasting);
+        assert!((out[0].yaw - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn full_loss_clears_velocity_before_fresh_acquisition() {
+        let mut t = BallTracker::new(0)
+            .with_max_coast_frames(1)
+            .with_max_jump_rad(0.1);
+        t.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 0.0);
+        t.update(&[det(CameraId::Left, 0.05, 0.0, 0.9, 0.5, 0.5)], 10.0);
+        let coast = t.update(&[], 20.0);
+        assert_eq!(coast[0].state, TrackState::Coasting);
+        let lost = t.update(&[], 30.0);
+        assert_eq!(lost[0].state, TrackState::Lost);
+
+        // Far beyond the old static gate, but after full loss this must be a
+        // clean first acquisition with no stale velocity or last-position bias.
+        let fresh = t.update(&[det(CameraId::Right, 1.2, 0.0, 0.8, 0.5, 0.5)], 40.0);
+        assert_eq!(fresh[0].state, TrackState::Tracking);
+        assert!((fresh[0].yaw - 1.2).abs() < 1e-6);
     }
 }
