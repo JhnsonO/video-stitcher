@@ -863,7 +863,10 @@ mod tests {
         let alternative = det(CameraId::Right, 1.40, 0.0, 0.95, 0.5, 0.5);
         let out = t.update(&[trajectory, alternative], 500.0);
         assert_eq!(out[0].state, TrackState::Tracking);
-        assert!((out[0].yaw - 1.40).abs() < 1e-6, "confidence gap should win");
+        assert!(
+            (out[0].yaw - 1.40).abs() < 1e-6,
+            "confidence gap should win"
+        );
     }
 
     #[test]
