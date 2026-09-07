@@ -30,7 +30,12 @@
 //!    projection already unifies the coordinate frame, so same-cam
 //!    vs cross-cam are scored identically (unlike the Python POC
 //!    which worked in pixels and had to special-case cross-cam).
-//! 5. **Coaster** — if no candidate survived this frame, hold the
+//! 5. **Post-loss grace** — after a full `Lost` transition, retain the
+//!    last genuine position/velocity briefly and apply a decaying soft
+//!    trajectory preference during fresh acquisition. The preference is
+//!    never a gate and expires to the same pure-confidence acquisition
+//!    used when no prior position exists.
+//! 6. **Coaster** — if no candidate survived this frame, hold the
 //!    last known position for up to `max_coast_frames` frames, then
 //!    transition to `Lost`.
 //!
@@ -68,6 +73,17 @@ pub const DEFAULT_COAST_FRAMES: u32 = 20;
 /// the POC's 250-500 px pixel threshold on a 3840-wide frame.
 pub const DEFAULT_PLAYER_ANCHOR_RAD: f32 = 0.20;
 
+/// Experimental post-loss trajectory-memory grace period.
+///
+/// 0.75s is a review/tuning default, not a fixed production constant.
+pub const DEFAULT_REACQUIRE_GRACE_MS: f64 = 750.0;
+
+/// Experimental initial trajectory contribution during post-loss acquisition.
+///
+/// 0.4 is a review/tuning default; the contribution decays to zero over
+/// [`DEFAULT_REACQUIRE_GRACE_MS`].
+pub const DEFAULT_REACQUIRE_INITIAL_WEIGHT: f32 = 0.40;
+
 /// Singleton ball tracker emitting at most one
 /// [`TrackedEntity`] per frame.
 ///
@@ -81,8 +97,14 @@ pub struct BallTracker {
     last: Option<LastKnown>,
     /// Velocity estimated only from consecutive fresh Tracking detections,
     /// in panorama radians per millisecond. Never updated from coast/bridge
-    /// output and cleared after a coast reacquisition or full loss.
+    /// output. It is retained across full loss only for the short reacquisition
+    /// grace window and discarded once that memory is consumed or expires.
     last_velocity: Option<(f32, f32)>,
+    /// Timestamp of the first full Lost transition while retained trajectory
+    /// memory is active. `None` means normal tracking/acquisition semantics.
+    lost_at_ms: Option<f64>,
+    reacquire_grace_ms: f64,
+    reacquire_initial_weight: f32,
     max_jump_rad: f32,
     player_anchor_max_rad: f32,
     /// Current-frame player anchors in panorama yaw/pitch. Populated each
@@ -112,6 +134,9 @@ impl BallTracker {
             coaster: Coaster::new(DEFAULT_COAST_FRAMES),
             last: None,
             last_velocity: None,
+            lost_at_ms: None,
+            reacquire_grace_ms: DEFAULT_REACQUIRE_GRACE_MS,
+            reacquire_initial_weight: DEFAULT_REACQUIRE_INITIAL_WEIGHT,
             max_jump_rad: DEFAULT_MAX_JUMP_RAD,
             player_anchor_max_rad: DEFAULT_PLAYER_ANCHOR_RAD,
             current_players: Vec::new(),
@@ -134,6 +159,18 @@ impl BallTracker {
     /// Override the coast budget.
     pub fn with_max_coast_frames(mut self, n: u32) -> Self {
         self.coaster = Coaster::new(n);
+        self
+    }
+
+    /// Override the post-loss trajectory-memory grace period.
+    pub fn with_reacquire_grace_ms(mut self, grace_ms: f64) -> Self {
+        self.reacquire_grace_ms = grace_ms.max(0.0);
+        self
+    }
+
+    /// Override the initial post-loss trajectory contribution.
+    pub fn with_reacquire_initial_weight(mut self, weight: f32) -> Self {
+        self.reacquire_initial_weight = weight.clamp(0.0, 1.0);
         self
     }
 
@@ -212,6 +249,70 @@ impl BallTracker {
         Some(predicted_dist - 0.1 * det.confidence)
     }
 
+    /// Return normalized trajectory proximity in [0, 1] for post-loss memory.
+    ///
+    /// `max_jump_rad` is reused only as a normalization radius here, never as
+    /// a rejection gate: candidates outside the radius receive proximity 0
+    /// and remain eligible on confidence.
+    fn trajectory_proximity(&self, det: &MappedDetection, elapsed_ms: f64) -> Option<f32> {
+        let pos = det.position?;
+        let last = self.last?;
+        let (vy, vp) = self.last_velocity?;
+        let elapsed = elapsed_ms.max(0.0) as f32;
+        let predicted_yaw = last.yaw + vy * elapsed;
+        let predicted_pitch = last.pitch + vp * elapsed;
+        let dy = pos.yaw - predicted_yaw;
+        let dp = pos.pitch - predicted_pitch;
+        let dist = (dy * dy + dp * dp).sqrt();
+
+        if self.max_jump_rad <= f32::EPSILON {
+            return Some(if dist <= f32::EPSILON { 1.0 } else { 0.0 });
+        }
+
+        Some((1.0 - dist / self.max_jump_rad).clamp(0.0, 1.0))
+    }
+
+    /// Higher-is-better soft acquisition score while post-loss memory exists.
+    ///
+    /// Linear decay is deliberate: it reaches exactly zero at the grace
+    /// boundary, making `t >= T` unambiguously identical to pure confidence
+    /// with no exponential tail. Missing trajectory memory also falls back to
+    /// pure confidence.
+    fn lost_reacquire_score(&self, det: &MappedDetection, timestamp_ms: f64) -> f32 {
+        let Some(lost_at_ms) = self.lost_at_ms else {
+            return det.confidence;
+        };
+        if self.reacquire_grace_ms <= 0.0 {
+            return det.confidence;
+        }
+
+        let elapsed_ms = (timestamp_ms - lost_at_ms).max(0.0);
+        if elapsed_ms >= self.reacquire_grace_ms {
+            return det.confidence;
+        }
+
+        let Some(proximity) = self.trajectory_proximity(det, elapsed_ms) else {
+            return det.confidence;
+        };
+        let remaining = 1.0 - (elapsed_ms / self.reacquire_grace_ms) as f32;
+        let weight = self.reacquire_initial_weight * remaining;
+        det.confidence * (1.0 - weight) + proximity * weight
+    }
+
+    /// Clear retained post-loss trajectory memory once its grace window ends.
+    fn expire_lost_memory(&mut self, timestamp_ms: f64) {
+        let Some(lost_at_ms) = self.lost_at_ms else {
+            return;
+        };
+        let elapsed_ms = (timestamp_ms - lost_at_ms).max(0.0);
+        if self.reacquire_grace_ms <= 0.0 || elapsed_ms >= self.reacquire_grace_ms {
+            self.last = None;
+            self.last_velocity = None;
+            self.lost_at_ms = None;
+            log::debug!("BallTracker: post-loss trajectory grace expired");
+        }
+    }
+
     /// Decide whether this detection survives the player-anchor gate.
     fn passes_player_anchor(&self, pos_yaw: f32, pos_pitch: f32) -> bool {
         if self.current_players.is_empty() {
@@ -227,6 +328,8 @@ impl BallTracker {
 
 impl Tracker for BallTracker {
     fn update(&mut self, detections: &[MappedDetection], timestamp_ms: f64) -> Vec<TrackedEntity> {
+        self.expire_lost_memory(timestamp_ms);
+
         // Step 1-4: filter candidates down to survivors.
         let mut survivors: Vec<&MappedDetection> = Vec::with_capacity(detections.len());
         for det in detections {
@@ -256,33 +359,48 @@ impl Tracker for BallTracker {
         // Step 5: normal tracking stays nearest-to-static-last. Only a
         // reacquisition after one or more coast frames may rank against the
         // velocity-projected position, and only when velocity is available.
+        // A full-Lost reacquisition is separate: retained trajectory memory is
+        // a soft higher-is-better blend with no max-jump rejection.
         let was_coasting = self.coaster.frames_coasting() > 0;
-        let use_predicted = was_coasting && self.last_velocity.is_some();
-        let best: Option<&MappedDetection> = survivors
-            .iter()
-            .filter_map(|d| {
-                let score = if use_predicted {
-                    self.score_predicted(d, timestamp_ms)
-                } else {
-                    self.score(d)
-                };
-                score.map(|s| (s, *d))
-            })
-            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(_, d)| d);
+        let was_lost = self.lost_at_ms.is_some();
+        let best: Option<&MappedDetection> = if was_lost {
+            survivors
+                .iter()
+                .map(|d| (self.lost_reacquire_score(d, timestamp_ms), *d))
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(_, d)| d)
+        } else {
+            let use_predicted = was_coasting && self.last_velocity.is_some();
+            survivors
+                .iter()
+                .filter_map(|d| {
+                    let score = if use_predicted {
+                        self.score_predicted(d, timestamp_ms)
+                    } else {
+                        self.score(d)
+                    };
+                    score.map(|s| (s, *d))
+                })
+                .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(_, d)| d)
+        };
 
         // Step 6: lifecycle.
         if let Some(det) = best {
-            let pos = det.position.expect("score() guarantees Some");
-            let was_new_track = self.last.is_none();
+            let pos = det.position.expect("scored candidates guarantee Some");
+            let was_new_track = was_lost || self.last.is_none();
             let previous_last = self.last;
 
             // Velocity is learned only from consecutive genuine accepted
             // detections. A coast-time reacquisition may use the pre-gap
             // velocity to rank candidates, but that velocity is discarded as
             // soon as the reacquisition is accepted so it cannot leak across
-            // the observation gap.
-            if was_coasting {
+            // the observation gap. Full-Lost memory is likewise consumed on
+            // the first accepted fresh acquisition.
+            if was_lost {
+                self.last_velocity = None;
+                self.lost_at_ms = None;
+            } else if was_coasting {
                 self.last_velocity = None;
             } else if let Some(last) = previous_last {
                 let dt_ms = timestamp_ms - last.timestamp_ms;
@@ -364,8 +482,13 @@ impl Tracker for BallTracker {
                 }
             }
             CoastStatus::Lost => {
-                self.last_velocity = None;
-                if let Some(last) = self.last.take() {
+                // Emit the Lost transition once, then retain position/velocity
+                // only as soft acquisition memory until the grace expires.
+                if self.lost_at_ms.is_some() {
+                    return vec![];
+                }
+                if let Some(last) = self.last {
+                    self.lost_at_ms = Some(timestamp_ms);
                     log::info!(
                         "BallTracker: track lost after {} coast frames (last yaw={:.3} pitch={:.3})",
                         self.coaster.frames_coasting(),
@@ -704,21 +827,91 @@ mod tests {
     }
 
     #[test]
-    fn full_loss_clears_velocity_before_fresh_acquisition() {
-        let mut t = BallTracker::new(0)
-            .with_max_coast_frames(1)
-            .with_max_jump_rad(0.1);
+    fn full_loss_retains_trajectory_memory_without_reemitting_lost() {
+        let mut t = BallTracker::new(0).with_max_coast_frames(1);
         t.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 0.0);
         t.update(&[det(CameraId::Left, 0.05, 0.0, 0.9, 0.5, 0.5)], 10.0);
         let coast = t.update(&[], 20.0);
         assert_eq!(coast[0].state, TrackState::Coasting);
         let lost = t.update(&[], 30.0);
         assert_eq!(lost[0].state, TrackState::Lost);
+        assert!(t.last.is_some());
+        assert!(t.last_velocity.is_some());
+        assert_eq!(t.lost_at_ms, Some(30.0));
 
-        // Far beyond the old static gate, but after full loss this must be a
-        // clean first acquisition with no stale velocity or last-position bias.
-        let fresh = t.update(&[det(CameraId::Right, 1.2, 0.0, 0.8, 0.5, 0.5)], 40.0);
-        assert_eq!(fresh[0].state, TrackState::Tracking);
-        assert!((fresh[0].yaw - 1.2).abs() < 1e-6);
+        let repeated = t.update(&[], 40.0);
+        assert!(repeated.is_empty());
+        assert!(t.last.is_some());
+        assert!(t.last_velocity.is_some());
+    }
+
+    #[test]
+    fn lost_grace_yields_to_much_higher_confidence_mid_window() {
+        let mut t = BallTracker::new(0)
+            .with_max_coast_frames(0)
+            .with_max_jump_rad(0.35);
+        t.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 0.0);
+        t.update(&[det(CameraId::Left, 0.1, 0.0, 0.9, 0.5, 0.5)], 100.0);
+        let lost = t.update(&[], 200.0);
+        assert_eq!(lost[0].state, TrackState::Lost);
+
+        // At 300ms into the 750ms grace, linear decay gives w=0.24.
+        // Trajectory candidate score = 0.3*0.76 + 1.0*0.24 = 0.468.
+        // A zero-proximity alternative needs confidence >0.616 to win;
+        // 0.95 is intentionally well beyond that threshold.
+        let trajectory = det(CameraId::Left, 0.40, 0.0, 0.30, 0.5, 0.5);
+        let alternative = det(CameraId::Right, 1.40, 0.0, 0.95, 0.5, 0.5);
+        let out = t.update(&[trajectory, alternative], 500.0);
+        assert_eq!(out[0].state, TrackState::Tracking);
+        assert!((out[0].yaw - 1.40).abs() < 1e-6, "confidence gap should win");
+    }
+
+    #[test]
+    fn lost_grace_expires_to_pure_confidence_at_boundary() {
+        let mut inside = BallTracker::new(0)
+            .with_max_coast_frames(0)
+            .with_max_jump_rad(0.35);
+        inside.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 0.0);
+        inside.update(&[det(CameraId::Left, 0.1, 0.0, 0.9, 0.5, 0.5)], 100.0);
+        inside.update(&[], 200.0);
+        let trajectory = det(CameraId::Left, 0.20, 0.0, 0.40, 0.5, 0.5);
+        let higher_conf = det(CameraId::Right, 1.20, 0.0, 0.60, 0.5, 0.5);
+        let inside_out = inside.update(&[trajectory, higher_conf], 300.0);
+        assert!(
+            (inside_out[0].yaw - 0.20).abs() < 1e-6,
+            "trajectory boost should still apply before T"
+        );
+
+        let mut expired = BallTracker::new(0)
+            .with_max_coast_frames(0)
+            .with_max_jump_rad(0.35);
+        expired.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 0.0);
+        expired.update(&[det(CameraId::Left, 0.1, 0.0, 0.9, 0.5, 0.5)], 100.0);
+        expired.update(&[], 200.0);
+        let trajectory = det(CameraId::Left, 0.85, 0.0, 0.40, 0.5, 0.5);
+        let higher_conf = det(CameraId::Right, 1.20, 0.0, 0.60, 0.5, 0.5);
+        let expired_out = expired.update(&[trajectory, higher_conf], 950.0);
+        assert!(
+            (expired_out[0].yaw - 1.20).abs() < 1e-6,
+            "t >= T must be pure confidence"
+        );
+    }
+
+    #[test]
+    fn lost_grace_does_not_block_far_new_possession() {
+        let mut t = BallTracker::new(0)
+            .with_max_coast_frames(0)
+            .with_max_jump_rad(0.05);
+        t.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 0.0);
+        t.update(&[det(CameraId::Left, 0.05, 0.0, 0.9, 0.5, 0.5)], 100.0);
+        let lost = t.update(&[], 200.0);
+        assert_eq!(lost[0].state, TrackState::Lost);
+
+        // Far outside the 0.05rad normalization radius, so proximity is 0.
+        // It must remain eligible and reacquire rather than being hard-gated.
+        let new_possession = det(CameraId::Right, 1.50, 0.0, 0.80, 0.5, 0.5);
+        let out = t.update(&[new_possession], 300.0);
+        assert_eq!(out[0].state, TrackState::Tracking);
+        assert!((out[0].yaw - 1.50).abs() < 1e-6);
     }
 }
