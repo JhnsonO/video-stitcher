@@ -259,12 +259,14 @@ impl DormantStaticSites {
             .windows(2)
             .filter_map(|pair| {
                 let dt_ms = pair[1].timestamp_ms - pair[0].timestamp_ms;
-                (dt_ms > 0.0).then(|| {
-                    Self::distance(
+                if dt_ms > 0.0 {
+                    Some(Self::distance(
                         (pair[0].yaw, pair[0].pitch),
                         (pair[1].yaw, pair[1].pitch),
-                    ) / dt_ms as f32
-                })
+                    ) / dt_ms as f32)
+                } else {
+                    None
+                }
             })
             .collect();
         let robust_velocity = Self::percentile(velocities, 0.5);
@@ -288,6 +290,9 @@ impl DormantStaticSites {
             return None;
         }
 
+        // Player tracks do not currently expose goalkeeper/outfield roles, so
+        // this deliberately uses every tracked player. Role classification is
+        // outside the static-site filter's scope.
         let mut weighted_yaw = 0.0;
         let mut weighted_pitch = 0.0;
         let mut total_weight = 0.0;
@@ -298,12 +303,14 @@ impl DormantStaticSites {
                 .find(|sample| sample.id == player.id)
                 .and_then(|sample| {
                     let dt_ms = timestamp_ms - sample.timestamp_ms;
-                    (dt_ms > 0.0).then(|| {
-                        Self::distance(
+                    if dt_ms > 0.0 {
+                        Some(Self::distance(
                             (player.yaw, player.pitch),
                             (sample.yaw, sample.pitch),
-                        ) / dt_ms as f32
-                    })
+                        ) / dt_ms as f32)
+                    } else {
+                        None
+                    }
                 })
                 .unwrap_or(0.0);
             weighted_yaw += player.yaw * velocity;
