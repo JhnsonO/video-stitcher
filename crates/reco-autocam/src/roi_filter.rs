@@ -122,6 +122,18 @@ pub struct RoiFilteredDetector {
     roi: FieldRoi,
     class_anchors: HashMap<u16, RoiAnchor>,
     default_anchor: RoiAnchor,
+    // Ball-ROI generous vertical margin (OEV hard-case 134-139s fix,
+    // ported from ffa-automations commit 916529a61f -- originally a
+    // diagnostic-only build-time patch, never committed to this repo).
+    // Every other class's filtering path above is untouched;
+    // ball_class_id stays None unless with_ball_roi_diagnostics is
+    // called, so default behaviour is identical to production.
+    ball_class_id: Option<u16>,
+    ball_vertical_margin: f64,
+    roi_diag_frame_left: u64,
+    roi_diag_frame_right: u64,
+    roi_diag_fps: f32,
+    roi_diag_frame_stride: u32,
 }
 
 impl RoiFilteredDetector {
@@ -134,6 +146,12 @@ impl RoiFilteredDetector {
             roi,
             class_anchors: HashMap::new(),
             default_anchor: RoiAnchor::Center,
+            ball_class_id: None,
+            ball_vertical_margin: 0.0,
+            roi_diag_frame_left: 0,
+            roi_diag_frame_right: 0,
+            roi_diag_fps: 60.0,
+            roi_diag_frame_stride: 1,
         }
     }
 
@@ -149,6 +167,32 @@ impl RoiFilteredDetector {
         self.default_anchor = anchor;
         self
     }
+
+    /// Gives `ball_class_id` a generous vertical allowance above the field
+    /// polygon's top edge before the ROI test, so a lofted ball whose
+    /// center is genuinely above the pitch line is not rejected purely for
+    /// being airborne. No other class is affected: `filter_by_roi` below
+    /// still runs unmodified for every class except this one. `fps` /
+    /// `frame_stride` are used only to derive an approximate timestamp for
+    /// window-scoped `eprintln!` diagnostics, matching the same cadence
+    /// formula used elsewhere in the autocam pipeline. Chainable.
+    ///
+    /// Ported from the OEV hard-case 134-139s ball-ROI fix
+    /// (ffa-automations commit 916529a61f); `vertical_margin=0.40` is the
+    /// value that fix used, not re-derived here.
+    pub fn with_ball_roi_diagnostics(
+        mut self,
+        ball_class_id: u16,
+        vertical_margin: f64,
+        fps: f32,
+        frame_stride: u32,
+    ) -> Self {
+        self.ball_class_id = Some(ball_class_id);
+        self.ball_vertical_margin = vertical_margin;
+        self.roi_diag_fps = fps;
+        self.roi_diag_frame_stride = frame_stride;
+        self
+    }
 }
 
 impl UnifiedDetector for RoiFilteredDetector {
@@ -162,12 +206,57 @@ impl UnifiedDetector for RoiFilteredDetector {
         frame: &DetectorFrame<'_>,
     ) -> Result<Vec<Detection>, DetectorError> {
         let detections = self.inner.detect(camera, frame)?;
-        Ok(filter_by_roi(
-            detections,
-            &self.roi,
-            &self.class_anchors,
-            self.default_anchor,
-        ))
+
+        // No-op (ball_dets always empty, kept == filter_by_roi(detections,
+        // ...)) unless with_ball_roi_diagnostics was called.
+        let frame_index = match camera {
+            CameraId::Left => {
+                let i = self.roi_diag_frame_left;
+                self.roi_diag_frame_left += 1;
+                i
+            }
+            CameraId::Right => {
+                let i = self.roi_diag_frame_right;
+                self.roi_diag_frame_right += 1;
+                i
+            }
+        };
+        let timestamp_ms = frame_index as f64 * 1000.0 * self.roi_diag_frame_stride as f64
+            / self.roi_diag_fps as f64;
+        let diag_window = (133000.0..=140000.0).contains(&timestamp_ms);
+
+        let (ball_dets, other_dets): (Vec<Detection>, Vec<Detection>) = detections
+            .into_iter()
+            .partition(|d| self.ball_class_id == Some(d.class_id));
+
+        let mut kept = filter_by_roi(other_dets, &self.roi, &self.class_anchors, self.default_anchor);
+
+        let polygon: &[[f64; 2]] = match camera {
+            CameraId::Left => &self.roi.left,
+            CameraId::Right => &self.roi.right,
+        };
+
+        if polygon.len() < 3 {
+            kept.extend(ball_dets);
+        } else {
+            for d in ball_dets {
+                let cx = d.center_x as f64;
+                let cy = d.center_y as f64;
+                let adj_cy = cy + self.ball_vertical_margin;
+                let roi_pass = point_in_polygon([cx, adj_cy], polygon);
+                if diag_window {
+                    eprintln!(
+                        "OEV_ROI_DIAG cam={:?} t_ms={:.3} cx={:.4} cy={:.4} adj_cy={:.4} roi_pass={}",
+                        camera, timestamp_ms, cx, cy, adj_cy, roi_pass
+                    );
+                }
+                if roi_pass {
+                    kept.push(d);
+                }
+            }
+        }
+
+        Ok(kept)
     }
 
     fn class_names(&self) -> Option<&[String]> {
