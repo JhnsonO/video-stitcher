@@ -288,7 +288,7 @@ impl Default for FieldPannerConfig {
 }
 
 /// Names accepted by [`FieldPannerConfig::from_preset_name`].
-pub const PRESET_NAMES: &[&str] = &["broadcast", "action", "frame_all", "v4_micro_damping"];
+pub const PRESET_NAMES: &[&str] = &["broadcast", "action", "frame_all", "v4_micro_damping", "v4_micro_damping_8aside_test"];
 
 impl FieldPannerConfig {
     /// Calm, anticipatory broadcast framing - the validated default.
@@ -326,6 +326,32 @@ impl FieldPannerConfig {
         }
     }
 
+    /// TEST preset, not yet validated: a faster-paced variant of
+    /// [`Self::v4_micro_damping`] for small-sided games (built for an
+    /// 8-a-side test). Raises `ball_weight` (the panner was measured
+    /// following the player cluster too heavily and losing the ball when
+    /// it separated from it - 0.20 left 25.7% of *clean*, non-glitchy
+    /// frames with the ball outside view), and loosens
+    /// `max_velocity_rad_per_sec`/`velocity_alpha` (found to be the
+    /// actual binding speed limit underneath the v4 dynamics layer -
+    /// EVERY existing preset, including `action`, shares the same
+    /// untouched 0.18 rad/s cap, so raising only the v4-specific fields
+    /// was not enough on its own) and the containment guard's per-frame
+    /// correction cap (0.35 deg/frame could not close the ~17-20 deg
+    /// gaps actually observed). Values below are a reasoned starting
+    /// point, not measured - the point of this preset is to test them.
+    pub fn v4_micro_damping_8aside_test() -> Self {
+        Self {
+            ball_weight: 0.55,
+            max_velocity_rad_per_sec: 0.6,
+            velocity_alpha: 0.20,
+            yaw_accel_rad_per_frame2: 0.30_f32.to_radians(),
+            max_yaw_step_rad: 2.0_f32.to_radians(),
+            micro_hold_rad: 2.0_f32.to_radians(),
+            ..Self::v4_micro_damping()
+        }
+    }
+
     /// Keep every player in frame (team framing).
     pub fn frame_all() -> Self {
         Self {
@@ -345,6 +371,7 @@ impl FieldPannerConfig {
             "action" => Some(Self::action()),
             "frame_all" => Some(Self::frame_all()),
             "v4_micro_damping" => Some(Self::v4_micro_damping()),
+            "v4_micro_damping_8aside_test" => Some(Self::v4_micro_damping_8aside_test()),
             _ => None,
         }
     }
@@ -1879,6 +1906,19 @@ mod tests {
         let broadcast = FieldPannerConfig::broadcast();
         assert!(!broadcast.camera_dynamics_enabled);
         assert!(!broadcast.containment_guard_enabled);
+    }
+
+    #[test]
+    fn v4_8aside_test_preset_raises_ball_weight_and_speed_caps_above_v4() {
+        let base = FieldPannerConfig::v4_micro_damping();
+        let fast = FieldPannerConfig::v4_micro_damping_8aside_test();
+        assert!(fast.camera_dynamics_enabled);
+        assert!(fast.containment_guard_enabled);
+        assert!(fast.ball_weight > base.ball_weight);
+        assert!(fast.max_velocity_rad_per_sec > base.max_velocity_rad_per_sec);
+        assert!(fast.velocity_alpha > base.velocity_alpha);
+        assert!(fast.micro_hold_rad > base.micro_hold_rad);
+        assert!(FieldPannerConfig::from_preset_name("v4_micro_damping_8aside_test").is_some());
     }
 
     #[test]
