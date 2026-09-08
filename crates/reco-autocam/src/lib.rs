@@ -323,6 +323,11 @@ pub fn setup_autocam(
     // so feet + 75th-pctile must both lie inside the ROI; ball stays
     // on the Center default).
     let person_id_for_roi = resolve_or(&class_names, &["person"], 0);
+    // Ball-ROI generous vertical margin (OEV hard-case 134-139s fix, ported
+    // from ffa-automations commit 916529a61f). Resolved the same way as
+    // person_id_for_roi above; falls back to COCO's "sports ball" id (32)
+    // if the model's label list doesn't have an exact match.
+    let ball_id_for_roi = resolve_or(&class_names, &["ball", "sports ball", "football"], 32);
 
     // Tiny helper so each backend's "wrap the detector in
     // RoiFilteredDetector if ROI is present" site stays one line.
@@ -331,7 +336,13 @@ pub fn setup_autocam(
      -> Box<dyn reco_core::detect::detector::UnifiedDetector> {
         Box::new(
             RoiFilteredDetector::new(inner, roi)
-                .with_class_anchor(person_id_for_roi, RoiAnchor::Bottom),
+                .with_class_anchor(person_id_for_roi, RoiAnchor::Bottom)
+                // Generous vertical margin (0.40, normalized) so a lofted
+                // ball genuinely above the pitch line isn't rejected purely
+                // for being airborne. frame_stride is u64 here but the
+                // builder takes u32 (ported from an older commit where it
+                // already was u32) -- cast at the call site.
+                .with_ball_roi_diagnostics(ball_id_for_roi, 0.40, fps, frame_stride as u32),
         )
     };
 
