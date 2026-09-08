@@ -94,8 +94,13 @@ const SITE_MAX_RADIUS_RAD: f32 = 1.0 * DEG_TO_RAD;
 const STATIC_MIN_SPAN_MS: f64 = 1_500.0;
 const STATIC_MIN_DETECTIONS: usize = 6;
 const EPISODE_GAP_MS: f64 = 750.0;
-const EPISODE_START_SEPARATION_MS: f64 = 5_000.0;
-const DORMANT_EVIDENCE_SPAN_MS: f64 = 20_000.0;
+// TEST-ONLY (mechanism validation, not a production tuning change):
+// dropped from 5_000.0 / 20_000.0 so the same clip's decoy can accumulate
+// enough evidence to go dormant within its first ~10-15s instead of near
+// the end / not at all, given the observed ~1-1.5s flicker rate between
+// the real ball and the decoy. Revert both before merging for real.
+const EPISODE_START_SEPARATION_MS: f64 = 1_000.0;
+const DORMANT_EVIDENCE_SPAN_MS: f64 = 4_000.0;
 const ALT_TRACK_MIN_MS: f64 = 750.0;
 const PLAYER_FAR_MIN_MS: f64 = 1_000.0;
 const CONTRADICTION_MIN_RAD: f32 = 0.15;
@@ -498,7 +503,9 @@ impl DormantStaticSites {
             first_start_ms: site.episodes.first().map_or(0.0, |episode| episode.start_ms),
             last_end_ms: site.episodes.last().map_or(0.0, |episode| episode.end_ms),
         };
-        site.dormant = site.evidence.episode_count >= 3
+        // TEST-ONLY: dropped from >= 3 (see EPISODE_START_SEPARATION_MS /
+        // DORMANT_EVIDENCE_SPAN_MS comment above). Revert before merging.
+        site.dormant = site.evidence.episode_count >= 2
             && site.evidence.last_end_ms - site.evidence.first_start_ms
                 >= DORMANT_EVIDENCE_SPAN_MS
             && site.evidence.contradicted_episode_count > 0;
