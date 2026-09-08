@@ -211,6 +211,35 @@ pub struct FieldPannerConfig {
     /// Tilt held when [`lock_pitch`](Self::lock_pitch) is set, in radians
     /// (panorama frame; `0.0` = level). Ignored otherwise.
     pub locked_pitch_rad: f32,
+    /// Enables the acceleration-limited camera dynamics layer (below).
+    /// `false` (default) preserves existing behaviour exactly - the
+    /// velocity-clamped chase above is unchanged unless this is set.
+    ///
+    /// From-spec reimplementation of the "v4 micro-damping" experiment
+    /// (`ffa-automations` branch `experiment/lookahead-ball-containment-01`,
+    /// reference run `31913398625`). That work was never committed to
+    /// this repo - it lived only as a source patch applied at build time
+    /// on a test pod - so this is a fresh implementation matching its
+    /// documented parameters and behaviour, not a literal port.
+    pub camera_dynamics_enabled: bool,
+    /// Max allowed frame-to-frame change in chase velocity (radians),
+    /// applied on top of the existing `velocity_alpha` EMA. Spec value:
+    /// `yaw_accel_deg_per_frame2 = 0.08`.
+    pub yaw_accel_rad_per_frame2: f32,
+    /// Hard per-frame cap on chase velocity (radians), applied after the
+    /// acceleration limit above. Spec value: `max_yaw_step_deg = 0.75`.
+    pub max_yaw_step_rad: f32,
+    /// Enables the post-smoothing containment guard (below). `false`
+    /// (default) preserves existing behaviour exactly.
+    pub containment_guard_enabled: bool,
+    /// Distance (radians) from the frame edge at which the containment
+    /// guard starts nudging the aim back toward a still-tracked ball, so
+    /// it corrects before the ball actually leaves frame rather than
+    /// after. Spec value: `micro_zone_deg = 4.0`.
+    pub micro_zone_rad: f32,
+    /// Max correction (radians) the containment guard applies in a
+    /// single frame. Spec value: `micro_hold_deg = 0.35`.
+    pub micro_hold_rad: f32,
 }
 
 impl Default for FieldPannerConfig {
@@ -248,12 +277,18 @@ impl Default for FieldPannerConfig {
             frame_all_margin_deg: 8.0,
             lock_pitch: false,
             locked_pitch_rad: 0.0,
+            camera_dynamics_enabled: false,
+            yaw_accel_rad_per_frame2: 0.08_f32.to_radians(),
+            max_yaw_step_rad: 0.75_f32.to_radians(),
+            containment_guard_enabled: false,
+            micro_zone_rad: 4.0_f32.to_radians(),
+            micro_hold_rad: 0.35_f32.to_radians(),
         }
     }
 }
 
 /// Names accepted by [`FieldPannerConfig::from_preset_name`].
-pub const PRESET_NAMES: &[&str] = &["broadcast", "action", "frame_all"];
+pub const PRESET_NAMES: &[&str] = &["broadcast", "action", "frame_all", "v4_micro_damping"];
 
 impl FieldPannerConfig {
     /// Calm, anticipatory broadcast framing - the validated default.
@@ -278,6 +313,19 @@ impl FieldPannerConfig {
         }
     }
 
+    /// Calm broadcast framing with the acceleration-limited camera
+    /// dynamics and post-smoothing containment guard enabled - a
+    /// from-spec reimplementation of the "v4 micro-damping" experiment
+    /// (see field docs on [`camera_dynamics_enabled`](Self::camera_dynamics_enabled)
+    /// for provenance). Everything else matches [`Self::broadcast`].
+    pub fn v4_micro_damping() -> Self {
+        Self {
+            camera_dynamics_enabled: true,
+            containment_guard_enabled: true,
+            ..Self::broadcast()
+        }
+    }
+
     /// Keep every player in frame (team framing).
     pub fn frame_all() -> Self {
         Self {
@@ -296,6 +344,7 @@ impl FieldPannerConfig {
             "broadcast" => Some(Self::broadcast()),
             "action" => Some(Self::action()),
             "frame_all" => Some(Self::frame_all()),
+            "v4_micro_damping" => Some(Self::v4_micro_damping()),
             _ => None,
         }
     }
@@ -335,6 +384,10 @@ impl FieldPannerConfig {
         self.lookahead_reactivity = self.lookahead_reactivity.clamp(1.0, 10.0);
         self.ball_presence_decay = self.ball_presence_decay.clamp(0.0, 1.0);
         self.ball_presence_attack = self.ball_presence_attack.clamp(0.0, 1.0);
+        self.yaw_accel_rad_per_frame2 = self.yaw_accel_rad_per_frame2.max(0.0);
+        self.max_yaw_step_rad = self.max_yaw_step_rad.max(0.0);
+        self.micro_zone_rad = self.micro_zone_rad.max(0.0);
+        self.micro_hold_rad = self.micro_hold_rad.max(0.0);
         if self != before {
             log::warn!(
                 "FieldPannerConfig: clamped out-of-range values to valid ranges \
@@ -942,8 +995,41 @@ impl Panner for FieldPanner {
             let desired_yaw = err_yaw.clamp(-max_v, max_v);
             let desired_pitch = err_pitch.clamp(-max_v, max_v);
 
+            let prev_velocity_yaw = self.velocity_yaw;
+            let prev_velocity_pitch = self.velocity_pitch;
             self.velocity_yaw += v_alpha * (desired_yaw - self.velocity_yaw);
             self.velocity_pitch += v_alpha * (desired_pitch - self.velocity_pitch);
+
+            // V4 acceleration-limited camera dynamics (opt-in, see
+            // `camera_dynamics_enabled` docs for provenance): cap how much
+            // the chase velocity itself is allowed to change in one frame,
+            // on top of the existing EMA above, then hard-cap the velocity
+            // itself. Additive - a no-op when disabled (default).
+            if self.config.camera_dynamics_enabled {
+                let accel_limit = self.config.yaw_accel_rad_per_frame2;
+                let raw_dv_yaw = self.velocity_yaw - prev_velocity_yaw;
+                let raw_dv_pitch = self.velocity_pitch - prev_velocity_pitch;
+                let dv_yaw = raw_dv_yaw.clamp(-accel_limit, accel_limit);
+                let dv_pitch = raw_dv_pitch.clamp(-accel_limit, accel_limit);
+                self.velocity_yaw = prev_velocity_yaw + dv_yaw;
+                self.velocity_pitch = prev_velocity_pitch + dv_pitch;
+
+                let max_step = self.config.max_yaw_step_rad;
+                self.velocity_yaw = self.velocity_yaw.clamp(-max_step, max_step);
+                self.velocity_pitch = self.velocity_pitch.clamp(-max_step, max_step);
+
+                let yaw_reduction = (raw_dv_yaw - dv_yaw).abs();
+                let pitch_reduction = (raw_dv_pitch - dv_pitch).abs();
+                if yaw_reduction > 1e-6 || pitch_reduction > 1e-6 {
+                    log::trace!(
+                        "BALL_CAMERA_DYNAMICS frame={} yaw_reduction_deg={:.4} \
+                         pitch_reduction_deg={:.4}",
+                        self.frame_index,
+                        yaw_reduction.to_degrees(),
+                        pitch_reduction.to_degrees(),
+                    );
+                }
+            }
 
             self.yaw += self.velocity_yaw;
             self.pitch += self.velocity_pitch;
@@ -1018,6 +1104,44 @@ impl Panner for FieldPanner {
                 self.lead_pitch,
                 self.config.lock_pitch,
             );
+        }
+
+        // V4 post-smoothing containment guard (opt-in, see
+        // `containment_guard_enabled` docs for provenance): if a still-
+        // tracked ball would fall within `micro_zone_rad` of the visible
+        // edge at the aim/FOV just computed above, nudge the aim back
+        // toward it directly (capped at `micro_hold_rad`/frame) - a
+        // last-resort correction on top of the normal cluster/dead-zone
+        // chase, specifically to catch the case where a known ball
+        // position still ends up outside frame. No-op when disabled
+        // (default) or when there is no live ball this frame.
+        if self.config.containment_guard_enabled
+            && let Some(b) = world
+                .ball
+                .as_ref()
+                .filter(|b| !matches!(b.state, TrackState::Lost))
+        {
+            let half_fov = self.current_fov.to_radians() * 0.5;
+            let guard_threshold = (half_fov - self.config.micro_zone_rad).max(0.0);
+            let dy = b.yaw - self.yaw;
+            let dp = b.pitch - self.pitch;
+            let dist = (dy * dy + dp * dp).sqrt();
+            if dist > guard_threshold && dist > 1e-6 {
+                let over = dist - guard_threshold;
+                let correction = over.min(self.config.micro_hold_rad);
+                let scale = correction / dist;
+                let yaw_correction = dy * scale;
+                let pitch_correction = dp * scale;
+                self.yaw += yaw_correction;
+                self.pitch += pitch_correction;
+                log::trace!(
+                    "BALL_CONTAINMENT_GUARD frame={} yaw_correction_deg={:.4} \
+                     pitch_correction_deg={:.4}",
+                    self.frame_index,
+                    yaw_correction.abs().to_degrees(),
+                    pitch_correction.abs().to_degrees(),
+                );
+            }
         }
 
         ViewportPosition {
@@ -1744,6 +1868,106 @@ mod tests {
             out.yaw.abs() < 0.15,
             "density should aim at the dominant near group (~0.0), got {}",
             out.yaw
+        );
+    }
+
+    #[test]
+    fn camera_dynamics_disabled_by_default() {
+        let cfg = FieldPannerConfig::default();
+        assert!(!cfg.camera_dynamics_enabled);
+        assert!(!cfg.containment_guard_enabled);
+        let broadcast = FieldPannerConfig::broadcast();
+        assert!(!broadcast.camera_dynamics_enabled);
+        assert!(!broadcast.containment_guard_enabled);
+    }
+
+    #[test]
+    fn v4_micro_damping_preset_enables_new_layers_on_top_of_broadcast() {
+        let v4 = FieldPannerConfig::v4_micro_damping();
+        assert!(v4.camera_dynamics_enabled);
+        assert!(v4.containment_guard_enabled);
+        // Everything else should match broadcast() exactly.
+        let broadcast = FieldPannerConfig::broadcast();
+        assert_eq!(v4.ball_weight, broadcast.ball_weight);
+        assert_eq!(v4.dead_zone_rad, broadcast.dead_zone_rad);
+        assert!(FieldPannerConfig::from_preset_name("v4_micro_damping").is_some());
+    }
+
+    #[test]
+    fn acceleration_limit_caps_velocity_jump_when_enabled() {
+        // A single large, isolated player jump should produce a smaller
+        // one-frame velocity change with camera_dynamics_enabled than
+        // without it, given the same starting state and target.
+        let cal = cal();
+        let far_world = || WorldState {
+            ball: None,
+            players: vec![player(0.9, 0.0, 1), player(0.94, 0.0, 2)],
+        };
+        let base_cfg = FieldPannerConfig {
+            ball_weight: 0.0,
+            dead_zone_rad: 0.0,
+            velocity_alpha: 1.0, // no EMA smoothing of its own, isolate the accel clamp
+            ..Default::default()
+        };
+
+        let mut plain = FieldPanner::with_config(30.0, base_cfg.clone());
+        let _ = plain.decide(&far_world(), &ctx(0, &cal));
+        let plain_step = plain.decide(&far_world(), &ctx(1, &cal));
+
+        let mut damped = FieldPanner::with_config(
+            30.0,
+            FieldPannerConfig {
+                camera_dynamics_enabled: true,
+                ..base_cfg
+            },
+        );
+        let _ = damped.decide(&far_world(), &ctx(0, &cal));
+        let damped_step = damped.decide(&far_world(), &ctx(1, &cal));
+
+        assert!(
+            damped_step.yaw.abs() <= plain_step.yaw.abs(),
+            "accel-limited step ({}) should not exceed the unlimited step ({})",
+            damped_step.yaw,
+            plain_step.yaw
+        );
+    }
+
+    #[test]
+    fn containment_guard_pulls_aim_toward_edge_ball_when_enabled() {
+        // A ball sitting right at the visible edge (inside micro_zone_rad
+        // of it) should get nudged toward frame-center by the guard; with
+        // the guard disabled the aim should not move from a static hold.
+        let cal = cal();
+        let w = WorldState {
+            ball: Some(ball(0.30, 0.0)),
+            players: vec![],
+        };
+        let cfg = FieldPannerConfig {
+            ball_weight: 0.0, // isolate the guard from the normal ball-blend path
+            fov_tight: 30.0,
+            fov_wide: 30.0,
+            fov_default: 30.0,
+            min_cluster: 999, // no cluster -> aim holds at (0,0) via the normal chase
+            ..Default::default()
+        };
+
+        let mut guarded = FieldPanner::with_config(
+            30.0,
+            FieldPannerConfig {
+                containment_guard_enabled: true,
+                ..cfg.clone()
+            },
+        );
+        let guarded_out = guarded.decide(&w, &ctx(0, &cal));
+
+        let mut plain = FieldPanner::with_config(30.0, cfg);
+        let plain_out = plain.decide(&w, &ctx(0, &cal));
+
+        assert!(
+            guarded_out.yaw > plain_out.yaw,
+            "containment guard should pull yaw toward the edge ball (guarded={}, plain={})",
+            guarded_out.yaw,
+            plain_out.yaw
         );
     }
 }
