@@ -514,12 +514,25 @@ impl DormantStaticSites {
         }
     }
 
+    /// DIAGNOSTIC (Sol fix #1, not for merge): log-only release. Confirms whether
+    /// update_reactivation()'s release_site() calls are the cause of the decoy
+    /// re-lock regression before any structural fix is built. Does NOT clear
+    /// site evidence/dormant state -- a dormant site stays dormant regardless of
+    /// how many times this fires. Expect: DIAG_RELEASE_SITE lines fire (would
+    /// have released), but decoy world.ball lock collapses after first dormancy
+    /// since nothing is actually reset.
+    const DIAG_LOG_ONLY_RELEASE: bool = true;
+
     fn release_site(site: &mut DormantSite, reason: &str) {
         log::info!(
-            "BallTracker: reactivated static site yaw={:.3} pitch={:.3} ({reason})",
+            "DIAG_RELEASE_SITE: would_release={} yaw={:.3} pitch={:.3} ({reason})",
+            !Self::DIAG_LOG_ONLY_RELEASE,
             site.center.0,
             site.center.1
         );
+        if Self::DIAG_LOG_ONLY_RELEASE {
+            return;
+        }
         site.dormant = false;
         site.episodes.clear();
         site.evidence = SiteEvidence::default();
