@@ -20,6 +20,7 @@
 pub mod ball;
 pub mod class_provider;
 pub mod filters;
+pub(crate) mod static_sites;
 
 pub use ball::BallTracker;
 pub use class_provider::ClassProvider;
