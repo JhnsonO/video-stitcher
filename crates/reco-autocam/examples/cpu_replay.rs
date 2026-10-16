@@ -22,6 +22,9 @@
 //!   value the tracker received during the original run (faithful replay).
 //! - `media`: `frame_index * fps_den * 1000 / fps_num` (source video time),
 //!   a TEST COMPARISON ONLY. It does not change production time handling.
+//! - `production-media`: the same timeline computed exactly as the corrected
+//!   production analysis clock (`reco-core` `media_elapsed`, integer
+//!   nanoseconds), so replay results predict the fixed pipeline bit-for-bit.
 //!
 //! Replay wall time is never used as tracker input; it is only reported as
 //! processing-time profiling.
@@ -158,8 +161,8 @@ fn parse_args() -> Result<Args, String> {
     if args.events.is_empty() {
         return Err("--events is required".into());
     }
-    if args.clock != "historical" && args.clock != "media" {
-        return Err("--clock must be historical or media".into());
+    if !["historical", "media", "production-media"].contains(&args.clock.as_str()) {
+        return Err("--clock must be historical, media or production-media".into());
     }
     if args.fps_num == 0 || args.fps_den == 0 {
         return Err("fps must be non-zero".into());
@@ -386,10 +389,16 @@ fn main() {
         *CURRENT_FRAME.lock().expect("frame lock") = i as u64;
         let detections = frame.detections.as_ref().expect("validated");
         let (recorded_ms, players, recorded_ball) = frame.world.as_ref().expect("validated");
-        let input_ms = if args.clock == "historical" {
-            *recorded_ms
-        } else {
-            i as f64 * frame_ms
+        let input_ms = match args.clock.as_str() {
+            "historical" => *recorded_ms,
+            // Bit-exact mirror of reco-core `media_elapsed` (fix/oev-media-clock-01):
+            // integer nanoseconds -> Duration -> as_secs_f64() * 1000.
+            "production-media" => {
+                let ns =
+                    i as u128 * args.fps_den as u128 * 1_000_000_000u128 / args.fps_num as u128;
+                std::time::Duration::from_nanos(ns as u64).as_secs_f64() * 1000.0
+            }
+            _ => i as f64 * frame_ms,
         };
         if input_ms <= prev_input_ms {
             nonmonotonic_inputs += 1;
