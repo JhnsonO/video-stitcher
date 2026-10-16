@@ -118,6 +118,9 @@ pub struct StitchSession {
     /// Values above 1 are used by the buffered lookahead loop, which
     /// interpolates camera poses between sparse analysis decisions.
     pub(crate) frame_stride: u64,
+    /// Exact rational frame rate used as the tracker/analysis clock for
+    /// offline sources (`None` = live source, wall clock). Set by `run`.
+    pub(crate) analysis_media_rate: Option<(u64, u64)>,
     pub(crate) frame_count: u64,
     /// Session start time for metrics computation.
     session_start: Option<std::time::Instant>,
@@ -272,6 +275,7 @@ impl StitchSession {
             skip_detection: false,
             lookahead_frames: 0,
             frame_stride: 1,
+            analysis_media_rate: None,
             frame_count: 0,
             extra_encoders: Vec::new(),
             session_start: None,

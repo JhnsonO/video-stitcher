@@ -482,3 +482,266 @@ fn compute_frame_limit_negative_fps_uses_fallback() {
     let result = compute_frame_limit(Some(10.0), None, -1.0);
     assert_eq!(result, 300);
 }
+
+// ─── Analysis clock (OEV media-time fix) ───────────────────────────────
+//
+// These drive the real `StitchSession::run` loop (buffered lookahead and
+// immediate paths) and record the `timestamp_ms` the tracker receives.
+// File sources report an exact `fps_rational`; the tracker must see the
+// recording's timeline (`source_index * den / num`), independent of how
+// fast frames are processed. Live sources (no `fps_rational`) keep the
+// wall clock.
+
+/// Frame source with configurable timing metadata.
+struct TimedSource {
+    remaining: u64,
+    fps: f64,
+    fps_rational: Option<(i32, i32)>,
+}
+
+impl FrameSource for TimedSource {
+    fn info(&self) -> SourceInfo {
+        SourceInfo {
+            width: W,
+            height: H,
+            fps: self.fps,
+            fps_rational: self.fps_rational,
+            total_frames: None,
+        }
+    }
+
+    fn next_frame(&mut self) -> Result<Option<StereoFrame>, SourceError> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        self.remaining -= 1;
+        Ok(Some(solid_frame()))
+    }
+}
+
+/// Detector that sleeps per call to emulate slow processing.
+struct SlowDetector {
+    delay: std::time::Duration,
+}
+
+impl UnifiedDetector for SlowDetector {
+    fn name(&self) -> &'static str {
+        "slow-mock"
+    }
+
+    fn detect(
+        &mut self,
+        _camera: CameraId,
+        _frame: &DetectorFrame<'_>,
+    ) -> Result<Vec<Detection>, DetectorError> {
+        std::thread::sleep(self.delay);
+        Ok(vec![Detection {
+            camera: CameraId::Left,
+            class_id: 0,
+            confidence: 0.9,
+            center_x: 0.5,
+            center_y: 0.5,
+            width: 0.1,
+            height: 0.1,
+        }])
+    }
+}
+
+/// Tracker that records every `timestamp_ms` it is given.
+struct TimestampTracker {
+    log: Arc<Mutex<Vec<f64>>>,
+}
+
+impl Tracker for TimestampTracker {
+    fn update(&mut self, _detections: &[MappedDetection], timestamp_ms: f64) -> Vec<TrackedEntity> {
+        self.log.lock().unwrap().push(timestamp_ms);
+        vec![]
+    }
+
+    fn class_id(&self) -> u16 {
+        0
+    }
+}
+
+/// (event kind, frame_index, timestamp_ms).
+type TimedEvent = (&'static str, u64, f64);
+
+/// Event sink collecting timed events.
+struct TimestampSink {
+    log: Arc<Mutex<Vec<TimedEvent>>>,
+}
+
+impl crate::detect::pipeline_event::PipelineEventSink for TimestampSink {
+    fn emit(&mut self, event: crate::detect::pipeline_event::PipelineEvent) {
+        use crate::detect::pipeline_event::PipelineEvent as E;
+        let entry = match event {
+            E::FrameStart {
+                frame_index,
+                timestamp_ms,
+            } => ("frame_start", frame_index, timestamp_ms),
+            E::WorldState {
+                frame_index,
+                timestamp_ms,
+                ..
+            } => ("world_state", frame_index, timestamp_ms),
+            _ => return,
+        };
+        self.log.lock().unwrap().push(entry);
+    }
+}
+
+struct ClockRun {
+    tracker_ms: Vec<f64>,
+    events: Vec<TimedEvent>,
+}
+
+fn run_clock_session(
+    frames: u64,
+    fps: f64,
+    fps_rational: Option<(i32, i32)>,
+    lookahead: usize,
+    stride: u64,
+    detect_delay_ms: u64,
+) -> ClockRun {
+    let detector = SlowDetector {
+        delay: std::time::Duration::from_millis(detect_delay_ms),
+    };
+    let mut session = build_test_session(None, Some(Box::new(detector)), 1).expect("session build");
+    let tracker_log = Arc::new(Mutex::new(Vec::new()));
+    session.set_ball_tracker(Box::new(TimestampTracker {
+        log: Arc::clone(&tracker_log),
+    }));
+    session.set_panner(Box::new(MockPanner {
+        position: ViewportPosition::default(),
+    }));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    session.set_event_sink(Box::new(TimestampSink {
+        log: Arc::clone(&events),
+    }));
+    session.set_lookahead(lookahead);
+    session.set_frame_stride(stride);
+    let mut source = TimedSource {
+        remaining: frames,
+        fps,
+        fps_rational,
+    };
+    let interrupted = AtomicBool::new(false);
+    session
+        .run(&mut source, u64::MAX, &interrupted, None)
+        .expect("run");
+    session.finish().expect("finish");
+    let tracker_ms = tracker_log.lock().unwrap().clone();
+    let events = events.lock().unwrap().clone();
+    ClockRun { tracker_ms, events }
+}
+
+fn media_ms(index: u64, num: u64, den: u64) -> f64 {
+    index as f64 * den as f64 * 1000.0 / num as f64
+}
+
+fn assert_media_times(got: &[f64], indices: &[u64], num: u64, den: u64) {
+    assert_eq!(got.len(), indices.len(), "tracker call count: {got:?}");
+    for (ms, &i) in got.iter().zip(indices) {
+        let want = media_ms(i, num, den);
+        assert!(
+            (ms - want).abs() < 1e-6,
+            "source frame {i}: tracker got {ms} ms, media time is {want} ms"
+        );
+    }
+}
+
+#[test]
+#[ignore] // requires GPU
+fn offline_stride1_lookahead_tracker_uses_media_time() {
+    let run = run_clock_session(12, 60000.0 / 1001.0, Some((60000, 1001)), 4, 1, 5);
+    let indices: Vec<u64> = (0..12).collect();
+    assert_media_times(&run.tracker_ms, &indices, 60000, 1001);
+    // Emitted world_state timestamps carry the same media timeline.
+    let ws: Vec<f64> = run
+        .events
+        .iter()
+        .filter(|e| e.0 == "world_state")
+        .map(|e| e.2)
+        .collect();
+    assert_media_times(&ws, &indices, 60000, 1001);
+}
+
+#[test]
+#[ignore] // requires GPU
+fn offline_stride3_lookahead_tracker_uses_media_time() {
+    let run = run_clock_session(13, 60000.0 / 1001.0, Some((60000, 1001)), 6, 3, 2);
+    assert_media_times(&run.tracker_ms, &[0, 3, 6, 9, 12], 60000, 1001);
+}
+
+#[test]
+#[ignore] // requires GPU
+fn offline_immediate_tracker_uses_media_time() {
+    let run = run_clock_session(8, 30000.0 / 1001.0, Some((30000, 1001)), 0, 1, 5);
+    let indices: Vec<u64> = (0..8).collect();
+    assert_media_times(&run.tracker_ms, &indices, 30000, 1001);
+}
+
+#[test]
+#[ignore] // requires GPU
+fn offline_tracker_time_independent_of_processing_speed() {
+    for lookahead in [0usize, 4] {
+        let fast = run_clock_session(10, 25.0, Some((25, 1)), lookahead, 1, 0);
+        let slow = run_clock_session(10, 25.0, Some((25, 1)), lookahead, 1, 30);
+        assert_eq!(
+            fast.tracker_ms, slow.tracker_ms,
+            "lookahead={lookahead}: tracker timeline changed with processing speed"
+        );
+    }
+}
+
+#[test]
+#[ignore] // requires GPU
+fn offline_tracker_time_is_strictly_monotonic() {
+    for (lookahead, stride) in [(0usize, 1u64), (4, 1), (6, 2), (8, 4)] {
+        let run = run_clock_session(17, 50.0, Some((50, 1)), lookahead, stride, 0);
+        assert!(!run.tracker_ms.is_empty());
+        assert!(
+            run.tracker_ms.windows(2).all(|w| w[1] > w[0]),
+            "lookahead={lookahead} stride={stride}: {:?}",
+            run.tracker_ms
+        );
+    }
+}
+
+#[test]
+#[ignore] // requires GPU
+fn frame_start_events_keep_wall_clock_for_profiling() {
+    // 1 fps media: frame 9 is at 9000 ms of media time. Processing 10 tiny
+    // frames takes far less wall time, so frame_start must stay well below.
+    let run = run_clock_session(10, 1.0, Some((1, 1)), 4, 1, 0);
+    let starts: Vec<f64> = run
+        .events
+        .iter()
+        .filter(|e| e.0 == "frame_start")
+        .map(|e| e.2)
+        .collect();
+    assert_eq!(starts.len(), 10);
+    assert!(starts.windows(2).all(|w| w[1] >= w[0]));
+    assert!(
+        *starts.last().unwrap() < 9000.0,
+        "frame_start should be processing wall time, got {starts:?}"
+    );
+    assert_media_times(&run.tracker_ms, &(0..10).collect::<Vec<_>>(), 1, 1);
+}
+
+#[test]
+#[ignore] // requires GPU
+fn live_source_without_rational_fps_keeps_wall_clock() {
+    // No fps_rational => live semantics preserved: tracker time is wall
+    // clock since session start, far below the 1 fps nominal timeline.
+    for lookahead in [0usize, 4] {
+        let run = run_clock_session(10, 1.0, None, lookahead, 1, 0);
+        assert_eq!(run.tracker_ms.len(), 10);
+        assert!(run.tracker_ms.windows(2).all(|w| w[1] >= w[0]));
+        assert!(
+            *run.tracker_ms.last().unwrap() < 9000.0,
+            "lookahead={lookahead}: live source should use wall time, got {:?}",
+            run.tracker_ms
+        );
+    }
+}

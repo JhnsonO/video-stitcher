@@ -61,6 +61,26 @@ fn queue_sparse_segment(
 /// speeds differ.
 const MAX_BRIDGE_SPEED_DEG_PER_S: f32 = 178.0;
 
+/// Exact rational frame rate of an offline (file) source, used as the
+/// tracker/analysis clock. `None` for live sources, which do not report an
+/// exact rate (`SourceInfo::fps_rational` is `None` for cameras), and for
+/// degenerate values.
+pub(crate) fn media_clock_rate(info: &crate::source::SourceInfo) -> Option<(u64, u64)> {
+    match info.fps_rational {
+        Some((num, den)) if num > 0 && den > 0 => Some((num as u64, den as u64)),
+        _ => None,
+    }
+}
+
+/// Media time of source frame `index` on a constant-frame-rate recording
+/// of `num / den` frames per second: `index * den / num` seconds, computed
+/// in integer nanoseconds so it never drifts with frame count.
+pub(crate) fn media_elapsed(index: u64, rate: (u64, u64)) -> std::time::Duration {
+    let (num, den) = rate;
+    let ns = index as u128 * den as u128 * 1_000_000_000u128 / num as u128;
+    std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
+}
+
 /// Backward-bridge `frame.world_state.ball` when it is `None` but a genuine
 /// (`Tracking`) detection exists both behind (`anchor`) and ahead
 /// (somewhere in `lookahead`) of the current frame, by linearly
@@ -281,6 +301,13 @@ impl StitchSession {
         mut on_progress: Option<ProgressCallback>,
     ) -> Result<u64, SessionError> {
         self.configure_from_source(source);
+        self.analysis_media_rate = media_clock_rate(&source.info());
+        match self.analysis_media_rate {
+            Some((num, den)) => {
+                log::info!("Analysis clock: source media time ({num}/{den} fps, frame index based)")
+            }
+            None => log::info!("Analysis clock: wall clock (source reports no exact frame rate)"),
+        }
 
         if self.frame_stride > 1 && self.lookahead_frames == 0 && self.panner.is_some() {
             return Err(SessionError::Config(
@@ -514,10 +541,15 @@ impl StitchSession {
             let source_index = *produce_count;
             let frame_stride = session.frame_stride.max(1);
             let analysis_frame = source_index.is_multiple_of(frame_stride);
-            let analysis_elapsed = if frame_stride > 1 {
-                std::time::Duration::from_secs_f64(source_index as f64 / source.info().fps.max(1.0))
-            } else {
-                wall_elapsed
+            // Tracker/panner time. Offline sources use the recording's own
+            // timeline so time-based tracker rules do not depend on
+            // processing speed; wall time stays available via FrameStart.
+            let analysis_elapsed = match session.analysis_media_rate {
+                Some(rate) => media_elapsed(source_index, rate),
+                None if frame_stride > 1 => std::time::Duration::from_secs_f64(
+                    source_index as f64 / source.info().fps.max(1.0),
+                ),
+                None => wall_elapsed,
             };
 
             // Stage every source frame so rendering remains full-rate. Only
@@ -866,10 +898,18 @@ impl StitchSession {
                 });
             }
 
+            // Tracker/panner time: media time for offline sources (every
+            // decoded frame is processed here, so `frame_count` is the source
+            // frame index), wall clock for live sources.
+            let analysis_elapsed = match self.analysis_media_rate {
+                Some(rate) => media_elapsed(self.frame_count, rate),
+                None => start.elapsed(),
+            };
+
             self.current_vram_slot = vram_slot;
             let process_result = self.process_frame_any(
                 &frame,
-                start.elapsed(),
+                analysis_elapsed,
                 decode_time,
                 upload_time,
                 frame_t0,
@@ -930,5 +970,74 @@ mod frame_stride_tests {
         };
         let mid = interpolate_pose(a, b, 0.5);
         assert!(mid.yaw.abs() > 3.0);
+    }
+}
+
+#[cfg(test)]
+mod media_clock_tests {
+    use super::{media_clock_rate, media_elapsed};
+    use crate::source::SourceInfo;
+
+    fn info(fps_rational: Option<(i32, i32)>) -> SourceInfo {
+        SourceInfo {
+            width: 64,
+            height: 32,
+            fps: 59.94,
+            fps_rational,
+            total_frames: None,
+        }
+    }
+
+    #[test]
+    fn rate_only_for_valid_rational() {
+        assert_eq!(
+            media_clock_rate(&info(Some((60000, 1001)))),
+            Some((60000, 1001))
+        );
+        assert_eq!(media_clock_rate(&info(None)), None);
+        assert_eq!(media_clock_rate(&info(Some((0, 1)))), None);
+        assert_eq!(media_clock_rate(&info(Some((30, 0)))), None);
+        assert_eq!(media_clock_rate(&info(Some((-30, 1)))), None);
+    }
+
+    #[test]
+    fn exact_ntsc_times_without_drift() {
+        let rate = (60000, 1001);
+        assert_eq!(media_elapsed(0, rate).as_nanos(), 0);
+        // 60000 frames at 60000/1001 fps is exactly 1001 s.
+        assert_eq!(media_elapsed(60_000, rate).as_nanos(), 1_001_000_000_000);
+        // Last frame of the 180 s OEV sample (index 10774).
+        assert_eq!(media_elapsed(10_774, rate).as_nanos(), 179_746_233_333);
+        // A 10-hour recording stays exact to the nanosecond floor.
+        let n = 2_157_840;
+        assert_eq!(
+            media_elapsed(n, rate).as_nanos(),
+            n as u128 * 1001 * 1_000_000_000 / 60000
+        );
+    }
+
+    #[test]
+    fn strictly_monotonic_per_frame() {
+        let rate = (30000, 1001);
+        let mut prev = media_elapsed(0, rate);
+        for i in 1..5_000 {
+            let t = media_elapsed(i, rate);
+            assert!(t > prev, "frame {i}");
+            prev = t;
+        }
+    }
+
+    #[test]
+    fn matches_previous_stride_formula_within_a_microsecond() {
+        // Strides > 1 previously used `index / fps` in f64. The rational
+        // clock must agree to rounding so stride > 1 behaviour is unchanged.
+        let rate = (60000, 1001);
+        let fps = 60000.0 / 1001.0;
+        for i in (0..10_775).step_by(3) {
+            let old = std::time::Duration::from_secs_f64(i as f64 / fps);
+            let new = media_elapsed(i, rate);
+            let diff = old.as_nanos().abs_diff(new.as_nanos());
+            assert!(diff < 1_000, "frame {i}: {diff} ns");
+        }
     }
 }
