@@ -5417,10 +5417,12 @@ dependencies = [
 name = "reco-autocam"
 version = "0.5.4"
 dependencies = [
+ "flate2",
  "log",
  "reco-core",
  "reco-detect",
  "serde",
+ "serde_json",
  "tracing",
  "wgpu",
 ]

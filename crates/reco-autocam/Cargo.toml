@@ -39,3 +39,8 @@ profiling = ["reco-core/profiling", "reco-detect/profiling", "dep:tracing"]
 [dependencies.tracing]
 workspace = true
 optional = true
+
+[dev-dependencies]
+# CPU replay example and replay regression tests only (OEV-001).
+serde_json = "1"
+flate2 = "1"
