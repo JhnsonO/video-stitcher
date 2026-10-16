@@ -57,6 +57,7 @@ use reco_core::detect::director::MappedDetection;
 use reco_core::detect::tracker::{TrackState, TrackedEntity, Tracker};
 
 use crate::trackers::filters::{CoastStatus, Coaster};
+use crate::trackers::static_sites::DormantStaticSites;
 
 /// Default angular gate on jumps between frames (radians).
 ///
@@ -87,599 +88,6 @@ pub const DEFAULT_REACQUIRE_GRACE_MS: f64 = 750.0;
 /// 0.4 is a review/tuning default; the contribution decays to zero over
 /// [`DEFAULT_REACQUIRE_GRACE_MS`].
 pub const DEFAULT_REACQUIRE_INITIAL_WEIGHT: f32 = 0.40;
-
-const DEG_TO_RAD: f32 = std::f32::consts::PI / 180.0;
-const SITE_MIN_RADIUS_RAD: f32 = 0.35 * DEG_TO_RAD;
-const SITE_MAX_RADIUS_RAD: f32 = 1.0 * DEG_TO_RAD;
-const STATIC_MIN_SPAN_MS: f64 = 1_500.0;
-const STATIC_MIN_DETECTIONS: usize = 6;
-const EPISODE_GAP_MS: f64 = 750.0;
-const EPISODE_START_SEPARATION_MS: f64 = 5_000.0;
-const DORMANT_EVIDENCE_SPAN_MS: f64 = 20_000.0;
-const ALT_TRACK_MIN_MS: f64 = 750.0;
-const PLAYER_FAR_MIN_MS: f64 = 1_000.0;
-const CONTRADICTION_MIN_RAD: f32 = 0.15;
-const REACTIVATION_MIN_DETECTIONS: usize = 3;
-const REACTIVATION_MIN_MS: f64 = 750.0;
-const PICKUP_OCCLUSION_MAX_MS: f64 = 2_000.0;
-
-#[derive(Debug, Clone, Copy)]
-struct TimedPoint {
-    yaw: f32,
-    pitch: f32,
-    timestamp_ms: f64,
-}
-
-#[derive(Debug, Default)]
-struct EpisodeRun {
-    points: Vec<TimedPoint>,
-    contradicted: bool,
-    player_far_since_ms: Option<f64>,
-    alternate: Option<MotionRun>,
-}
-
-#[derive(Debug, Clone)]
-struct StaticEpisode {
-    points: Vec<TimedPoint>,
-    center: (f32, f32),
-    radius: f32,
-    start_ms: f64,
-    end_ms: f64,
-    contradicted: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct SiteEvidence {
-    episode_count: usize,
-    contradicted_episode_count: usize,
-    first_start_ms: f64,
-    last_end_ms: f64,
-}
-
-#[derive(Debug)]
-struct DormantSite {
-    center: (f32, f32),
-    radius: f32,
-    evidence: SiteEvidence,
-    episodes: Vec<StaticEpisode>,
-    dormant: bool,
-    last_near_ms: Option<f64>,
-    outgoing: Option<MotionRun>,
-    pickup_disappeared_ms: Option<f64>,
-    pickup_motion: Option<MotionRun>,
-    player_near_when_last_seen: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MotionRun {
-    first: TimedPoint,
-    last: TimedPoint,
-    count: usize,
-    authorized: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PlayerSample {
-    id: u64,
-    yaw: f32,
-    pitch: f32,
-    timestamp_ms: f64,
-}
-
-#[derive(Debug, Default)]
-struct DormantStaticSites {
-    sites: Vec<DormantSite>,
-    current_episode: EpisodeRun,
-    current_players: Vec<TrackedEntity>,
-    previous_players: Vec<PlayerSample>,
-}
-
-impl DormantStaticSites {
-    fn set_players(&mut self, players: &[TrackedEntity]) {
-        self.current_players.clear();
-        self.current_players.extend_from_slice(players);
-    }
-
-    fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
-        let dy = a.0 - b.0;
-        let dp = a.1 - b.1;
-        (dy * dy + dp * dp).sqrt()
-    }
-
-    fn percentile(mut values: Vec<f32>, percentile: f32) -> f32 {
-        if values.is_empty() {
-            return 0.0;
-        }
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let index = ((values.len() - 1) as f32 * percentile)
-            .round()
-            .clamp(0.0, (values.len() - 1) as f32) as usize;
-        values[index]
-    }
-
-    fn medoid(points: &[TimedPoint]) -> (f32, f32) {
-        points
-            .iter()
-            .map(|candidate| {
-                let total: f32 = points
-                    .iter()
-                    .map(|point| {
-                        Self::distance(
-                            (candidate.yaw, candidate.pitch),
-                            (point.yaw, point.pitch),
-                        )
-                    })
-                    .sum();
-                (total, (candidate.yaw, candidate.pitch))
-            })
-            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(_, point)| point)
-            .unwrap_or((0.0, 0.0))
-    }
-
-    fn site_radius(points: &[TimedPoint], center: (f32, f32)) -> f32 {
-        let distances: Vec<f32> = points
-            .iter()
-            .map(|point| Self::distance((point.yaw, point.pitch), center))
-            .collect();
-        let median = Self::percentile(distances.clone(), 0.5);
-        let deviations = distances
-            .into_iter()
-            .map(|distance| (distance - median).abs())
-            .collect();
-        (3.0 * 1.4826 * Self::percentile(deviations, 0.5))
-            .clamp(SITE_MIN_RADIUS_RAD, SITE_MAX_RADIUS_RAD)
-    }
-
-    fn qualify_episode(run: EpisodeRun) -> Option<StaticEpisode> {
-        if run.points.len() < STATIC_MIN_DETECTIONS {
-            return None;
-        }
-        let start_ms = run.points.first()?.timestamp_ms;
-        let end_ms = run.points.last()?.timestamp_ms;
-        if end_ms - start_ms < STATIC_MIN_SPAN_MS {
-            return None;
-        }
-        let center = Self::medoid(&run.points);
-        let radius = Self::site_radius(&run.points, center);
-        let distances: Vec<f32> = run
-            .points
-            .iter()
-            .map(|point| Self::distance((point.yaw, point.pitch), center))
-            .collect();
-        if Self::percentile(distances, 0.95) > radius {
-            return None;
-        }
-
-        // Median step velocity catches out-and-back motion that a first/last
-        // displacement check would incorrectly call static. The limit scales
-        // with the robust site radius and the minimum episode duration.
-        let velocities: Vec<f32> = run
-            .points
-            .windows(2)
-            .filter_map(|pair| {
-                let dt_ms = pair[1].timestamp_ms - pair[0].timestamp_ms;
-                if dt_ms > 0.0 {
-                    Some(Self::distance(
-                        (pair[0].yaw, pair[0].pitch),
-                        (pair[1].yaw, pair[1].pitch),
-                    ) / dt_ms as f32)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let robust_velocity = Self::percentile(velocities, 0.5);
-        if robust_velocity > radius / STATIC_MIN_SPAN_MS as f32 {
-            return None;
-        }
-
-        Some(StaticEpisode {
-            points: run.points,
-            center,
-            radius,
-            start_ms,
-            end_ms,
-            contradicted: run.contradicted,
-        })
-    }
-
-    fn player_centroid(&mut self, timestamp_ms: f64) -> Option<(f32, f32)> {
-        if self.current_players.is_empty() {
-            self.previous_players.clear();
-            return None;
-        }
-
-        // Player tracks do not currently expose goalkeeper/outfield roles, so
-        // this deliberately uses every tracked player. Role classification is
-        // outside the static-site filter's scope.
-        let mut weighted_yaw = 0.0;
-        let mut weighted_pitch = 0.0;
-        let mut total_weight = 0.0;
-        for player in &self.current_players {
-            let velocity = self
-                .previous_players
-                .iter()
-                .find(|sample| sample.id == player.id)
-                .and_then(|sample| {
-                    let dt_ms = timestamp_ms - sample.timestamp_ms;
-                    if dt_ms > 0.0 {
-                        Some(Self::distance(
-                            (player.yaw, player.pitch),
-                            (sample.yaw, sample.pitch),
-                        ) / dt_ms as f32)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0.0);
-            weighted_yaw += player.yaw * velocity;
-            weighted_pitch += player.pitch * velocity;
-            total_weight += velocity;
-        }
-
-        let centroid = if total_weight > f32::EPSILON {
-            (weighted_yaw / total_weight, weighted_pitch / total_weight)
-        } else {
-            let count = self.current_players.len() as f32;
-            (
-                self.current_players.iter().map(|p| p.yaw).sum::<f32>() / count,
-                self.current_players.iter().map(|p| p.pitch).sum::<f32>() / count,
-            )
-        };
-        self.previous_players = self
-            .current_players
-            .iter()
-            .map(|player| PlayerSample {
-                id: player.id,
-                yaw: player.yaw,
-                pitch: player.pitch,
-                timestamp_ms,
-            })
-            .collect();
-        Some(centroid)
-    }
-
-    fn observe_frame_context(
-        &mut self,
-        detections: &[MappedDetection],
-        class_id: u16,
-        timestamp_ms: f64,
-    ) {
-        let centroid = self.player_centroid(timestamp_ms);
-        if self.current_episode.points.is_empty() {
-            return;
-        }
-        let first = self
-            .current_episode
-            .points
-            .first()
-            .expect("empty episode returned above");
-        let center = (first.yaw, first.pitch);
-
-        if let Some(centroid) = centroid {
-            if Self::distance(centroid, center) >= CONTRADICTION_MIN_RAD {
-                let far_since = self
-                    .current_episode
-                    .player_far_since_ms
-                    .get_or_insert(timestamp_ms);
-                if timestamp_ms - *far_since >= PLAYER_FAR_MIN_MS {
-                    self.current_episode.contradicted = true;
-                }
-            } else {
-                self.current_episode.player_far_since_ms = None;
-            }
-        } else {
-            self.current_episode.player_far_since_ms = None;
-        }
-
-        let alternate = detections
-            .iter()
-            .filter(|detection| detection.class_id == class_id)
-            .filter_map(|detection| detection.position.map(|position| (detection, position)))
-            .filter(|(_, position)| {
-                Self::distance((position.yaw, position.pitch), center) >= CONTRADICTION_MIN_RAD
-            })
-            .max_by(|a, b| {
-                a.0.confidence
-                    .partial_cmp(&b.0.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(_, position)| TimedPoint {
-                yaw: position.yaw,
-                pitch: position.pitch,
-                timestamp_ms,
-            });
-
-        if let Some(point) = alternate {
-            let coherent = self.current_episode.alternate.is_some_and(|run| {
-                timestamp_ms - run.last.timestamp_ms <= EPISODE_GAP_MS
-                    && Self::distance((point.yaw, point.pitch), (run.last.yaw, run.last.pitch))
-                        <= DEFAULT_MAX_JUMP_RAD
-            });
-            let run = if coherent {
-                let mut run = self.current_episode.alternate.expect("checked above");
-                run.last = point;
-                run.count += 1;
-                run
-            } else {
-                MotionRun {
-                    first: point,
-                    last: point,
-                    count: 1,
-                    authorized: true,
-                }
-            };
-            if run.last.timestamp_ms - run.first.timestamp_ms >= ALT_TRACK_MIN_MS {
-                self.current_episode.contradicted = true;
-            }
-            self.current_episode.alternate = Some(run);
-        } else {
-            self.current_episode.alternate = None;
-        }
-    }
-
-    fn observe_accepted(&mut self, point: TimedPoint) {
-        let continues = self.current_episode.points.last().is_some_and(|last| {
-            point.timestamp_ms - last.timestamp_ms <= EPISODE_GAP_MS
-                && self.current_episode.points.first().is_some_and(|first| {
-                    Self::distance((point.yaw, point.pitch), (first.yaw, first.pitch))
-                        <= SITE_MAX_RADIUS_RAD
-                })
-        });
-        if !self.current_episode.points.is_empty() && !continues {
-            self.finish_episode();
-        }
-        self.current_episode.points.push(point);
-    }
-
-    fn finish_if_stale(&mut self, timestamp_ms: f64) {
-        if self.current_episode.points.last().is_some_and(|point| {
-            timestamp_ms - point.timestamp_ms > EPISODE_GAP_MS
-        }) {
-            self.finish_episode();
-        }
-    }
-
-    fn finish_episode(&mut self) {
-        let run = std::mem::take(&mut self.current_episode);
-        let Some(episode) = Self::qualify_episode(run) else {
-            return;
-        };
-
-        let site_index = self.sites.iter().position(|site| {
-            let merge_radius = (site.radius + episode.radius).max(3.0 * SITE_MIN_RADIUS_RAD);
-            Self::distance(site.center, episode.center) <= merge_radius
-        });
-        if let Some(index) = site_index {
-            let site = &mut self.sites[index];
-            let previous_start_ms = site
-                .episodes
-                .last()
-                .map_or(site.evidence.first_start_ms, |previous| previous.start_ms);
-            if episode.start_ms - previous_start_ms < EPISODE_START_SEPARATION_MS {
-                return;
-            }
-            site.episodes.push(episode);
-            Self::refresh_site(site);
-        } else {
-            let mut site = DormantSite {
-                center: episode.center,
-                radius: episode.radius,
-                evidence: SiteEvidence::default(),
-                episodes: vec![episode],
-                dormant: false,
-                last_near_ms: None,
-                outgoing: None,
-                pickup_disappeared_ms: None,
-                pickup_motion: None,
-                player_near_when_last_seen: false,
-            };
-            Self::refresh_site(&mut site);
-            self.sites.push(site);
-        }
-    }
-
-    fn refresh_site(site: &mut DormantSite) {
-        let all_points: Vec<TimedPoint> = site
-            .episodes
-            .iter()
-            .flat_map(|episode| episode.points.iter().copied())
-            .collect();
-        site.center = Self::medoid(&all_points);
-        site.radius = Self::site_radius(&all_points, site.center);
-        site.evidence = SiteEvidence {
-            episode_count: site.episodes.len(),
-            contradicted_episode_count: site
-                .episodes
-                .iter()
-                .filter(|episode| episode.contradicted)
-                .count(),
-            first_start_ms: site.episodes.first().map_or(0.0, |episode| episode.start_ms),
-            last_end_ms: site.episodes.last().map_or(0.0, |episode| episode.end_ms),
-        };
-        site.dormant = site.evidence.episode_count >= 3
-            && site.evidence.last_end_ms - site.evidence.first_start_ms
-                >= DORMANT_EVIDENCE_SPAN_MS
-            && site.evidence.contradicted_episode_count > 0;
-        if site.dormant {
-            log::info!(
-                "BallTracker: dormant static site yaw={:.3} pitch={:.3} radius={:.4}rad episodes={} contradicted={}",
-                site.center.0,
-                site.center.1,
-                site.radius,
-                site.evidence.episode_count,
-                site.evidence.contradicted_episode_count
-            );
-        }
-    }
-
-    fn release_site(site: &mut DormantSite, reason: &str) {
-        log::info!(
-            "BallTracker: reactivated static site yaw={:.3} pitch={:.3} ({reason})",
-            site.center.0,
-            site.center.1
-        );
-        site.dormant = false;
-        site.episodes.clear();
-        site.evidence = SiteEvidence::default();
-        site.outgoing = None;
-        site.pickup_motion = None;
-        site.pickup_disappeared_ms = None;
-    }
-
-    fn update_reactivation(
-        &mut self,
-        detections: &[MappedDetection],
-        class_id: u16,
-        timestamp_ms: f64,
-        last: Option<LastKnown>,
-        actively_tracking: bool,
-        player_anchor_rad: f32,
-    ) {
-        let candidates: Vec<TimedPoint> = detections
-            .iter()
-            .filter(|detection| detection.class_id == class_id)
-            .filter_map(|detection| detection.position)
-            .map(|position| TimedPoint {
-                yaw: position.yaw,
-                pitch: position.pitch,
-                timestamp_ms,
-            })
-            .collect();
-        let players = &self.current_players;
-
-        for site in self.sites.iter_mut().filter(|site| site.dormant) {
-            let inside = candidates.iter().copied().find(|point| {
-                Self::distance((point.yaw, point.pitch), site.center) <= site.radius
-            });
-            let player_near_site = players.iter().any(|player| {
-                Self::distance((player.yaw, player.pitch), site.center) <= player_anchor_rad
-            });
-
-            if inside.is_some() {
-                site.last_near_ms = Some(timestamp_ms);
-                site.player_near_when_last_seen = player_near_site;
-                site.outgoing = None;
-                site.pickup_disappeared_ms = None;
-                site.pickup_motion = None;
-                continue;
-            }
-
-            if site.last_near_ms.is_some_and(|seen_ms| {
-                timestamp_ms - seen_ms <= EPISODE_GAP_MS
-            }) && player_near_site
-            {
-                site.pickup_disappeared_ms.get_or_insert(timestamp_ms);
-            }
-
-            let other_ball_active = actively_tracking
-                && last.is_some_and(|last| {
-                    Self::distance((last.yaw, last.pitch), site.center)
-                        >= CONTRADICTION_MIN_RAD.max(3.0 * site.radius)
-                });
-            let outgoing_candidate = candidates
-                .iter()
-                .copied()
-                .filter(|point| {
-                    Self::distance((point.yaw, point.pitch), site.center) > 2.0 * site.radius
-                })
-                .min_by(|a, b| {
-                    let anchor = site
-                        .outgoing
-                        .map_or(site.center, |run| (run.last.yaw, run.last.pitch));
-                    Self::distance((a.yaw, a.pitch), anchor)
-                        .partial_cmp(&Self::distance((b.yaw, b.pitch), anchor))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-            if let Some(point) = outgoing_candidate {
-                let can_start = site.last_near_ms.is_some_and(|seen_ms| {
-                    timestamp_ms - seen_ms <= EPISODE_GAP_MS
-                });
-                let coherent = site.outgoing.is_some_and(|run| {
-                    timestamp_ms - run.last.timestamp_ms <= EPISODE_GAP_MS
-                        && Self::distance((point.yaw, point.pitch), (run.last.yaw, run.last.pitch))
-                            <= DEFAULT_MAX_JUMP_RAD
-                });
-                if coherent {
-                    if let Some(run) = site.outgoing.as_mut() {
-                        run.last = point;
-                        run.count += 1;
-                    }
-                } else if can_start {
-                    site.outgoing = Some(MotionRun {
-                        first: point,
-                        last: point,
-                        count: 1,
-                        authorized: site.player_near_when_last_seen || !other_ball_active,
-                    });
-                }
-
-                if site.outgoing.is_some_and(|run| {
-                    run.authorized
-                        && run.count >= REACTIVATION_MIN_DETECTIONS
-                        && run.last.timestamp_ms - run.first.timestamp_ms >= REACTIVATION_MIN_MS
-                }) {
-                    Self::release_site(site, "persistent outgoing motion");
-                    continue;
-                }
-
-                if site.pickup_disappeared_ms.is_some_and(|disappeared_ms| {
-                    timestamp_ms - disappeared_ms <= PICKUP_OCCLUSION_MAX_MS
-                }) && players.iter().any(|player| {
-                    Self::distance((player.yaw, player.pitch), (point.yaw, point.pitch))
-                        <= player_anchor_rad
-                }) {
-                    let coherent_pickup = site.pickup_motion.is_some_and(|run| {
-                        timestamp_ms - run.last.timestamp_ms <= EPISODE_GAP_MS
-                            && Self::distance(
-                                (point.yaw, point.pitch),
-                                (run.last.yaw, run.last.pitch),
-                            ) <= DEFAULT_MAX_JUMP_RAD
-                    });
-                    if coherent_pickup {
-                        if let Some(run) = site.pickup_motion.as_mut() {
-                            run.last = point;
-                            run.count += 1;
-                        }
-                    } else {
-                        site.pickup_motion = Some(MotionRun {
-                            first: point,
-                            last: point,
-                            count: 1,
-                            authorized: true,
-                        });
-                    }
-                    if site.pickup_motion.is_some_and(|run| {
-                        run.count >= 2
-                            && Self::distance(
-                                (run.first.yaw, run.first.pitch),
-                                (run.last.yaw, run.last.pitch),
-                            ) > site.radius
-                    }) {
-                        Self::release_site(site, "pickup occlusion");
-                    }
-                }
-            } else {
-                site.outgoing = None;
-            }
-
-            if site.pickup_disappeared_ms.is_some_and(|disappeared_ms| {
-                timestamp_ms - disappeared_ms > PICKUP_OCCLUSION_MAX_MS
-            }) {
-                site.pickup_disappeared_ms = None;
-                site.pickup_motion = None;
-            }
-        }
-    }
-
-    fn rejects(&self, point: (f32, f32)) -> bool {
-        self.sites.iter().any(|site| {
-            site.dormant && Self::distance(point, site.center) <= site.radius
-        })
-    }
-}
 
 /// Singleton ball tracker emitting at most one
 /// [`TrackedEntity`] per frame.
@@ -929,20 +337,8 @@ impl BallTracker {
 impl Tracker for BallTracker {
     fn update(&mut self, detections: &[MappedDetection], timestamp_ms: f64) -> Vec<TrackedEntity> {
         self.expire_lost_memory(timestamp_ms);
-        self.dormant_sites.finish_if_stale(timestamp_ms);
         self.dormant_sites
-            .observe_frame_context(detections, self.class_id, timestamp_ms);
-        let actively_tracking = self.last.is_some()
-            && self.lost_at_ms.is_none()
-            && self.coaster.frames_coasting() == 0;
-        self.dormant_sites.update_reactivation(
-            detections,
-            self.class_id,
-            timestamp_ms,
-            self.last,
-            actively_tracking,
-            self.player_anchor_max_rad,
-        );
+            .observe_frame(detections, self.class_id, timestamp_ms);
 
         // Steps 1-4: filter candidates down to survivors. Dormant sites are a
         // hard gate at the same reject-before-scoring tier as player anchors.
@@ -1043,11 +439,6 @@ impl Tracker for BallTracker {
                 timestamp_ms,
             });
             self.age_frames = self.age_frames.saturating_add(1);
-            self.dormant_sites.observe_accepted(TimedPoint {
-                yaw: pos.yaw,
-                pitch: pos.pitch,
-                timestamp_ms,
-            });
 
             if was_new_track {
                 log::info!(
@@ -1546,14 +937,16 @@ mod tests {
         assert!((out[0].yaw - 1.50).abs() < 1e-6);
     }
 
+    /// 2 s of a stationary candidate at (0, 0) at 20 Hz, optionally with a
+    /// second candidate moving steadily elsewhere (play contradicting it).
     fn play_static_episode(t: &mut BallTracker, start_ms: f64, contradiction: bool) {
-        for index in 0..6 {
-            let timestamp_ms = start_ms + index as f64 * 300.0;
+        for index in 0..40 {
+            let timestamp_ms = start_ms + index as f64 * 50.0;
             let site = det(CameraId::Left, 0.0, 0.0, 0.95, 0.5, 0.5);
             if contradiction {
                 let elsewhere = det(
                     CameraId::Right,
-                    0.30 + index as f32 * 0.005,
+                    0.30 + index as f32 * 0.003,
                     0.0,
                     0.40,
                     0.5,
@@ -1567,24 +960,8 @@ mod tests {
         t.update(&[], start_ms + 2_500.0);
     }
 
-    fn seed_dormant_site(t: &mut BallTracker, center: (f32, f32)) {
-        t.dormant_sites.sites.push(DormantSite {
-            center,
-            radius: SITE_MIN_RADIUS_RAD,
-            evidence: SiteEvidence {
-                episode_count: 3,
-                contradicted_episode_count: 1,
-                first_start_ms: 0.0,
-                last_end_ms: 25_000.0,
-            },
-            episodes: Vec::new(),
-            dormant: true,
-            last_near_ms: None,
-            outgoing: None,
-            pickup_disappeared_ms: None,
-            pickup_motion: None,
-            player_near_when_last_seen: false,
-        });
+    fn seed_dormant_site(t: &mut BallTracker, center: (f32, f32), last_seen_ms: f64) {
+        t.dormant_sites.seed_dormant(center, last_seen_ms);
     }
 
     fn tracked_player(id: u64, yaw: f32, pitch: f32) -> TrackedEntity {
@@ -1607,16 +984,9 @@ mod tests {
         play_static_episode(&mut t, 10_000.0, true);
         play_static_episode(&mut t, 25_000.0, true);
 
-        assert_eq!(t.dormant_sites.sites.len(), 1);
-        let site = &t.dormant_sites.sites[0];
-        assert!(site.dormant);
-        assert_eq!(site.evidence.episode_count, 3);
-        assert_eq!(site.evidence.contradicted_episode_count, 3);
+        assert_eq!(t.dormant_sites.dormant_count(), 1);
 
-        let rejected = t.update(
-            &[det(CameraId::Left, 0.0, 0.0, 0.99, 0.5, 0.5)],
-            28_000.0,
-        );
+        let rejected = t.update(&[det(CameraId::Left, 0.0, 0.0, 0.99, 0.5, 0.5)], 28_000.0);
         assert!(
             rejected.is_empty() || rejected[0].state != TrackState::Tracking,
             "dormant-site candidate was accepted"
@@ -1628,9 +998,7 @@ mod tests {
         let mut t = BallTracker::new(0);
         play_static_episode(&mut t, 0.0, true);
 
-        assert_eq!(t.dormant_sites.sites.len(), 1);
-        assert_eq!(t.dormant_sites.sites[0].evidence.episode_count, 1);
-        assert!(!t.dormant_sites.sites[0].dormant);
+        assert_eq!(t.dormant_sites.dormant_count(), 0);
     }
 
     #[test]
@@ -1640,39 +1008,35 @@ mod tests {
         play_static_episode(&mut t, 10_000.0, false);
         play_static_episode(&mut t, 25_000.0, false);
 
-        assert_eq!(t.dormant_sites.sites.len(), 1);
-        assert_eq!(t.dormant_sites.sites[0].evidence.episode_count, 3);
-        assert_eq!(
-            t.dormant_sites.sites[0]
-                .evidence
-                .contradicted_episode_count,
-            0
-        );
-        assert!(!t.dormant_sites.sites[0].dormant);
+        assert_eq!(t.dormant_sites.dormant_count(), 0);
     }
 
     #[test]
     fn dormant_site_releases_after_persistent_outgoing_motion() {
         let mut t = BallTracker::new(0);
-        seed_dormant_site(&mut t, (0.0, 0.0));
+        seed_dormant_site(&mut t, (0.0, 0.0), 0.0);
 
         t.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 0.0);
-        t.update(&[det(CameraId::Left, 0.02, 0.0, 0.9, 0.5, 0.5)], 100.0);
-        t.update(&[det(CameraId::Left, 0.03, 0.0, 0.9, 0.5, 0.5)], 500.0);
-        let released = t.update(
-            &[det(CameraId::Left, 0.04, 0.0, 0.9, 0.5, 0.5)],
-            900.0,
-        );
-
-        assert!(!t.dormant_sites.sites[0].dormant);
-        assert_eq!(released[0].state, TrackState::Tracking);
-        assert!((released[0].yaw - 0.04).abs() < 1e-6);
+        t.update(&[det(CameraId::Left, 0.01, 0.0, 0.9, 0.5, 0.5)], 100.0);
+        t.update(&[det(CameraId::Left, 0.03, 0.0, 0.9, 0.5, 0.5)], 400.0);
+        t.update(&[det(CameraId::Left, 0.05, 0.0, 0.9, 0.5, 0.5)], 800.0);
+        let moved = t.update(&[det(CameraId::Left, 0.06, 0.0, 0.9, 0.5, 0.5)], 900.0);
+        // The moved ball is tracked immediately (it left the exclusion
+        // zone); the site itself is released once it stayed empty.
+        assert_eq!(moved[0].state, TrackState::Tracking);
+        assert!((moved[0].yaw - 0.06).abs() < 1e-6);
+        t.update(&[det(CameraId::Left, 0.08, 0.0, 0.9, 0.5, 0.5)], 1_900.0);
+        t.update(&[det(CameraId::Left, 0.10, 0.0, 0.9, 0.5, 0.5)], 3_000.0);
+        assert_eq!(t.dormant_sites.dormant_count(), 0);
+        // And a ball returning to the old site is accepted again.
+        let back = t.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 3_100.0);
+        assert_eq!(back[0].state, TrackState::Tracking);
     }
 
     #[test]
     fn dormant_site_releases_after_pickup_occlusion() {
         let mut t = BallTracker::new(0);
-        seed_dormant_site(&mut t, (0.0, 0.0));
+        seed_dormant_site(&mut t, (0.0, 0.0), 0.0);
 
         t.set_players(&[tracked_player(1, 0.0, 0.0)]);
         t.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 0.0);
@@ -1681,25 +1045,39 @@ mod tests {
         t.set_players(&[tracked_player(1, 0.02, 0.0)]);
         t.update(&[det(CameraId::Left, 0.02, 0.0, 0.9, 0.5, 0.5)], 500.0);
         t.set_players(&[tracked_player(1, 0.03, 0.0)]);
-        let released = t.update(
-            &[det(CameraId::Left, 0.03, 0.0, 0.9, 0.5, 0.5)],
-            800.0,
-        );
+        let carried = t.update(&[det(CameraId::Left, 0.03, 0.0, 0.9, 0.5, 0.5)], 800.0);
+        assert_eq!(carried[0].state, TrackState::Tracking);
+        t.set_players(&[tracked_player(1, 0.05, 0.0)]);
+        t.update(&[det(CameraId::Left, 0.05, 0.0, 0.9, 0.5, 0.5)], 2_900.0);
+        assert_eq!(t.dormant_sites.dormant_count(), 0);
+    }
 
-        assert!(!t.dormant_sites.sites[0].dormant);
-        assert_eq!(released[0].state, TrackState::Tracking);
+    #[test]
+    fn dormant_site_is_not_released_while_still_observed() {
+        let mut t = BallTracker::new(0);
+        seed_dormant_site(&mut t, (0.0, 0.0), 0.0);
+        // The spare stays visible at the site while another ball moves
+        // outward from right next to it: no release.
+        for i in 0..20 {
+            let ms = i as f64 * 50.0;
+            t.update(
+                &[
+                    det(CameraId::Left, 0.0, 0.0, 0.5, 0.5, 0.5),
+                    det(CameraId::Left, 0.012 + 0.004 * i as f32, 0.0, 0.9, 0.5, 0.5),
+                ],
+                ms,
+            );
+        }
+        assert_eq!(t.dormant_sites.dormant_count(), 1);
     }
 
     #[test]
     fn all_candidates_rejected_uses_existing_lost_path() {
         let mut t = BallTracker::new(0).with_max_coast_frames(0);
         t.update(&[det(CameraId::Left, 0.0, 0.0, 0.9, 0.5, 0.5)], 0.0);
-        seed_dormant_site(&mut t, (0.0, 0.0));
+        seed_dormant_site(&mut t, (0.0, 0.0), 0.0);
 
-        let lost = t.update(
-            &[det(CameraId::Left, 0.0, 0.0, 0.99, 0.5, 0.5)],
-            100.0,
-        );
+        let lost = t.update(&[det(CameraId::Left, 0.0, 0.0, 0.99, 0.5, 0.5)], 100.0);
         assert_eq!(lost.len(), 1);
         assert_eq!(lost[0].state, TrackState::Lost);
         assert!(t.update(&[], 200.0).is_empty());

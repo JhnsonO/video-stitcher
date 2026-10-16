@@ -7,15 +7,47 @@
 //! player tracker output and the recorded post-bridge `world_state.ball`,
 //! with the recorded tracker input timestamps (historical clock).
 //!
-//! The real tracker is replayed from frame 0 and must reproduce every
-//! recorded decision. Backward bridging only rewrites a tracker `None` or
-//! `Coasting` into `Bridged`; everything else must match exactly.
+//! The real tracker is replayed from frame 0. The fixture was recorded with
+//! the pre-OEV-003 static-site logic, so the replay must reproduce every
+//! recorded decision up to the first dormant-site transition of the current
+//! tracker: OEV-003 changes behaviour only through the static-site gate.
+//! Backward bridging only rewrites a tracker `None` or `Coasting` into
+//! `Bridged`; everything else must match exactly. (Exact full-fixture parity
+//! of the pre-OEV-003 tracker is asserted on `audit/cpu-ball-replay-01`.)
 
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader};
 
 use reco_autocam::trackers::BallTracker;
 use reco_core::detect::director::MappedDetection;
 use reco_core::detect::tracker::{TrackState, TrackedEntity, Tracker, WorldState};
+
+thread_local! {
+    static DORMANT_AT: RefCell<Option<usize>> = const { RefCell::new(None) };
+    static FRAME: RefCell<usize> = const { RefCell::new(0) };
+}
+
+struct DormancyLogger;
+
+impl log::Log for DormancyLogger {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Info
+    }
+    fn log(&self, r: &log::Record) {
+        if r.args().to_string().contains("dormant static site") {
+            let frame = FRAME.with(|f| *f.borrow());
+            DORMANT_AT.with(|d| {
+                let mut d = d.borrow_mut();
+                if d.is_none() {
+                    *d = Some(frame);
+                }
+            });
+        }
+    }
+    fn flush(&self) {}
+}
+
+static LOGGER: DormancyLogger = DormancyLogger;
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -120,11 +152,31 @@ fn fixture_is_complete_and_ordered() {
 }
 
 #[test]
-fn historical_parity_tracker_stage_vs_recorded_post_bridge() {
+fn historical_parity_until_first_dormant_site() {
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
+    DORMANT_AT.with(|d| *d.borrow_mut() = None);
     let frames = load();
-    let out = replay(&frames, 1.0);
-    let mut bridged = 0;
-    for (i, (replay, recorded)) in out.iter().zip(frames.iter().map(|f| f.ball)).enumerate() {
+    let mut t = field_tracker();
+    let mut out = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        FRAME.with(|fr| *fr.borrow_mut() = i);
+        t.observe_world(&WorldState {
+            ball: None,
+            players: f.players.clone(),
+        });
+        out.push(t.update(&f.detections, f.timestamp_ms).into_iter().next());
+    }
+    let dormant_at = DORMANT_AT
+        .with(|d| *d.borrow())
+        .expect("fixture should reach a dormant site on the historical clock");
+    let mut checked = 0;
+    for (i, (replay, recorded)) in out
+        .iter()
+        .zip(frames.iter().map(|f| f.ball))
+        .enumerate()
+        .take(dormant_at + 1)
+    {
         match (replay, recorded) {
             (None, None) => {}
             (None, Some(r)) | (Some(_), Some(r)) if r.state == TrackState::Bridged => {
@@ -132,7 +184,6 @@ fn historical_parity_tracker_stage_vs_recorded_post_bridge() {
                     replay.is_none_or(|p| p.state == TrackState::Coasting),
                     "frame {i}: Bridged over a non-Coasting tracker output"
                 );
-                bridged += 1;
             }
             (Some(p), Some(r)) => {
                 assert_eq!(p.state, r.state, "frame {i}: state");
@@ -142,13 +193,9 @@ fn historical_parity_tracker_stage_vs_recorded_post_bridge() {
             }
             (p, r) => panic!("frame {i}: replay {p:?} vs recorded {r:?}"),
         }
+        checked += 1;
     }
-    assert_eq!(bridged, 248, "bridged frame count changed");
-    let tracking = out
-        .iter()
-        .filter(|b| b.is_some_and(|b| b.state == TrackState::Tracking))
-        .count();
-    assert_eq!(tracking, 1012);
+    assert!(checked > 90, "too few frames checked: {checked}");
 }
 
 #[test]

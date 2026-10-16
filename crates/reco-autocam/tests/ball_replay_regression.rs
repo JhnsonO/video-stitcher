@@ -1,11 +1,11 @@
 //! OEV-001 causal regression fixtures for the real [`BallTracker`].
 //!
-//! These tests drive the unmodified tracker with small synthetic
-//! detection streams and assert its EXISTING behaviour, including
-//! behaviour that is known to be undesirable (marked "documents current
-//! behaviour"). They exist so that later tickets can change a rule and see
-//! exactly which causal case moved. Nothing here fixes or reimplements a
-//! tracker rule; site transitions are observed through the tracker's own
+//! These tests drive the real tracker with small synthetic detection
+//! streams. OEV-001 recorded the pre-OEV-003 behaviour; OEV-003 (candidate
+//! based static sites, associated + confirmed release, probation) flipped
+//! the two known weaknesses (unrelated motion and bystanders releasing a
+//! site) and replaced the clock-scale dependency case with frame-rate
+//! invariance. Site transitions are observed through the tracker's own
 //! `log` output.
 //!
 //! All streams are deterministic: fixed timestamps, fixed detections, no
@@ -54,7 +54,7 @@ fn captured(needle: &str) -> usize {
 // ------------------------------------------------------------ fixtures
 
 const BALL: u16 = 32;
-const STEP_MS: f64 = 100.0;
+const STEP_MS: f64 = 50.0;
 
 fn ball(cam: CameraId, yaw: f32, pitch: f32, conf: f32) -> MappedDetection {
     MappedDetection {
@@ -108,114 +108,112 @@ fn step(
 
 const SPARE: (f32, f32) = (1.0, 0.0);
 
-/// Players: one stationary next to the spare ball (so the player-anchor gate
-/// admits it) and two moving players around yaw 0 (they dominate the
-/// velocity-weighted centroid, contradicting the spare site).
-fn players_at(frame: u64) -> Vec<TrackedEntity> {
+/// Two moving players near yaw 0 (where play is).
+fn play_players(frame: u64) -> Vec<TrackedEntity> {
     let wobble = 0.02 * ((frame % 4) as f32);
     vec![
-        player(1, SPARE.0, SPARE.1 + 0.05),
         player(2, -0.05 + wobble, 0.0),
         player(3, 0.05 - wobble, 0.02),
     ]
 }
 
-/// Players during play-only phases: the bystander next to the spare has
-/// walked away, so only the moving players near yaw 0 remain.
-fn play_players(frame: u64) -> Vec<TrackedEntity> {
-    players_at(frame).into_iter().skip(1).collect()
+/// Play players plus a bystander standing 0.03 rad from the spare.
+fn players_with_bystander(frame: u64) -> Vec<TrackedEntity> {
+    let mut p = play_players(frame);
+    p.push(player(1, SPARE.0, SPARE.1 + 0.03));
+    p
 }
 
-/// Builds a dormant spare-ball site: alternating 3 s phases of "only the
-/// stationary spare is visible" and "only the real ball near play is
-/// visible", repeated `cycles` times. The bystander player is present only
-/// during spare phases (see `bystander_near_spare_triggers_pickup_release`
-/// for what happens when it stays). Returns (tracker, next_frame).
-fn dormant_spare_site(cycles: u64) -> (BallTracker, u64) {
-    build_spare_site(cycles, false)
+/// The real match ball wandering around near play (yaw -0.2..0.2).
+fn real_ball_at(frame: u64) -> (f32, f32) {
+    let t = frame as f32 * STEP_MS as f32 / 1000.0;
+    (0.2 * (0.7 * t).sin(), 0.02 * (1.3 * t).cos())
 }
 
-fn build_spare_site(cycles: u64, bystander_stays: bool) -> (BallTracker, u64) {
+/// Builds a dormant spare-ball site the way it happens in a match: the
+/// spare is visible at its spot while the real ball is played elsewhere.
+/// Returns (tracker, next_frame).
+fn dormant_spare_site_with(step_ms: f64, seconds: f64, bystander: bool) -> (BallTracker, u64) {
     let mut t = tracker();
-    let mut f = 0u64;
-    for _ in 0..cycles {
-        for _ in 0..30 {
-            step(
-                &mut t,
-                &players_at(f),
-                &[ball(CameraId::Left, SPARE.0, SPARE.1, 0.5)],
-                f as f64 * STEP_MS,
-            );
-            f += 1;
-        }
-        // 1 s with no ball candidates, longer than the 750 ms outgoing-start
-        // window, so the play phase cannot itself release the site (see
-        // `unrelated_ball_right_after_spare_sighting_releases_site`).
-        for _ in 0..10 {
-            let players = if bystander_stays {
-                players_at(f)
-            } else {
-                play_players(f)
-            };
-            step(&mut t, &players, &[], f as f64 * STEP_MS);
-            f += 1;
-        }
-        for k in 0..30 {
-            let yaw = -0.1 + 0.01 * k as f32;
-            let players = if bystander_stays {
-                players_at(f)
-            } else {
-                play_players(f)
-            };
-            step(
-                &mut t,
-                &players,
-                &[ball(CameraId::Left, yaw, 0.0, 0.8)],
-                f as f64 * STEP_MS,
-            );
-            f += 1;
-        }
+    let frames = (seconds * 1000.0 / step_ms) as u64;
+    for f in 0..frames {
+        let ms = f as f64 * step_ms;
+        let tt = ms as f32 / 1000.0;
+        let real = (0.2 * (0.7 * tt).sin(), 0.02 * (1.3 * tt).cos());
+        let players = if bystander {
+            players_with_bystander(f)
+        } else {
+            play_players(f)
+        };
+        step(
+            &mut t,
+            &players,
+            &[
+                ball(CameraId::Left, SPARE.0, SPARE.1, 0.4),
+                ball(CameraId::Left, real.0, real.1, 0.8),
+            ],
+            ms,
+        );
     }
-    (t, f)
+    (t, frames)
+}
+
+fn dormant_spare_site() -> (BallTracker, u64) {
+    dormant_spare_site_with(STEP_MS, 25.0, false)
+}
+
+/// Continue with only the real ball in play for `frames` frames.
+fn play_on(t: &mut BallTracker, from: u64, frames: u64) -> u64 {
+    for f in from..from + frames {
+        let r = real_ball_at(f);
+        step(
+            t,
+            &play_players(f),
+            &[ball(CameraId::Left, r.0, r.1, 0.8)],
+            f as f64 * STEP_MS,
+        );
+    }
+    from + frames
 }
 
 // ------------------------------------------------------------ cases
 
-/// Stationary spare ball, repeatedly selected while play is elsewhere,
-/// becomes a dormant site and is then rejected.
+/// Stationary spare visible while the real ball is played elsewhere
+/// becomes a dormant site and is then rejected even when it is the only
+/// candidate.
 #[test]
 fn stationary_spare_ball_becomes_dormant_and_is_rejected() {
     init_capture();
-    let (mut t, f) = dormant_spare_site(5);
+    let (mut t, f) = dormant_spare_site();
     assert!(
         captured("dormant static site") >= 1,
         "site never went dormant"
     );
-    // Only the spare is visible now: the tracker must not accept it.
     let mut accepted = 0;
-    for k in 0..30 {
+    for k in 0..40 {
         let out = step(
             &mut t,
-            &players_at(f + k),
+            &play_players(f + k),
             &[ball(CameraId::Left, SPARE.0, SPARE.1, 0.9)],
             (f + k) as f64 * STEP_MS,
         );
-        if out.is_some_and(|b| b.state == TrackState::Tracking) {
-            accepted += 1;
-        }
+        accepted += usize::from(out.is_some_and(|b| b.state == TrackState::Tracking));
     }
     assert_eq!(accepted, 0, "dormant spare was re-accepted");
+    assert_eq!(captured("reactivated static site"), 0);
 }
 
-/// Legitimate stationary dead ball (single long static episode with play
-/// around it) stays trackable: one episode is never enough for dormancy.
+/// Legitimate dead ball: the match ball rests for 30 s (e.g. waiting for a
+/// goal kick) with nothing else moving. Never excluded, tracked throughout,
+/// and still tracked when kicked back into play.
 #[test]
-fn legitimate_dead_ball_single_episode_is_not_excluded() {
+fn legitimate_dead_ball_rest_then_kick_is_never_excluded() {
     init_capture();
     let mut t = tracker();
-    let players = [player(1, 0.3, 0.0), player(2, 0.35, 0.02)];
+    let players = [player(1, 0.3, 0.05), player(2, 0.5, 0.0)];
     let mut tracking = 0;
-    for f in 0..100u64 {
+    let frames = 600u64;
+    for f in 0..frames {
         let out = step(
             &mut t,
             &players,
@@ -224,27 +222,36 @@ fn legitimate_dead_ball_single_episode_is_not_excluded() {
         );
         tracking += usize::from(out.is_some_and(|b| b.state == TrackState::Tracking));
     }
-    assert_eq!(tracking, 100);
+    assert_eq!(tracking, frames as usize);
+    for k in 1..=20u64 {
+        let yaw = 0.3 + 0.02 * k as f32;
+        let out = step(
+            &mut t,
+            &players,
+            &[ball(CameraId::Left, yaw, 0.0, 0.7)],
+            (frames + k) as f64 * STEP_MS,
+        )
+        .expect("tracked");
+        assert_eq!(out.state, TrackState::Tracking, "kick frame {k}");
+    }
     assert_eq!(captured("dormant static site"), 0);
 }
 
-/// Genuine ball disappears briefly (within coast) and returns: Coasting
-/// then Tracking again, held position while coasting.
+/// Genuine ball disappears briefly (within coast) and returns.
 #[test]
 fn genuine_ball_disappears_and_returns_within_coast() {
     init_capture();
     let mut t = tracker();
     let p = [player(1, 0.0, 0.0)];
     step(&mut t, &p, &[ball(CameraId::Left, 0.0, 0.0, 0.8)], 0.0);
-    let c = step(&mut t, &p, &[], 100.0).expect("coast");
+    let c = step(&mut t, &p, &[], 50.0).expect("coast");
     assert_eq!(c.state, TrackState::Coasting);
     assert_eq!((c.yaw, c.pitch), (0.0, 0.0));
-    let back = step(&mut t, &p, &[ball(CameraId::Left, 0.02, 0.0, 0.8)], 200.0).expect("back");
+    let back = step(&mut t, &p, &[ball(CameraId::Left, 0.02, 0.0, 0.8)], 100.0).expect("back");
     assert_eq!(back.state, TrackState::Tracking);
 }
 
-/// Genuine ball lost fully, then returns far away after grace: acquired by
-/// confidence (no max-jump gate after full loss).
+/// Genuine ball lost fully, then returns far away after grace.
 #[test]
 fn genuine_ball_lost_then_reacquired_far_away() {
     init_capture();
@@ -261,155 +268,90 @@ fn genuine_ball_lost_then_reacquired_far_away() {
     assert_eq!(far.yaw, 0.6);
 }
 
-/// Real ball kicked away from a dormant site with no player escorting it:
-/// coherent motion starting at the site releases it via
-/// "persistent outgoing motion".
+/// Real ball at the dormant spot kicked away; a chasing player 0.1 rad
+/// behind (outside contact range, so this is the outgoing-motion path).
+/// Tracked as soon as it leaves the zone; site released once it stays empty.
 #[test]
 fn real_ball_kicked_away_from_dormant_site_releases_it() {
     init_capture();
-    let (mut t, f) = dormant_spare_site(5);
+    let (mut t, f) = dormant_spare_site();
     assert!(captured("dormant static site") >= 1);
     let mut frame = f;
-    step(
-        &mut t,
-        &play_players(frame),
-        &[ball(CameraId::Left, SPARE.0, SPARE.1, 0.6)],
-        frame as f64 * STEP_MS,
-    );
-    frame += 1;
-    for k in 1..=10 {
-        step(
+    let mut tracked_moving = 0;
+    for k in 0..60u64 {
+        let yaw = SPARE.0 - 0.015 * k as f32;
+        let mut players = play_players(frame);
+        players.push(player(4, yaw + 0.1, 0.0));
+        let out = step(
             &mut t,
-            &play_players(frame),
-            &[ball(CameraId::Left, SPARE.0 - 0.03 * k as f32, 0.0, 0.6)],
+            &players,
+            &[ball(CameraId::Left, yaw, 0.0, 0.8)],
             frame as f64 * STEP_MS,
         );
+        if k >= 2 && out.is_some_and(|b| b.state == TrackState::Tracking) {
+            tracked_moving += 1;
+        }
         frame += 1;
     }
+    assert!(
+        tracked_moving >= 50,
+        "moving ball tracked {tracked_moving}/58"
+    );
     assert!(
         captured("(persistent outgoing motion)") >= 1,
         "kicked ball did not release the site"
     );
 }
 
-/// Real ball dribbled away by a player starting at the site: the site is
-/// released. Documents current behaviour: the pickup-occlusion path fires
-/// before outgoing motion accumulates its 3 detections / 750 ms.
+/// Ball dribbled away by the player standing at the site: released.
 #[test]
 fn real_ball_dribbled_away_from_dormant_site_releases_it() {
     init_capture();
-    let (mut t, f) = dormant_spare_site(5);
+    let (mut t, f) = dormant_spare_site();
     let mut frame = f;
-    step(
-        &mut t,
-        &players_at(frame),
-        &[ball(CameraId::Left, SPARE.0, SPARE.1, 0.6)],
-        frame as f64 * STEP_MS,
-    );
-    frame += 1;
-    for k in 1..=10 {
-        let yaw = SPARE.0 - 0.03 * k as f32;
+    for k in 0..60u64 {
+        let yaw = SPARE.0 - 0.01 * k as f32;
+        let mut players = play_players(frame);
+        players.push(player(1, yaw, 0.01));
         step(
             &mut t,
-            &[player(1, yaw, 0.0)],
-            &[ball(CameraId::Left, yaw, 0.0, 0.6)],
+            &players,
+            &[ball(CameraId::Left, yaw, 0.0, 0.8)],
             frame as f64 * STEP_MS,
         );
         frame += 1;
     }
     assert!(captured("reactivated static site") >= 1);
-    assert!(captured("(pickup occlusion)") >= 1);
 }
 
-/// Documents current behaviour (known weakness, OEV-001 hypothesis): an
-/// UNRELATED ball far from the site that appears within 750 ms of the last
-/// spare sighting and moves coherently releases the dormant site, because
-/// "outgoing" candidates need only lie outside 2 * radius - they need not
-/// originate at the site or be the same object.
-#[test]
-fn unrelated_ball_right_after_spare_sighting_releases_site() {
-    init_capture();
-    let (mut t, f) = dormant_spare_site(5);
-    assert!(captured("dormant static site") >= 1);
-    assert_eq!(captured("reactivated static site"), 0);
-    let mut frame = f;
-    // Spare seen at the site (bystander present).
-    step(
-        &mut t,
-        &players_at(frame),
-        &[ball(CameraId::Left, SPARE.0, SPARE.1, 0.4)],
-        frame as f64 * STEP_MS,
-    );
-    frame += 1;
-    // Next frames: only an unrelated ball 1.1 rad away, drifting slowly.
-    for k in 0..10 {
-        step(
-            &mut t,
-            &play_players(frame),
-            &[ball(CameraId::Left, -0.1 + 0.01 * k as f32, 0.0, 0.8)],
-            frame as f64 * STEP_MS,
-        );
-        frame += 1;
-    }
-    assert!(
-        captured("(persistent outgoing motion)") >= 1,
-        "documents current behaviour: unrelated distant motion released the site"
-    );
-}
-
-/// Contrast case: the same unrelated ball appearing more than 750 ms after
-/// the last spare sighting does NOT release the site.
-#[test]
-fn unrelated_ball_after_gap_does_not_release_site() {
-    init_capture();
-    let (mut t, f) = dormant_spare_site(5);
-    let mut frame = f;
-    step(
-        &mut t,
-        &players_at(frame),
-        &[ball(CameraId::Left, SPARE.0, SPARE.1, 0.4)],
-        frame as f64 * STEP_MS,
-    );
-    frame += 10; // 1 s gap
-    for k in 0..10 {
-        step(
-            &mut t,
-            &play_players(frame),
-            &[ball(CameraId::Left, -0.1 + 0.01 * k as f32, 0.0, 0.8)],
-            frame as f64 * STEP_MS,
-        );
-        frame += 1;
-    }
-    assert_eq!(captured("reactivated static site"), 0);
-}
-
-/// Pickup/occlusion path: ball disappears at the site with a player near,
-/// then reappears moving with that player -> release "pickup occlusion".
+/// Player picks the ball up at the site (ball hidden), then carries it away.
 #[test]
 fn pickup_occlusion_releases_dormant_site() {
     init_capture();
-    let (mut t, f) = dormant_spare_site(5);
+    let (mut t, f) = dormant_spare_site();
     let mut frame = f;
+    let mut players = play_players(frame);
+    players.push(player(1, SPARE.0, SPARE.1 + 0.01));
     step(
         &mut t,
-        &players_at(frame),
+        &players,
         &[ball(CameraId::Left, SPARE.0, SPARE.1, 0.6)],
         frame as f64 * STEP_MS,
     );
     frame += 1;
-    // Player at the site, ball hidden.
-    step(
-        &mut t,
-        &[player(1, SPARE.0, SPARE.1)],
-        &[],
-        frame as f64 * STEP_MS,
-    );
-    frame += 1;
-    for k in 1..=3 {
-        let yaw = SPARE.0 - 0.05 * k as f32;
+    for _ in 0..6 {
+        let mut players = play_players(frame);
+        players.push(player(1, SPARE.0, SPARE.1 + 0.01));
+        step(&mut t, &players, &[], frame as f64 * STEP_MS);
+        frame += 1;
+    }
+    for k in 1..=60u64 {
+        let yaw = SPARE.0 - 0.004 * k as f32;
+        let mut players = play_players(frame);
+        players.push(player(1, yaw, 0.01));
         step(
             &mut t,
-            &[player(1, yaw, 0.0)],
+            &players,
             &[ball(CameraId::Left, yaw, 0.0, 0.6)],
             frame as f64 * STEP_MS,
         );
@@ -417,12 +359,146 @@ fn pickup_occlusion_releases_dormant_site() {
     }
     assert!(
         captured("reactivated static site") >= 1,
-        "pickup did not release the site"
+        "pickup did not release"
     );
 }
 
-/// Competing detections while tracking: closer candidate wins over a more
-/// confident far one (nearest-to-last scoring).
+/// Flipped from OEV-001: an unrelated ball far from the site appearing
+/// right after the last spare sighting no longer releases the site.
+#[test]
+fn unrelated_ball_right_after_spare_sighting_does_not_release_site() {
+    init_capture();
+    let (mut t, f) = dormant_spare_site();
+    assert!(captured("dormant static site") >= 1);
+    let end = play_on(&mut t, f, 120);
+    assert_eq!(captured("reactivated static site"), 0);
+    // The spare is still excluded afterwards.
+    let out = step(
+        &mut t,
+        &play_players(end),
+        &[ball(CameraId::Left, SPARE.0, SPARE.1, 0.95)],
+        end as f64 * STEP_MS,
+    );
+    assert!(out.is_none_or(|b| b.state != TrackState::Tracking));
+}
+
+/// Flipped from OEV-001: a bystander standing next to the spare while the
+/// real ball moves near other players does not trigger a pickup release.
+#[test]
+fn bystander_near_spare_does_not_release_site() {
+    init_capture();
+    let (mut t, f) = dormant_spare_site_with(STEP_MS, 25.0, true);
+    assert!(captured("dormant static site") >= 1);
+    // Spare momentarily undetected; bystander stays; real ball keeps playing.
+    for k in 0..120u64 {
+        let frame = f + k;
+        let r = real_ball_at(frame);
+        let mut dets = vec![ball(CameraId::Left, r.0, r.1, 0.8)];
+        if k % 40 >= 20 {
+            dets.push(ball(CameraId::Left, SPARE.0, SPARE.1, 0.4));
+        }
+        step(
+            &mut t,
+            &players_with_bystander(frame),
+            &dets,
+            frame as f64 * STEP_MS,
+        );
+    }
+    assert_eq!(captured("reactivated static site"), 0);
+}
+
+/// A second stationary detection 16 mrad from a dormant spare (a
+/// neighbouring detection of the same object) is excluded too, while an
+/// area 5 deg away is not.
+#[test]
+fn neighbouring_static_detection_joins_exclusion() {
+    init_capture();
+    let (mut t, f) = dormant_spare_site();
+    let neighbour = (SPARE.0 - 0.016, SPARE.1);
+    let mut frame = f;
+    for _ in 0..60 {
+        let r = real_ball_at(frame);
+        step(
+            &mut t,
+            &play_players(frame),
+            &[
+                ball(CameraId::Left, SPARE.0, SPARE.1, 0.4),
+                ball(CameraId::Left, neighbour.0, neighbour.1, 0.4),
+                ball(CameraId::Left, r.0, r.1, 0.8),
+            ],
+            frame as f64 * STEP_MS,
+        );
+        frame += 1;
+    }
+    assert!(
+        captured("neighbour of dormant site") >= 1,
+        "neighbour not excluded"
+    );
+    // Only the neighbour visible: rejected.
+    let out = step(
+        &mut t,
+        &play_players(frame),
+        &[ball(CameraId::Left, neighbour.0, neighbour.1, 0.9)],
+        frame as f64 * STEP_MS,
+    );
+    assert!(out.is_none_or(|b| b.state != TrackState::Tracking));
+    // A ball 5 deg away from the spare (with a player on it) is accepted.
+    let far = (SPARE.0 - 0.0873, SPARE.1);
+    let mut accepted = false;
+    for k in 1..=40u64 {
+        let mut players = play_players(frame + k);
+        players.push(player(4, far.0, far.1 + 0.02));
+        let out = step(
+            &mut t,
+            &players,
+            &[ball(CameraId::Left, far.0, far.1, 0.9)],
+            (frame + k) as f64 * STEP_MS,
+        );
+        accepted |= out.is_some_and(|b| b.state == TrackState::Tracking);
+    }
+    assert!(accepted, "area 5 deg from the spare was excluded");
+}
+
+/// Probation: a site released by a (spurious) departure that settles again
+/// within the probation window re-dormants immediately, without relearning
+/// the 20 s of evidence.
+#[test]
+fn released_site_that_resettles_redormants_during_probation() {
+    init_capture();
+    let (mut t, f) = dormant_spare_site();
+    let mut frame = f;
+    // Kick-like departure, site stays empty for 3 s.
+    for k in 0..60u64 {
+        let yaw = SPARE.0 - 0.015 * k as f32;
+        step(
+            &mut t,
+            &play_players(frame),
+            &[ball(CameraId::Left, yaw, 0.0, 0.8)],
+            frame as f64 * STEP_MS,
+        );
+        frame += 1;
+    }
+    assert!(captured("reactivated static site") >= 1);
+    // The spare is back at the spot (e.g. returned by a ball boy) while play
+    // continues: re-dormant within a couple of seconds.
+    let before = captured("re-static during probation");
+    for _ in 0..60u64 {
+        let r = real_ball_at(frame);
+        step(
+            &mut t,
+            &play_players(frame),
+            &[
+                ball(CameraId::Left, SPARE.0, SPARE.1, 0.4),
+                ball(CameraId::Left, r.0, r.1, 0.8),
+            ],
+            frame as f64 * STEP_MS,
+        );
+        frame += 1;
+    }
+    assert_eq!(captured("re-static during probation"), before + 1);
+}
+
+/// Competing detections while tracking: closer candidate wins.
 #[test]
 fn competing_detections_nearest_wins_while_tracking() {
     init_capture();
@@ -442,9 +518,8 @@ fn competing_detections_nearest_wins_while_tracking() {
     assert_eq!(out.yaw, 0.02);
 }
 
-/// Confidence competition after full Lost and expired grace: the highest
-/// confidence candidate wins regardless of location (documents current
-/// behaviour - this is how a confident decoy can be acquired).
+/// Confidence competition after full Lost and expired grace: highest
+/// confidence wins (unchanged by OEV-003; a known lever for later work).
 #[test]
 fn confidence_competition_after_full_lost_picks_highest_confidence() {
     init_capture();
@@ -464,30 +539,31 @@ fn confidence_competition_after_full_lost_picks_highest_confidence() {
         2_000.0,
     )
     .expect("acquire");
-    assert_eq!(out.yaw, 0.5, "highest confidence acquired after grace");
+    assert_eq!(out.yaw, 0.5);
 }
 
-/// Stale evidence: static accepts separated by more than the 750 ms episode
-/// gap never accumulate into one qualifying episode, so no dormancy.
+/// Stale evidence: sightings 800 ms apart (gap > 750 ms) never form a static
+/// window, so no dormancy.
 #[test]
-fn stale_evidence_does_not_form_static_episodes() {
+fn stale_evidence_does_not_form_static_windows() {
     init_capture();
     let mut t = tracker().with_max_coast_frames(1000);
-    let players = players_at(0);
     for k in 0..60u64 {
-        // One spare sighting every 800 ms (gap > 750 ms) for 48 s.
+        let r = real_ball_at(k * 16);
         step(
             &mut t,
-            &players,
-            &[ball(CameraId::Left, SPARE.0, SPARE.1, 0.6)],
+            &play_players(k),
+            &[
+                ball(CameraId::Left, SPARE.0, SPARE.1, 0.6),
+                ball(CameraId::Left, r.0, r.1, 0.8),
+            ],
             k as f64 * 800.0,
         );
     }
     assert_eq!(captured("dormant static site"), 0);
 }
 
-/// Cross-camera overlap: the same ball reported by both cameras at nearly
-/// the same panorama position keeps one continuous track with no jump.
+/// Cross-camera overlap keeps one continuous track with no jump.
 #[test]
 fn cross_camera_overlap_keeps_single_continuous_track() {
     init_capture();
@@ -514,8 +590,8 @@ fn cross_camera_overlap_keeps_single_continuous_track() {
     }
 }
 
-/// Replay-rate invariance: identical inputs and timestamps produce
-/// identical outputs regardless of execution speed.
+/// Replay-rate invariance: identical inputs and timestamps give identical
+/// outputs regardless of execution speed.
 #[test]
 fn replay_rate_invariance() {
     init_capture();
@@ -526,9 +602,12 @@ fn replay_rate_invariance() {
             let dets = if f % 7 == 0 {
                 vec![]
             } else {
-                vec![ball(CameraId::Left, (f as f32 * 0.003).sin(), 0.0, 0.6)]
+                vec![
+                    ball(CameraId::Left, (f as f32 * 0.003).sin(), 0.0, 0.6),
+                    ball(CameraId::Left, SPARE.0, SPARE.1, 0.4),
+                ]
             };
-            let b = step(&mut t, &players_at(f), &dets, f as f64 * 16.683);
+            let b = step(&mut t, &play_players(f), &dets, f as f64 * 16.683);
             out.push(b.map(|b| (b.state, b.yaw.to_bits(), b.pitch.to_bits())));
             if sleep_us > 0 {
                 std::thread::sleep(std::time::Duration::from_micros(sleep_us));
@@ -539,53 +618,46 @@ fn replay_rate_invariance() {
     assert_eq!(run(0), run(50));
 }
 
-/// Clock sensitivity (documents current behaviour): the same spare-ball
-/// stream yields a dormant site on a stretched clock but not when the
-/// timestamps are compressed ~13x, as observed between the recorded wall
-/// clock and source video time on sample_02.
+/// Replaces OEV-001's clock-scale dependency case: the same 25 s match
+/// situation sampled at 30, 60 and 120 fps goes dormant at the same video
+/// time (within one static window) and is not released.
 #[test]
-fn static_site_dormancy_depends_on_clock_scale() {
-    let run = |scale: f64| {
+fn spare_dormancy_is_frame_rate_invariant() {
+    let mut first_dormant_ms = Vec::new();
+    for fps in [30.0f64, 60.0, 120.0] {
         init_capture();
+        let step_ms = 1000.0 / fps;
         let mut t = tracker();
-        let mut f = 0u64;
-        for _ in 0..5 {
-            for _ in 0..30 {
-                step(
-                    &mut t,
-                    &players_at(f),
-                    &[ball(CameraId::Left, SPARE.0, SPARE.1, 0.5)],
-                    f as f64 * STEP_MS * scale,
-                );
-                f += 1;
-            }
-            for k in 0..30 {
-                step(
-                    &mut t,
-                    &players_at(f),
-                    &[ball(CameraId::Left, -0.1 + 0.01 * k as f32, 0.0, 0.8)],
-                    f as f64 * STEP_MS * scale,
-                );
-                f += 1;
+        let mut at = None;
+        let frames = (25_000.0 / step_ms) as u64;
+        for f in 0..frames {
+            let ms = f as f64 * step_ms;
+            let tt = ms as f32 / 1000.0;
+            let real = (0.2 * (0.7 * tt).sin(), 0.02 * (1.3 * tt).cos());
+            step(
+                &mut t,
+                &play_players(f),
+                &[
+                    ball(CameraId::Left, SPARE.0, SPARE.1, 0.4),
+                    ball(CameraId::Left, real.0, real.1, 0.8),
+                ],
+                ms,
+            );
+            if at.is_none() && captured("dormant static site") > 0 {
+                at = Some(ms);
             }
         }
-        captured("dormant static site")
-    };
-    assert!(run(1.0) >= 1, "baseline stream should go dormant");
-    assert_eq!(run(1.0 / 13.0), 0, "compressed clock should not go dormant");
-}
-
-/// Documents current behaviour (known weakness): a stationary bystander
-/// player standing next to the spare, plus the real ball moving near other
-/// players elsewhere, satisfies the "pickup occlusion" release although
-/// nobody picked the spare up.
-#[test]
-fn bystander_near_spare_triggers_pickup_release() {
-    init_capture();
-    let _ = build_spare_site(5, true);
-    assert!(captured("dormant static site") >= 1);
+        assert_eq!(
+            captured("reactivated static site"),
+            0,
+            "{fps} fps: released"
+        );
+        first_dormant_ms.push(at.unwrap_or_else(|| panic!("{fps} fps: no dormancy")));
+    }
+    let min = first_dormant_ms.iter().cloned().fold(f64::MAX, f64::min);
+    let max = first_dormant_ms.iter().cloned().fold(f64::MIN, f64::max);
     assert!(
-        captured("(pickup occlusion)") >= 1,
-        "documents current behaviour: bystander + distant ball released the site"
+        max - min <= 1_600.0,
+        "dormancy time differs across frame rates: {first_dormant_ms:?}"
     );
 }
