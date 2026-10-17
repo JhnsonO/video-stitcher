@@ -33,7 +33,7 @@
 //! ```text
 //! cargo run --release -p reco-autocam --no-default-features --example cpu_replay -- \
 //!     --events run.jsonl --clock historical --out report.json [--trace trace.csv]
-//!     [--fps-num 60000 --fps-den 1001] [--throttle-us 0] [--label name]
+//!     [--fps-num 60000 --fps-den 1001] [--throttle-us 0] [--label name] [--active-ball]
 //! ```
 
 use std::collections::BTreeMap;
@@ -49,6 +49,7 @@ use reco_core::detect::tracker::{TrackState, TrackedEntity, Tracker, WorldState}
 /// Field-mode configuration as built in `reco_autocam::lib` (TrackingMode::Field,
 /// stride 1). Kept explicit and printed in every report.
 const BALL_CLASS_ID: u16 = 32;
+const PERSON_CLASS_ID: u16 = 0;
 const FIELD_MAX_JUMP_RAD: f32 = 0.8;
 const COAST_FRAMES_STRIDE1: u32 = reco_autocam::trackers::ball::DEFAULT_COAST_FRAMES;
 
@@ -130,6 +131,7 @@ struct Args {
     fps_den: u64,
     throttle_us: u64,
     label: String,
+    active_ball: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -142,6 +144,7 @@ fn parse_args() -> Result<Args, String> {
         fps_den: 1001,
         throttle_us: 0,
         label: String::new(),
+        active_ball: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -155,6 +158,7 @@ fn parse_args() -> Result<Args, String> {
             "--fps-den" => args.fps_den = value()?.parse().map_err(|e| format!("{e}"))?,
             "--throttle-us" => args.throttle_us = value()?.parse().map_err(|e| format!("{e}"))?,
             "--label" => args.label = value()?,
+            "--active-ball" => args.active_ball = true,
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -360,6 +364,11 @@ fn main() {
     let mut tracker = BallTracker::new(BALL_CLASS_ID)
         .with_max_jump_rad(FIELD_MAX_JUMP_RAD)
         .with_max_coast_frames(COAST_FRAMES_STRIDE1);
+    if args.active_ball {
+        tracker = tracker.with_active_ball_selection(
+            reco_autocam::trackers::active_ball::ActiveBallConfig::sample02(PERSON_CLASS_ID),
+        );
+    }
 
     let frame_ms = 1000.0 * args.fps_den as f64 / args.fps_num as f64;
     let mut trace_out = args
@@ -569,6 +578,7 @@ fn main() {
             "reacquire_initial_weight": reco_autocam::trackers::ball::DEFAULT_REACQUIRE_INITIAL_WEIGHT,
             "player_source": "recorded world_state.players (ClassProvider person=0 output)",
             "fps": format!("{}/{}", args.fps_num, args.fps_den),
+            "active_ball": args.active_ball,
         },
         "input": {
             "ball_candidates_mapped": ball_candidates,

@@ -56,6 +56,7 @@ use reco_core::detect::detector::CameraId;
 use reco_core::detect::director::MappedDetection;
 use reco_core::detect::tracker::{TrackState, TrackedEntity, Tracker};
 
+use crate::trackers::active_ball::{ActiveBallConfig, ActiveBallSelector, Verdict};
 use crate::trackers::filters::{CoastStatus, Coaster};
 use crate::trackers::static_sites::DormantStaticSites;
 
@@ -89,6 +90,10 @@ pub const DEFAULT_REACQUIRE_GRACE_MS: f64 = 750.0;
 /// [`DEFAULT_REACQUIRE_GRACE_MS`].
 pub const DEFAULT_REACQUIRE_INITIAL_WEIGHT: f32 = 0.40;
 
+/// Distance-score penalty (radians) applied to a candidate with active-ball
+/// weight 0 during normal tracking; scales linearly with `1 - weight`.
+pub const ACTIVE_BALL_PENALTY_RAD: f32 = 0.35;
+
 /// Singleton ball tracker emitting at most one
 /// [`TrackedEntity`] per frame.
 ///
@@ -118,6 +123,8 @@ pub struct BallTracker {
     /// tracker is registered → the player-anchor filter is a no-op.
     current_players: Vec<(f32, f32)>,
     dormant_sites: DormantStaticSites,
+    /// Optional active-ball selection (OEV-004). `None` = disabled.
+    active: Option<ActiveBallSelector>,
     /// Persistent age counter; singleton ball so `id` is always 0
     /// but `age_frames` ticks every frame we're actively tracking.
     age_frames: u64,
@@ -147,6 +154,7 @@ impl BallTracker {
             player_anchor_max_rad: DEFAULT_PLAYER_ANCHOR_RAD,
             current_players: Vec::new(),
             dormant_sites: DormantStaticSites::default(),
+            active: None,
             age_frames: 0,
         }
     }
@@ -186,6 +194,14 @@ impl BallTracker {
     /// keeping the code path active.
     pub fn with_player_anchor_rad(mut self, rad: f32) -> Self {
         self.player_anchor_max_rad = rad.max(0.0);
+        self
+    }
+
+    /// Enable active-ball selection (OEV-004 experiment): body-attachment
+    /// down-weighting and a size prior, both soft except near-certain body
+    /// attachment. Needs person detections in the `update` input.
+    pub fn with_active_ball_selection(mut self, cfg: ActiveBallConfig) -> Self {
+        self.active = Some(ActiveBallSelector::new(cfg));
         self
     }
 
@@ -321,6 +337,21 @@ impl BallTracker {
         }
     }
 
+    /// Fold an active-ball weight into a lower-is-better score. With no prior
+    /// position the score is `-confidence`, so it is scaled; otherwise a
+    /// distance penalty proportional to `1 - weight` is added. Weight 1.0
+    /// leaves the score bit-identical.
+    fn apply_active_weight(&self, score: f32, weight: f32) -> f32 {
+        if weight >= 1.0 {
+            return score;
+        }
+        if self.last.is_none() {
+            score * weight
+        } else {
+            score + (1.0 - weight) * ACTIVE_BALL_PENALTY_RAD
+        }
+    }
+
     /// Decide whether this detection survives the player-anchor gate.
     fn passes_player_anchor(&self, pos_yaw: f32, pos_pitch: f32) -> bool {
         if self.current_players.is_empty() {
@@ -340,10 +371,15 @@ impl Tracker for BallTracker {
         self.dormant_sites
             .observe_frame(detections, self.class_id, timestamp_ms);
 
+        if let Some(a) = self.active.as_mut() {
+            a.observe(detections, self.class_id, timestamp_ms);
+        }
+
         // Steps 1-4: filter candidates down to survivors. Dormant sites are a
         // hard gate at the same reject-before-scoring tier as player anchors.
-        let mut survivors: Vec<&MappedDetection> = Vec::with_capacity(detections.len());
-        for det in detections {
+        // Each survivor carries its active-ball weight (1.0 when disabled).
+        let mut survivors: Vec<(&MappedDetection, f32)> = Vec::with_capacity(detections.len());
+        for (index, det) in detections.iter().enumerate() {
             if det.class_id != self.class_id {
                 continue;
             }
@@ -372,7 +408,19 @@ impl Tracker for BallTracker {
                 );
                 continue;
             }
-            survivors.push(det);
+            let weight = match self.active.as_ref().map(|a| a.verdict(detections, index)) {
+                None => 1.0,
+                Some(Verdict::Weight(w)) => w,
+                Some(Verdict::Reject) => {
+                    log::trace!(
+                        "BallTracker: drop body-attached — yaw={:.3} pitch={:.3}",
+                        pos.yaw,
+                        pos.pitch
+                    );
+                    continue;
+                }
+            };
+            survivors.push((det, weight));
         }
 
         // Step 5: normal tracking stays nearest-to-static-last. Only a
@@ -385,20 +433,20 @@ impl Tracker for BallTracker {
         let best: Option<&MappedDetection> = if was_lost {
             survivors
                 .iter()
-                .map(|d| (self.lost_reacquire_score(d, timestamp_ms), *d))
+                .map(|&(d, w)| (self.lost_reacquire_score(d, timestamp_ms) * w, d))
                 .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(_, d)| d)
         } else {
             let use_predicted = was_coasting && self.last_velocity.is_some();
             survivors
                 .iter()
-                .filter_map(|d| {
+                .filter_map(|&(d, w)| {
                     let score = if use_predicted {
                         self.score_predicted(d, timestamp_ms)
                     } else {
                         self.score(d)
                     };
-                    score.map(|s| (s, *d))
+                    score.map(|s| (self.apply_active_weight(s, w), d))
                 })
                 .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(_, d)| d)
@@ -1081,5 +1129,243 @@ mod tests {
         assert_eq!(lost.len(), 1);
         assert_eq!(lost[0].state, TrackState::Lost);
         assert!(t.update(&[], 200.0).is_empty());
+    }
+
+    // ---------------------------------------------------------------- OEV-004
+    // Active-ball selection fixtures. Camera coords double as panorama coords
+    // (yaw = cx, pitch = -cy) so geometry is easy to read.
+
+    const BALL: u16 = 32;
+    const PERSON: u16 = 0;
+    const DT: f64 = 1000.0 / 59.94;
+
+    fn expected_size(cy: f32) -> f32 {
+        let m = crate::trackers::active_ball::SizePrior::SAMPLE02_FIT.left;
+        (m.slope * cy + m.intercept).exp()
+    }
+
+    fn cand(class_id: u16, cx: f32, cy: f32, w: f32, h: f32, conf: f32) -> MappedDetection {
+        MappedDetection {
+            camera: CameraId::Left,
+            class_id,
+            confidence: conf,
+            camera_center: (cx, cy),
+            camera_size: (w, h),
+            position: Some(ViewportPosition {
+                yaw: cx,
+                pitch: -cy,
+                fov_degrees: None,
+            }),
+        }
+    }
+
+    /// Plausible ball at (cx, cy).
+    fn ball_at(cx: f32, cy: f32) -> MappedDetection {
+        let s = expected_size(cy);
+        cand(BALL, cx, cy, s, s, 0.6)
+    }
+
+    fn person_at(cx: f32, cy: f32) -> MappedDetection {
+        cand(PERSON, cx, cy, 0.05, 0.20, 0.9)
+    }
+
+    /// Point at relative (u, v) inside the person box centred at (px, py).
+    fn on_body(px: f32, py: f32, u: f32, v: f32) -> (f32, f32) {
+        (px + u * 0.05, py - 0.10 + v * 0.20)
+    }
+
+    fn field_tracker(active: bool) -> BallTracker {
+        let t = BallTracker::new(BALL)
+            .with_max_jump_rad(0.8)
+            .with_max_coast_frames(DEFAULT_COAST_FRAMES);
+        if active {
+            t.with_active_ball_selection(crate::trackers::active_ball::ActiveBallConfig::sample02(
+                PERSON,
+            ))
+        } else {
+            t
+        }
+    }
+
+    /// Knee patch rigidly attached to a walking player for 2 s while the real
+    /// ball rolls nearby. Without selection the tracker stays on the knee; with
+    /// it the tracker moves to the real ball.
+    fn knee_scene(active: bool) -> (usize, usize) {
+        let mut t = field_tracker(active);
+        let (mut on_ball, mut on_knee) = (0, 0);
+        for i in 0..120 {
+            let ts = i as f64 * DT;
+            let px = 0.30 + 0.0015 * i as f32;
+            let (kx, ky) = on_body(px, 0.70, 0.05, 0.65);
+            let knee = cand(BALL, kx, ky, 0.006, 0.006, 0.8);
+            let ball = ball_at(0.55 + 0.001 * i as f32, 0.80);
+            let mut dets = vec![person_at(px, 0.70), knee];
+            // The real ball only appears after the knee has been tracked.
+            if i >= 10 {
+                dets.push(ball);
+            }
+            let out = t.update(&dets, ts);
+            if i >= 60 {
+                match out.first() {
+                    Some(e)
+                        if e.state == TrackState::Tracking
+                            && (e.yaw - ball.camera_center.0).abs() < 1e-6 =>
+                    {
+                        on_ball += 1
+                    }
+                    Some(e) if e.state == TrackState::Tracking && (e.yaw - kx).abs() < 1e-6 => {
+                        on_knee += 1
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (on_ball, on_knee)
+    }
+
+    #[test]
+    fn knee_patch_without_selection_stays_on_knee() {
+        let (on_ball, on_knee) = knee_scene(false);
+        assert_eq!(on_ball, 0);
+        assert_eq!(on_knee, 60);
+    }
+
+    #[test]
+    fn knee_patch_with_selection_switches_to_real_ball() {
+        let (on_ball, on_knee) = knee_scene(true);
+        assert_eq!(on_knee, 0);
+        assert_eq!(on_ball, 60);
+    }
+
+    /// Ball controlled at the chest for ~0.6 s by a moving player, then drops
+    /// and rolls away. It may be down-weighted while held but is never dropped,
+    /// and stays tracked after separation.
+    #[test]
+    fn held_ball_is_never_rejected_and_tracks_after_separation() {
+        let mut t = field_tracker(true);
+        let mut ts = 0.0;
+        for i in 0..36 {
+            ts = i as f64 * DT;
+            let px = 0.30 + 0.002 * i as f32;
+            let (bx, by) = on_body(px, 0.70, 0.0, 0.35);
+            let s = expected_size(by);
+            let out = t.update(&[person_at(px, 0.70), cand(BALL, bx, by, s, s, 0.6)], ts);
+            assert_eq!(out[0].state, TrackState::Tracking, "held frame {i}");
+        }
+        for k in 1..40 {
+            let px = 0.372;
+            let bx = px + 0.004 * k as f32;
+            let by = (0.70 - 0.10 + 0.35 * 0.20 + 0.01 * k as f32).min(0.95);
+            let out = t.update(&[person_at(px, 0.70), ball_at(bx, by)], ts + k as f64 * DT);
+            assert_eq!(out[0].state, TrackState::Tracking, "separated frame {k}");
+            assert!((out[0].yaw - bx).abs() < 1e-6);
+        }
+    }
+
+    /// Dribble: ball at the feet moving with the player, then rolling ahead.
+    #[test]
+    fn dribble_is_never_rejected() {
+        let mut t = field_tracker(true);
+        for i in 0..180 {
+            let px = 0.30 + 0.002 * i as f32;
+            let ahead = if i < 120 {
+                0.0
+            } else {
+                0.004 * (i - 120) as f32
+            };
+            let (bx, by) = on_body(px, 0.70, 0.2, 0.93);
+            let out = t.update(
+                &[person_at(px, 0.70), ball_at(bx + ahead, by)],
+                i as f64 * DT,
+            );
+            assert_eq!(out[0].state, TrackState::Tracking, "frame {i}");
+            assert!((out[0].yaw - (bx + ahead)).abs() < 1e-6);
+        }
+    }
+
+    /// Boot swinging at the feet next to a tracked real ball: the real ball is
+    /// chosen every frame.
+    #[test]
+    fn boot_swing_does_not_steal_real_ball() {
+        let mut t = field_tracker(true);
+        for i in 0..120 {
+            let px = 0.30 + 0.002 * i as f32;
+            let swing = 0.3 * (i as f32 * 0.4).sin();
+            let (bx, by) = on_body(px, 0.70, swing, 0.95);
+            let boot = cand(BALL, bx, by, 0.012, 0.008, 0.7);
+            let ball = ball_at(0.40, 0.82);
+            let out = t.update(&[person_at(px, 0.70), boot, ball], i as f64 * DT);
+            assert_eq!(out[0].state, TrackState::Tracking);
+            assert!((out[0].yaw - 0.40).abs() < 1e-6, "frame {i}");
+        }
+    }
+
+    /// Boot only, no ball anywhere: the tracker keeps running (tracks, coasts
+    /// or loses) without panicking.
+    #[test]
+    fn boot_only_runs_without_crash() {
+        let mut t = field_tracker(true);
+        for i in 0..300 {
+            let px = 0.30 + 0.002 * i as f32;
+            let (bx, by) = on_body(px, 0.70, 0.3 * (i as f32 * 0.4).sin(), 0.93);
+            let dets = if i % 7 == 0 {
+                vec![person_at(px, 0.70)]
+            } else {
+                vec![person_at(px, 0.70), cand(BALL, bx, by, 0.012, 0.008, 0.7)]
+            };
+            let out = t.update(&dets, i as f64 * DT);
+            assert!(out.len() <= 1);
+        }
+    }
+
+    /// Size prior: a much-too-small candidate loses to a plausible one, both on
+    /// fresh acquisition (where it has higher confidence) and while tracking
+    /// (where it is slightly closer).
+    #[test]
+    fn size_prior_prefers_plausible_candidate() {
+        let tiny = |cx: f32, conf: f32| {
+            let s = expected_size(0.5) * 0.25;
+            cand(BALL, cx, 0.5, s, s, conf)
+        };
+        let plausible = |cx: f32, conf: f32| {
+            let s = expected_size(0.5);
+            cand(BALL, cx, 0.5, s, s, conf)
+        };
+
+        let mut t = field_tracker(true);
+        let out = t.update(&[tiny(0.30, 0.9), plausible(0.40, 0.6)], 0.0);
+        assert!((out[0].yaw - 0.40).abs() < 1e-6, "acquisition");
+
+        let out = t.update(&[tiny(0.41, 0.6), plausible(0.43, 0.6)], DT);
+        assert!((out[0].yaw - 0.43).abs() < 1e-6, "tracking");
+
+        // Without selection the same frames pick by confidence / proximity.
+        let mut base = field_tracker(false);
+        let out = base.update(&[tiny(0.30, 0.9), plausible(0.40, 0.6)], 0.0);
+        assert!((out[0].yaw - 0.30).abs() < 1e-6);
+    }
+
+    /// Ball-only input (no person detections, plausible sizes): selection is a
+    /// no-op and the output is identical to the disabled tracker.
+    #[test]
+    fn selection_without_persons_matches_disabled_tracker() {
+        let mut a = field_tracker(true);
+        let mut b = field_tracker(false);
+        for i in 0..200 {
+            let x = 0.3 + 0.002 * i as f32;
+            let dets = if i % 11 == 0 {
+                vec![]
+            } else {
+                vec![ball_at(x, 0.6)]
+            };
+            let oa = a.update(&dets, i as f64 * DT);
+            let ob = b.update(&dets, i as f64 * DT);
+            assert_eq!(oa.len(), ob.len());
+            for (x, y) in oa.iter().zip(&ob) {
+                assert_eq!(x.state, y.state);
+                assert_eq!(x.yaw.to_bits(), y.yaw.to_bits());
+                assert_eq!(x.pitch.to_bits(), y.pitch.to_bits());
+            }
+        }
     }
 }

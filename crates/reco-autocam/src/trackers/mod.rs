@@ -17,6 +17,7 @@
 //!   this frame's points). The [`Tracker`](reco_core::detect::tracker::Tracker)
 //!   trait's two real shapes are this and the stateful ball tracker.
 
+pub mod active_ball;
 pub mod ball;
 pub mod class_provider;
 pub mod filters;
