@@ -96,6 +96,31 @@ fn filter_by_roi(
         .collect()
 }
 
+/// Ball ROI test with a vertical allowance ABOVE the polygon.
+///
+/// Image y grows downward, so "a ball above the pitch line" means the
+/// field polygon lies BELOW the ball. The ball passes if the polygon
+/// contains the ball centre itself, or any point up to `margin` straight
+/// below it (sampled every 0.02 of frame height, endpoints included).
+/// The earlier single test at `cy + margin` accepted lofted balls but
+/// also rejected every ball in the lower part of the frame (the near
+/// side of the pitch), because `cy + margin` fell below the polygon's
+/// bottom edge. This version accepts a strict superset of that test.
+fn ball_passes_roi(cx: f64, cy: f64, margin: f64, polygon: &[[f64; 2]]) -> bool {
+    if point_in_polygon([cx, cy], polygon) {
+        return true;
+    }
+    if margin <= 0.0 {
+        return false;
+    }
+    const STEP: f64 = 0.02;
+    let n = (margin / STEP).ceil() as usize;
+    (1..=n).any(|i| {
+        let dy = (i as f64 * STEP).min(margin);
+        point_in_polygon([cx, cy + dy], polygon)
+    })
+}
+
 /// An [`UnifiedDetector`] decorator that filters output detections by
 /// field ROI polygon using a per-class anchor policy.
 ///
@@ -243,7 +268,7 @@ impl UnifiedDetector for RoiFilteredDetector {
                 let cx = d.center_x as f64;
                 let cy = d.center_y as f64;
                 let adj_cy = cy + self.ball_vertical_margin;
-                let roi_pass = point_in_polygon([cx, adj_cy], polygon);
+                let roi_pass = ball_passes_roi(cx, cy, self.ball_vertical_margin, polygon);
                 if diag_window {
                     eprintln!(
                         "OEV_ROI_DIAG cam={:?} t_ms={:.3} cx={:.4} cy={:.4} adj_cy={:.4} roi_pass={}",
@@ -415,5 +440,53 @@ mod tests {
         let mut anchors = HashMap::new();
         anchors.insert(7u16, RoiAnchor::Bottom);
         assert!(filter_by_roi(vec![det], &roi, &anchors, RoiAnchor::Center).is_empty());
+    }
+
+    // ── ball vertical margin: allowance is above the polygon, not a
+    //    downward shift that rejects near-side balls ──────────────────
+
+    #[test]
+    fn ball_margin_keeps_near_side_ball_inside_polygon() {
+        // Polygon spans y in [0.4, 1.0]. A ball at y=0.7 is inside; the
+        // old `cy + 0.40` test put it at 1.1 (outside) and dropped it.
+        let poly = vec![[0.0, 0.4], [1.0, 0.4], [1.0, 1.0], [0.0, 1.0]];
+        assert!(ball_passes_roi(0.5, 0.7, 0.40, &poly));
+        assert!(!point_in_polygon([0.5, 0.7 + 0.40], &poly));
+    }
+
+    #[test]
+    fn ball_margin_still_accepts_lofted_ball_above_top_edge() {
+        let poly = vec![[0.0, 0.4], [1.0, 0.4], [1.0, 1.0], [0.0, 1.0]];
+        // 0.25 above the top edge: within the 0.40 allowance.
+        assert!(ball_passes_roi(0.5, 0.15, 0.40, &poly));
+        // 0.45 above: beyond it.
+        assert!(!ball_passes_roi(0.5, -0.05, 0.40, &poly));
+    }
+
+    #[test]
+    fn ball_margin_rejects_ball_outside_sideways_or_below() {
+        let poly = vec![[0.2, 0.4], [0.8, 0.4], [0.8, 0.9], [0.2, 0.9]];
+        assert!(!ball_passes_roi(0.05, 0.6, 0.40, &poly)); // left of polygon
+        assert!(!ball_passes_roi(0.5, 0.95, 0.40, &poly)); // below bottom edge
+    }
+
+    #[test]
+    fn ball_margin_is_superset_of_old_test() {
+        let poly = vec![[0.1, 0.45], [0.9, 0.38], [1.0, 1.0], [0.1, 1.0]];
+        for xi in 0..=20 {
+            for yi in 0..=20 {
+                let (x, y) = (xi as f64 / 20.0, yi as f64 / 20.0);
+                if point_in_polygon([x, y + 0.40], &poly) {
+                    assert!(ball_passes_roi(x, y, 0.40, &poly), "lost ({x},{y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ball_margin_zero_equals_plain_center_test() {
+        let poly = vec![[0.2, 0.4], [0.8, 0.4], [0.8, 0.9], [0.2, 0.9]];
+        assert!(ball_passes_roi(0.5, 0.5, 0.0, &poly));
+        assert!(!ball_passes_roi(0.5, 0.2, 0.0, &poly));
     }
 }
