@@ -18,6 +18,10 @@
 //!    not penalised (a ball in flight sits higher in the image than its ground
 //!    point and looks large for its row).
 //!
+//! 3. **Shape prior.** A ball is round, so its normalised box `h / w` sits
+//!    near the camera's aspect-corrected value. Tall/thin or flat boxes (fence
+//!    posts, poles, lines) are down-weighted.
+//!
 //! Attachment is inferred from positions: detections carry no identities.
 //! The only hard reject is near-certain attachment (attached and tiny, or
 //! attached for [`ActiveBallConfig::attach_reject_ms`]). Everything else is a
@@ -117,6 +121,17 @@ pub struct ActiveBallConfig {
     pub size_z_reject_attached: f32,
     /// Floor of the size weight.
     pub size_min_weight: f32,
+    /// Expected normalised box `h / w` of a round ball (pixel aspect 1:1 on
+    /// a 16:9 camera gives ~1.78). `None` disables the shape check.
+    pub aspect_expected: Option<f32>,
+    /// Allowed `|ln(aspect / expected)|` before the shape penalty starts.
+    pub aspect_tolerance_ln: f32,
+    /// Scale (in ln units) of the Gaussian shape penalty beyond tolerance.
+    pub aspect_scale_ln: f32,
+    /// Floor of the shape weight.
+    pub aspect_min_weight: f32,
+    /// Combined weight at or below which a candidate is dropped outright.
+    pub reject_below_weight: f32,
 }
 
 impl ActiveBallConfig {
@@ -136,6 +151,12 @@ impl ActiveBallConfig {
             size_z_soft: -2.0,
             size_z_reject_attached: -2.5,
             size_min_weight: 0.10,
+            // sample_02 confident balls: median h/w 1.82, p99 2.33.
+            aspect_expected: Some(1.82),
+            aspect_tolerance_ln: (2.4f32 / 1.82).ln(),
+            aspect_scale_ln: 0.12,
+            aspect_min_weight: 0.10,
+            reject_below_weight: 0.02,
         }
     }
 }
@@ -370,6 +391,19 @@ impl ActiveBallSelector {
             let d = z - self.cfg.size_z_soft;
             w *= (-0.5 * d * d).exp().max(self.cfg.size_min_weight);
         }
+        if let Some(expected) = self.cfg.aspect_expected {
+            let (bw, bh) = det.camera_size;
+            if bw > 0.0 && bh > 0.0 && expected > 0.0 {
+                let excess = ((bh / bw) / expected).ln().abs() - self.cfg.aspect_tolerance_ln;
+                if excess > 0.0 {
+                    let d = excess / self.cfg.aspect_scale_ln.max(f32::EPSILON);
+                    w *= (-0.5 * d * d).exp().max(self.cfg.aspect_min_weight);
+                }
+            }
+        }
+        if w <= self.cfg.reject_below_weight {
+            return Verdict::Reject;
+        }
         Verdict::Weight(w.clamp(f32::MIN_POSITIVE, 1.0))
     }
 }
@@ -397,6 +431,7 @@ mod tests {
     fn cfg_no_size() -> ActiveBallConfig {
         ActiveBallConfig {
             size_prior: None,
+            aspect_expected: None,
             ..ActiveBallConfig::sample02(0)
         }
     }
@@ -496,15 +531,38 @@ mod tests {
     }
 
     #[test]
+    fn shape_prior_penalises_thin_boxes_only() {
+        let cfg = ActiveBallConfig {
+            size_prior: None,
+            ..ActiveBallConfig::sample02(0)
+        };
+        let mut s = ActiveBallSelector::new(cfg);
+        let d = [
+            mk(32, 0.2, 0.5, 0.010, 0.0182), // round (h/w 1.82)
+            mk(32, 0.4, 0.5, 0.010, 0.0230), // p99 real ball (2.3)
+            mk(32, 0.6, 0.5, 0.010, 0.0300), // fence-like (3.0)
+            mk(32, 0.8, 0.5, 0.010, 0.0450), // very thin (4.5)
+        ];
+        s.observe(&d, 32, 0.0);
+        assert_eq!(s.verdict(&d, 0), Verdict::Weight(1.0));
+        assert_eq!(s.verdict(&d, 1), Verdict::Weight(1.0));
+        assert!(matches!(s.verdict(&d, 2), Verdict::Weight(w) if w < 0.5));
+        assert!(matches!(s.verdict(&d, 3), Verdict::Weight(w) if w <= 0.1));
+    }
+
+    #[test]
     fn size_prior_penalises_only_small_boxes() {
         let m = SizePrior::SAMPLE02_FIT.left;
         let cy = 0.5;
         let expected = (m.slope * cy + m.intercept).exp();
         let mut s = ActiveBallSelector::new(ActiveBallConfig::sample02(0));
+        // Round ball on a 16:9 camera: normalised h/w ~1.82, same geometric
+        // mean size.
+        let k = 1.82f32.sqrt();
         let d = [
-            mk(32, 0.2, cy, expected, expected),
-            mk(32, 0.4, cy, expected * 0.3, expected * 0.3),
-            mk(32, 0.6, cy, expected * 3.0, expected * 3.0),
+            mk(32, 0.2, cy, expected / k, expected * k),
+            mk(32, 0.4, cy, expected * 0.3 / k, expected * 0.3 * k),
+            mk(32, 0.6, cy, expected * 3.0 / k, expected * 3.0 * k),
         ];
         s.observe(&d, 32, 0.0);
         assert_eq!(s.verdict(&d, 0), Verdict::Weight(1.0));

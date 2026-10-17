@@ -1162,7 +1162,8 @@ mod tests {
     /// Plausible ball at (cx, cy).
     fn ball_at(cx: f32, cy: f32) -> MappedDetection {
         let s = expected_size(cy);
-        cand(BALL, cx, cy, s, s, 0.6)
+        let k = 1.82f32.sqrt();
+        cand(BALL, cx, cy, s / k, s * k, 0.6)
     }
 
     fn person_at(cx: f32, cy: f32) -> MappedDetection {
@@ -1197,7 +1198,7 @@ mod tests {
             let ts = i as f64 * DT;
             let px = 0.30 + 0.0015 * i as f32;
             let (kx, ky) = on_body(px, 0.70, 0.05, 0.65);
-            let knee = cand(BALL, kx, ky, 0.006, 0.006, 0.8);
+            let knee = cand(BALL, kx, ky, 0.0045, 0.0082, 0.8);
             let ball = ball_at(0.55 + 0.001 * i as f32, 0.80);
             let mut dets = vec![person_at(px, 0.70), knee];
             // The real ball only appears after the knee has been tracked.
@@ -1249,7 +1250,11 @@ mod tests {
             let px = 0.30 + 0.002 * i as f32;
             let (bx, by) = on_body(px, 0.70, 0.0, 0.35);
             let s = expected_size(by);
-            let out = t.update(&[person_at(px, 0.70), cand(BALL, bx, by, s, s, 0.6)], ts);
+            let k = 1.82f32.sqrt();
+            let out = t.update(
+                &[person_at(px, 0.70), cand(BALL, bx, by, s / k, s * k, 0.6)],
+                ts,
+            );
             assert_eq!(out[0].state, TrackState::Tracking, "held frame {i}");
         }
         for k in 1..40 {
@@ -1325,11 +1330,11 @@ mod tests {
     fn size_prior_prefers_plausible_candidate() {
         let tiny = |cx: f32, conf: f32| {
             let s = expected_size(0.5) * 0.25;
-            cand(BALL, cx, 0.5, s, s, conf)
+            cand(BALL, cx, 0.5, s / 1.82f32.sqrt(), s * 1.82f32.sqrt(), conf)
         };
         let plausible = |cx: f32, conf: f32| {
             let s = expected_size(0.5);
-            cand(BALL, cx, 0.5, s, s, conf)
+            cand(BALL, cx, 0.5, s / 1.82f32.sqrt(), s * 1.82f32.sqrt(), conf)
         };
 
         let mut t = field_tracker(true);
