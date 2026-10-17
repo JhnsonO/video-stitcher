@@ -21,6 +21,7 @@ pub mod active_ball;
 pub mod ball;
 pub mod class_provider;
 pub mod filters;
+pub mod players;
 pub(crate) mod static_sites;
 
 pub use ball::BallTracker;

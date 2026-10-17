@@ -64,7 +64,7 @@ pub use reco_detect::OrtGpuDetector;
 #[cfg(feature = "tensorrt-native")]
 pub use reco_detect::TrtGpuDetector;
 
-pub use roi_filter::{RoiAnchor, RoiFilteredDetector};
+pub use roi_filter::{RoiAnchor, RoiFilteredDetector, filter_mapped_field_mode};
 pub mod wgpu_detector;
 pub use wgpu_detector::WgpuPreprocessingDetector;
 // `RoiFilteredGpuDetector` and `RoiFilteredMetalDetector` were

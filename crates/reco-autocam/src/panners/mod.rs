@@ -14,8 +14,10 @@
 
 pub mod field;
 pub mod file_panner;
+pub mod hybrid;
 pub mod sweep;
 
 pub use field::{ClusterMode, FieldPanner, FieldPannerConfig, FramingMode, PRESET_NAMES};
 pub use file_panner::FilePanner;
+pub use hybrid::{DirectorState, HybridConfig, HybridDirector};
 pub use sweep::SweepPanner;

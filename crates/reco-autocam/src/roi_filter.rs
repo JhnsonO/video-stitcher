@@ -121,6 +121,76 @@ fn ball_passes_roi(cx: f64, cy: f64, margin: f64, polygon: &[[f64; 2]]) -> bool 
     })
 }
 
+/// Apply the production field-mode ROI policy to detections that were
+/// recorded WITHOUT an ROI (OEV-006 CPU replay).
+///
+/// Mirrors [`RoiFilteredDetector`] as `setup_autocam` builds it for field
+/// mode: `person_class` uses [`RoiAnchor::Bottom`], every other non-ball
+/// class [`RoiAnchor::Center`], and `ball_class` the vertical-allowance
+/// test with `ball_vertical_margin`. Production filters once per camera
+/// call, emitting the kept non-ball detections followed by the kept ball
+/// detections; consecutive same-camera runs in `detections` are treated
+/// as one call so the output order matches the live tracker input. The
+/// test runs on each detection's recorded camera-space box
+/// (`camera_center`, `camera_size`), the exact values the live decorator
+/// saw.
+pub fn filter_mapped_field_mode(
+    detections: &[reco_core::detect::director::MappedDetection],
+    roi: &FieldRoi,
+    person_class: u16,
+    ball_class: u16,
+    ball_vertical_margin: f64,
+) -> Vec<reco_core::detect::director::MappedDetection> {
+    let mut anchors = HashMap::new();
+    anchors.insert(person_class, RoiAnchor::Bottom);
+    let mut out = Vec::with_capacity(detections.len());
+    let mut start = 0;
+    while start < detections.len() {
+        let camera = detections[start].camera;
+        let mut end = start;
+        while end < detections.len() && detections[end].camera == camera {
+            end += 1;
+        }
+        let group = &detections[start..end];
+        let polygon: &[[f64; 2]] = match camera {
+            CameraId::Left => &roi.left,
+            CameraId::Right => &roi.right,
+        };
+        let as_detection = |m: &reco_core::detect::director::MappedDetection| Detection {
+            camera: m.camera,
+            class_id: m.class_id,
+            confidence: m.confidence,
+            center_x: m.camera_center.0,
+            center_y: m.camera_center.1,
+            width: m.camera_size.0,
+            height: m.camera_size.1,
+        };
+        for m in group.iter().filter(|m| m.class_id != ball_class) {
+            let keep = polygon.len() < 3 || {
+                let anchor = anchors.get(&m.class_id).copied().unwrap_or_default();
+                anchor.passes(&as_detection(m), polygon)
+            };
+            if keep {
+                out.push(*m);
+            }
+        }
+        for m in group.iter().filter(|m| m.class_id == ball_class) {
+            let keep = polygon.len() < 3
+                || ball_passes_roi(
+                    m.camera_center.0 as f64,
+                    m.camera_center.1 as f64,
+                    ball_vertical_margin,
+                    polygon,
+                );
+            if keep {
+                out.push(*m);
+            }
+        }
+        start = end;
+    }
+    out
+}
+
 /// An [`UnifiedDetector`] decorator that filters output detections by
 /// field ROI polygon using a per-class anchor policy.
 ///
@@ -254,7 +324,12 @@ impl UnifiedDetector for RoiFilteredDetector {
             .into_iter()
             .partition(|d| self.ball_class_id == Some(d.class_id));
 
-        let mut kept = filter_by_roi(other_dets, &self.roi, &self.class_anchors, self.default_anchor);
+        let mut kept = filter_by_roi(
+            other_dets,
+            &self.roi,
+            &self.class_anchors,
+            self.default_anchor,
+        );
 
         let polygon: &[[f64; 2]] = match camera {
             CameraId::Left => &self.roi.left,
@@ -334,6 +409,99 @@ mod tests {
 
     fn filter(dets: Vec<Detection>, roi: &FieldRoi) -> Vec<Detection> {
         filter_by_roi(dets, roi, &HashMap::new(), RoiAnchor::Center)
+    }
+
+    /// Inner detector returning a fixed per-camera script.
+    struct Scripted {
+        left: Vec<Detection>,
+        right: Vec<Detection>,
+    }
+
+    impl UnifiedDetector for Scripted {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn detect(
+            &mut self,
+            camera: CameraId,
+            _frame: &DetectorFrame<'_>,
+        ) -> Result<Vec<Detection>, DetectorError> {
+            Ok(match camera {
+                CameraId::Left => self.left.clone(),
+                CameraId::Right => self.right.clone(),
+            })
+        }
+    }
+
+    fn mapped(d: &Detection) -> reco_core::detect::director::MappedDetection {
+        reco_core::detect::director::MappedDetection {
+            camera: d.camera,
+            class_id: d.class_id,
+            confidence: d.confidence,
+            camera_center: (d.center_x, d.center_y),
+            camera_size: (d.width, d.height),
+            position: None,
+        }
+    }
+
+    /// `filter_mapped_field_mode` on unfiltered recorded detections must
+    /// equal what the live `RoiFilteredDetector` (field-mode config) would
+    /// have passed to the tracker, in the same order.
+    #[test]
+    fn mapped_field_mode_matches_live_decorator() {
+        let roi = FieldRoi {
+            left: vec![[0.1, 0.45], [0.95, 0.38], [1.0, 1.0], [0.1, 1.0]],
+            right: vec![[0.0, 0.40], [0.8, 0.48], [0.75, 1.0], [0.0, 1.0]],
+        };
+        let mut grid = Vec::new();
+        for (i, cls) in [0u16, 32, 0, 5, 32, 0, 32].iter().enumerate() {
+            for k in 0..9 {
+                let cx = 0.05 + 0.11 * k as f32;
+                let cy = 0.1 + 0.12 * i as f32;
+                grid.push((*cls, cx, cy, 0.02 + 0.01 * k as f32, 0.05 + 0.02 * i as f32));
+            }
+        }
+        let side = |cam: CameraId| -> Vec<Detection> {
+            grid.iter()
+                .map(|&(c, x, y, w, h)| make_detection_class(cam, c, x, y, w, h))
+                .collect()
+        };
+        let (left, right) = (side(CameraId::Left), side(CameraId::Right));
+        let mut live = RoiFilteredDetector::new(
+            Box::new(Scripted {
+                left: left.clone(),
+                right: right.clone(),
+            }),
+            roi.clone(),
+        )
+        .with_class_anchor(0, RoiAnchor::Bottom)
+        .with_ball_roi_diagnostics(32, 0.40, 60.0, 1);
+        let frame = DetectorFrame::PreprocessedChw {
+            data: &[],
+            input_size: 0,
+            src_width: 0,
+            src_height: 0,
+        };
+        let mut want: Vec<_> = live
+            .detect(CameraId::Left, &frame)
+            .unwrap()
+            .iter()
+            .map(mapped)
+            .collect();
+        want.extend(
+            live.detect(CameraId::Right, &frame)
+                .unwrap()
+                .iter()
+                .map(mapped),
+        );
+        let recorded: Vec<_> = left.iter().chain(&right).map(mapped).collect();
+        let got = filter_mapped_field_mode(&recorded, &roi, 0, 32, 0.40);
+        assert!(
+            want.len() > 10 && want.len() < recorded.len(),
+            "test must keep some and drop some"
+        );
+        assert_eq!(format!("{got:?}"), format!("{want:?}"));
     }
 
     #[test]
