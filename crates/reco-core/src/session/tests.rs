@@ -745,3 +745,219 @@ fn live_source_without_rational_fps_keeps_wall_clock() {
         );
     }
 }
+
+// ─── Offline director replay parity (OEV-006) ──────────────────────────
+//
+// `offline_director::replay_dense_lookahead` must reproduce the live
+// stride-1 lookahead loop exactly: same bridged worlds, same lookahead
+// windows, same `previous_position` interleaving, same smoothed poses.
+
+/// Deterministic scripted ball: Tracking runs separated by None and
+/// Coasting gaps so the backward bridge is exercised, with one fast jump
+/// that the bridge speed gate must reject.
+fn scripted_ball(i: u64) -> Option<TrackedEntity> {
+    let state = match i % 11 {
+        3 | 4 => return None,
+        7 => TrackState::Coasting,
+        _ => TrackState::Tracking,
+    };
+    let jump = if i >= 30 { 1.2 } else { 0.0 };
+    Some(TrackedEntity {
+        id: 1,
+        class_id: 32,
+        yaw: -0.4 + 0.013 * i as f32 + jump,
+        pitch: 0.02 + 0.001 * (i % 5) as f32,
+        confidence: 0.8,
+        state,
+        age_frames: i,
+        origin: CameraId::Left,
+    })
+}
+
+/// Ball tracker that replays [`scripted_ball`] by call order.
+struct ScriptedBallTracker {
+    calls: u64,
+}
+
+impl Tracker for ScriptedBallTracker {
+    fn update(
+        &mut self,
+        _detections: &[MappedDetection],
+        _timestamp_ms: f64,
+    ) -> Vec<TrackedEntity> {
+        let out = scripted_ball(self.calls).into_iter().collect();
+        self.calls += 1;
+        out
+    }
+
+    fn class_id(&self) -> u16 {
+        32
+    }
+}
+
+/// Panner whose output depends on the current world, the whole lookahead
+/// window and `previous_position`, so any divergence in any of the three
+/// shows up in the pose.
+struct ProbePanner;
+
+impl Panner for ProbePanner {
+    fn decide(&mut self, world: &WorldState, ctx: &PanContext<'_>) -> ViewportPosition {
+        self.decide_with_lookahead(world, &[], ctx)
+    }
+
+    fn decide_with_lookahead(
+        &mut self,
+        world: &WorldState,
+        future: &[WorldState],
+        ctx: &PanContext<'_>,
+    ) -> ViewportPosition {
+        let now = world.ball.map_or(0.0, |b| b.yaw);
+        let mut fsum = 0.0f32;
+        let mut fcount = 0u32;
+        for (k, ws) in future.iter().enumerate() {
+            if let Some(b) = ws.ball {
+                fsum += b.yaw * (k as f32 + 1.0);
+                fcount += 1;
+            }
+        }
+        let state_code = match world.ball.map(|b| b.state) {
+            None => 0.0,
+            Some(TrackState::Tracking) => 0.001,
+            Some(TrackState::Coasting) => 0.002,
+            Some(TrackState::Bridged) => 0.003,
+            Some(TrackState::Lost) => 0.004,
+        };
+        ViewportPosition {
+            yaw: now + 0.01 * fsum + 0.1 * ctx.previous_position.yaw + state_code,
+            pitch: world.ball.map_or(0.0, |b| b.pitch) + 0.0001 * fcount as f32,
+            fov_degrees: Some(40.0 + future.len() as f32 * 0.25 + ctx.previous_position.pitch),
+        }
+    }
+}
+
+/// (bridged ball as recorded, rendered pose) per rendered frame.
+type DirectorLog = Arc<Mutex<Vec<(Option<TrackedEntity>, ViewportPosition)>>>;
+
+/// Event sink keeping the WorldState + PanDecision stream in order.
+struct DirectorSink {
+    log: DirectorLog,
+    pending: Option<Option<TrackedEntity>>,
+}
+
+impl crate::detect::pipeline_event::PipelineEventSink for DirectorSink {
+    fn emit(&mut self, event: crate::detect::pipeline_event::PipelineEvent) {
+        use crate::detect::pipeline_event::PipelineEvent as E;
+        match event {
+            E::WorldState { ball, .. } => self.pending = Some(ball),
+            E::PanDecision { pose, .. } => {
+                let ball = self
+                    .pending
+                    .take()
+                    .expect("world_state before pan_decision");
+                self.log.lock().unwrap().push((ball, pose));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn assert_offline_matches_live(frames: u64, lookahead: usize) {
+    let fps_rational = (60000, 1001);
+    let fps = 60000.0 / 1001.0;
+    let detector = SlowDetector {
+        delay: std::time::Duration::from_millis(0),
+    };
+    let mut session = build_test_session(None, Some(Box::new(detector)), 1).expect("session build");
+    session.set_ball_tracker(Box::new(ScriptedBallTracker { calls: 0 }));
+    session.set_panner(Box::new(ProbePanner));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    session.set_event_sink(Box::new(DirectorSink {
+        log: Arc::clone(&log),
+        pending: None,
+    }));
+    session.set_lookahead(lookahead);
+    let mut source = TimedSource {
+        remaining: frames,
+        fps,
+        fps_rational: Some(fps_rational),
+    };
+    let interrupted = AtomicBool::new(false);
+    session
+        .run(&mut source, u64::MAX, &interrupted, None)
+        .expect("run");
+    session.finish().expect("finish");
+    let live = log.lock().unwrap().clone();
+
+    let offline_frames: Vec<super::OfflineFrame> = (0..frames)
+        .map(|i| super::OfflineFrame {
+            source_frame_index: i,
+            elapsed_ms: super::run_loop::media_elapsed(i, (60000, 1001)).as_secs_f64() * 1000.0,
+            world: WorldState {
+                ball: scripted_ball(i),
+                players: vec![],
+            },
+        })
+        .collect();
+    let cal = test_calibration();
+    let offline = super::replay_dense_lookahead(
+        &offline_frames,
+        &mut ProbePanner,
+        lookahead,
+        fps,
+        &cal,
+        ViewportPosition::default(),
+    );
+
+    assert_eq!(live.len(), frames as usize, "live rendered frame count");
+    assert_eq!(offline.len(), live.len(), "offline frame count");
+    for (k, ((live_ball, live_pose), off)) in live.iter().zip(&offline).enumerate() {
+        assert_eq!(off.source_frame_index, k as u64, "render order");
+        assert_eq!(
+            format!("{live_ball:?}"),
+            format!("{:?}", off.world.ball),
+            "bridged ball differs at frame {k}"
+        );
+        assert_eq!(
+            (
+                live_pose.yaw.to_bits(),
+                live_pose.pitch.to_bits(),
+                live_pose.fov_degrees.map(f32::to_bits)
+            ),
+            (
+                off.smoothed.yaw.to_bits(),
+                off.smoothed.pitch.to_bits(),
+                off.smoothed.fov_degrees.map(f32::to_bits)
+            ),
+            "smoothed pose differs at frame {k}: live {live_pose:?} offline {:?}",
+            off.smoothed
+        );
+    }
+    // The script must actually exercise bridging, or the test proves less.
+    assert!(
+        frames < 12
+            || offline
+                .iter()
+                .any(|p| p.world.ball.is_some_and(|b| b.state == TrackState::Bridged)),
+        "script produced no bridged frames"
+    );
+}
+
+#[test]
+#[ignore] // requires GPU (runs on lavapipe)
+fn offline_director_matches_live_lookahead_6() {
+    assert_offline_matches_live(48, 6);
+}
+
+#[test]
+#[ignore] // requires GPU (runs on lavapipe)
+fn offline_director_matches_live_lookahead_90() {
+    // Harness setting: --lookahead 1.5 at 59.94 fps -> 90 frames.
+    assert_offline_matches_live(240, 90);
+}
+
+#[test]
+#[ignore] // requires GPU (runs on lavapipe)
+fn offline_director_matches_live_lookahead_1_and_short_clip() {
+    assert_offline_matches_live(30, 1);
+    assert_offline_matches_live(4, 6);
+}

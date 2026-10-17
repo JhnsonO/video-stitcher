@@ -106,13 +106,34 @@ fn bridge_ball(
     anchor: &mut Option<(u64, f32, f32)>,
     fps: f64,
 ) {
+    bridge_ball_world(
+        frame.source_frame_index,
+        &mut frame.world_state,
+        lookahead,
+        stride_frames,
+        anchor,
+        fps,
+    );
+}
+
+/// [`bridge_ball`] on a bare `WorldState` + its source frame index, so the
+/// offline director replay (`super::offline_director`) runs the exact same
+/// bridging code as the live lookahead loop.
+pub(super) fn bridge_ball_world(
+    source_frame_index: u64,
+    world_state: &mut crate::detect::tracker::WorldState,
+    lookahead: &[crate::detect::tracker::WorldState],
+    stride_frames: u64,
+    anchor: &mut Option<(u64, f32, f32)>,
+    fps: f64,
+) {
     use crate::detect::tracker::{TrackState, TrackedEntity};
 
     // Bridge candidates: no detection this frame (`None`), or the coast
     // budget already froze the position (`Coasting`). Never re-bridge an
     // already-`Bridged` value and never touch `Tracking` (a genuine
     // detection this frame needs no help).
-    let needs_bridge = match frame.world_state.ball {
+    let needs_bridge = match world_state.ball {
         None => true,
         Some(b) => b.state == TrackState::Coasting,
     };
@@ -125,8 +146,7 @@ fn bridge_ball(
                     .map(|b| (k, b))
             });
             if let Some((k, future)) = found {
-                let future_frame_index =
-                    frame.source_frame_index + (k as u64 + 1) * stride_frames.max(1);
+                let future_frame_index = source_frame_index + (k as u64 + 1) * stride_frames.max(1);
                 let gap_frames = future_frame_index.saturating_sub(anchor_index);
                 if gap_frames > 0 && fps > 0.0 {
                     let gap_seconds = gap_frames as f64 / fps;
@@ -136,11 +156,11 @@ fn bridge_ball(
                     let implied_speed_deg_per_s = angular_distance_deg / gap_seconds;
 
                     if implied_speed_deg_per_s <= MAX_BRIDGE_SPEED_DEG_PER_S as f64 {
-                        let elapsed_frames = frame.source_frame_index.saturating_sub(anchor_index);
+                        let elapsed_frames = source_frame_index.saturating_sub(anchor_index);
                         let frac = elapsed_frames as f32 / gap_frames as f32;
                         let bridged_yaw = anchor_yaw + (future.yaw - anchor_yaw) * frac;
                         let bridged_pitch = anchor_pitch + (future.pitch - anchor_pitch) * frac;
-                        frame.world_state.ball = Some(TrackedEntity {
+                        world_state.ball = Some(TrackedEntity {
                             id: future.id,
                             class_id: future.class_id,
                             yaw: bridged_yaw,
@@ -165,9 +185,9 @@ fn bridge_ball(
     // post-bridge, whichever the frame ends up with -- but only from
     // `Tracking`, never from `Coasting` or `Bridged`, so bridges never
     // chain off each other.
-    if let Some(b) = frame.world_state.ball {
+    if let Some(b) = world_state.ball {
         if b.state == TrackState::Tracking {
-            *anchor = Some((frame.source_frame_index, b.yaw, b.pitch));
+            *anchor = Some((source_frame_index, b.yaw, b.pitch));
         }
     }
 }
@@ -185,7 +205,7 @@ fn bridge_ball(
 /// clip shorter than the lookahead window the entire output is in this
 /// boundary regime. This is acceptable (no future data exists past EOF);
 /// it is documented so the boundary behavior is not mistaken for a bug.
-fn centered_smooth(
+pub(super) fn centered_smooth(
     raw_pose: crate::detect::director::ViewportPosition,
     ahead: impl Iterator<Item = crate::detect::director::ViewportPosition>,
     past: impl Iterator<Item = crate::detect::director::ViewportPosition>,

@@ -27,8 +27,11 @@ mod detection_dispatch;
 pub(crate) mod frame_buffer;
 /// Per-frame render and encode methods (step, process_frame, submit_render_output).
 mod frame_processing;
+/// CPU-only replay of the dense lookahead director loop (OEV-006).
+pub mod offline_director;
 /// Batch processing entry points (run, run_immediate, setup_gpu_source).
 mod run_loop;
+pub use offline_director::{OfflineFrame, OfflinePose, replay_dense_lookahead};
 /// VRAM texture pool for GPU-resident frame buffering.
 pub(crate) mod vram_pool;
 /// Lookahead VRAM fit estimate, for the export UI risk slider and the
