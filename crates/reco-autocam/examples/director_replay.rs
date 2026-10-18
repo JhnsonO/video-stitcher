@@ -193,7 +193,16 @@ fn parse_args() -> Result<Args, String> {
     if a.worlds != "recorded" && a.worlds != "tracker" {
         return Err("--worlds must be recorded or tracker".into());
     }
-    if !["none", "plausible", "hindsight", "both", "identity"].contains(&a.ball_filter.as_str()) {
+    if ![
+        "none",
+        "plausible",
+        "hindsight",
+        "both",
+        "identity",
+        "hindsight-id",
+    ]
+    .contains(&a.ball_filter.as_str())
+    {
         return Err("--ball-filter must be none, plausible, hindsight, both or identity".into());
     }
     if !["stateless", "tracked", "owned"].contains(&a.players.as_str()) {
@@ -450,7 +459,7 @@ fn main() {
     // strictly inside our outline or only in the above-the-line margin.
     let mut ball_obs: Vec<Vec<(f32, f32, bool)>> = Vec::new();
     for (i, r) in recorded.iter().enumerate() {
-        if args.ball_filter == "identity" {
+        if args.ball_filter == "identity" || args.ball_filter == "hindsight-id" {
             let id_roi = ownership_roi
                 .as_ref()
                 .or(roi.as_ref())
@@ -576,7 +585,17 @@ fn main() {
     let (hindsight_frames, plausible_rejected) = match args.ball_filter.as_str() {
         "plausible" => (0, plausible_filter(&mut frames, fps as f32)),
         "hindsight" => (hindsight_filter(&mut frames, fps as f32), 0),
-        "identity" => (identity_filter(&mut frames, &ball_obs, fps as f32), 0),
+        "identity" => (
+            identity_filter(&mut frames, &ball_obs, fps as f32, false),
+            0,
+        ),
+        "hindsight-id" => {
+            let h = hindsight_filter(&mut frames, fps as f32);
+            (
+                h + identity_filter(&mut frames, &ball_obs, fps as f32, true),
+                0,
+            )
+        }
         "both" => {
             let h = hindsight_filter(&mut frames, fps as f32);
             (h, plausible_filter(&mut frames, fps as f32))
@@ -830,16 +849,23 @@ const IDENTITY_OURS_INSIDE_SHARE: f32 = 0.5;
 /// that arrives from beyond the line stays foreign), then follow only our
 /// ball, bridging gaps between its sightings. Returns frames whose ball is
 /// our ball (seen or bridged).
-fn identity_filter(frames: &mut [OfflineFrame], obs: &[Vec<(f32, f32, bool)>], fps: f32) -> usize {
+fn identity_filter(
+    frames: &mut [OfflineFrame],
+    obs: &[Vec<(f32, f32, bool)>],
+    fps: f32,
+    conditional: bool,
+) -> usize {
     struct Tl {
         pts: Vec<(usize, (f32, f32), bool)>,
     }
     let link = (IDENTITY_LINK_GAP_S * fps) as usize;
     let mut tls: Vec<Tl> = Vec::new();
     let mut open: Vec<usize> = Vec::new();
+    let mut tl_of: Vec<Vec<usize>> = Vec::with_capacity(obs.len());
     for (i, cands) in obs.iter().enumerate() {
         open.retain(|&t| i - tls[t].pts.last().unwrap().0 <= link);
         let mut used = vec![false; open.len()];
+        let mut row = Vec::with_capacity(cands.len());
         for &(y, p, inside) in cands {
             let pos = (y, p);
             let best = open
@@ -856,6 +882,7 @@ fn identity_filter(frames: &mut [OfflineFrame], obs: &[Vec<(f32, f32, bool)>], f
                 Some((k, t, _)) => {
                     used[k] = true;
                     tls[t].pts.push((i, pos, inside));
+                    row.push(t);
                 }
                 None => {
                     tls.push(Tl {
@@ -863,9 +890,11 @@ fn identity_filter(frames: &mut [OfflineFrame], obs: &[Vec<(f32, f32, bool)>], f
                     });
                     open.push(tls.len() - 1);
                     used.push(true);
+                    row.push(tls.len() - 1);
                 }
             }
         }
+        tl_of.push(row);
     }
     // Our ball's sightings: points of "ours" tracklets; when two overlap,
     // keep the one continuing from our previous sighting.
@@ -892,6 +921,20 @@ fn identity_filter(frames: &mut [OfflineFrame], obs: &[Vec<(f32, f32, bool)>], f
             ours.push((i, p));
         }
     }
+    let max_gap = (IDENTITY_MAX_GAP_S * fps) as usize;
+    let mut ours_pos: Vec<Option<(f32, f32)>> = vec![None; frames.len()];
+    for w in 0..ours.len() {
+        let (i, p) = ours[w];
+        ours_pos[i] = Some(p);
+        if let Some(&(j, q)) = ours.get(w + 1) {
+            if j - i > 1 && j - i <= max_gap {
+                for (f, slot) in ours_pos.iter_mut().enumerate().take(j).skip(i + 1) {
+                    let a = (f - i) as f32 / (j - i) as f32;
+                    *slot = Some((p.0 + (q.0 - p.0) * a, p.1 + (q.1 - p.1) * a));
+                }
+            }
+        }
+    }
     let template = frames
         .iter()
         .find_map(|f| f.world.ball)
@@ -905,32 +948,44 @@ fn identity_filter(frames: &mut [OfflineFrame], obs: &[Vec<(f32, f32, bool)>], f
             age_frames: 0,
             origin: reco_core::detect::detector::CameraId::Left,
         });
-    let max_gap = (IDENTITY_MAX_GAP_S * fps) as usize;
-    for f in frames.iter_mut() {
-        f.world.ball = None;
-    }
-    let mut covered = 0;
-    for w in 0..ours.len() {
-        let (i, p) = ours[w];
-        let mut b = template;
-        b.state = TrackState::Tracking;
-        b.yaw = p.0;
-        b.pitch = p.1;
-        frames[i].world.ball = Some(b);
-        covered += 1;
-        if let Some(&(j, q)) = ours.get(w + 1) {
-            if j - i > 1 && j - i <= max_gap {
-                for f in i + 1..j {
-                    let a = (f - i) as f32 / (j - i) as f32;
-                    let mut b = template;
-                    b.state = TrackState::Tracking;
-                    b.yaw = p.0 + (q.0 - p.0) * a;
-                    b.pitch = p.1 + (q.1 - p.1) * a;
-                    frames[f].world.ball = Some(b);
-                    covered += 1;
-                }
-            }
+    let as_ball = |p: Option<(f32, f32)>| {
+        p.map(|(y, pi)| {
+            let mut b = template;
+            b.state = TrackState::Tracking;
+            b.yaw = y;
+            b.pitch = pi;
+            b
+        })
+    };
+    let mut changed = 0;
+    for (f, frame) in frames.iter_mut().enumerate() {
+        if !conditional {
+            frame.world.ball = as_ball(ours_pos[f]);
+            changed += ours_pos[f].is_some() as usize;
+            continue;
         }
+        // Conditional: only question a ball that sits somewhere odd (above
+        // our outline). If the candidate it matches came from beyond the
+        // line, it is foreign: follow our ball instead.
+        let Some(b) = frame.world.ball else { continue };
+        let pos = (b.yaw, b.pitch);
+        let hit = obs[f]
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| ang((o.0, o.1), pos) <= 0.03)
+            .min_by(|a, b2| ang((a.1.0, a.1.1), pos).total_cmp(&ang((b2.1.0, b2.1.1), pos)));
+        let Some((j, &(_, _, inside))) = hit else {
+            continue;
+        };
+        if inside {
+            continue;
+        }
+        let tl = &tls[tl_of[f][j]];
+        if tl.pts[0].2 {
+            continue; // came from inside our pitch: our ball in the air
+        }
+        frame.world.ball = as_ball(ours_pos[f]);
+        changed += 1;
     }
-    covered
+    changed
 }
