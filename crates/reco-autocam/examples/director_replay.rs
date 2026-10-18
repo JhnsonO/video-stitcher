@@ -200,6 +200,7 @@ fn parse_args() -> Result<Args, String> {
         "both",
         "identity",
         "hindsight-id",
+        "hindsight-id-hold",
     ]
     .contains(&a.ball_filter.as_str())
     {
@@ -459,7 +460,7 @@ fn main() {
     // strictly inside our outline or only in the above-the-line margin.
     let mut ball_obs: Vec<Vec<(f32, f32, bool)>> = Vec::new();
     for (i, r) in recorded.iter().enumerate() {
-        if args.ball_filter == "identity" || args.ball_filter == "hindsight-id" {
+        if args.ball_filter == "identity" || args.ball_filter.starts_with("hindsight-id") {
             let id_roi = ownership_roi
                 .as_ref()
                 .or(roi.as_ref())
@@ -586,13 +587,20 @@ fn main() {
         "plausible" => (0, plausible_filter(&mut frames, fps as f32)),
         "hindsight" => (hindsight_filter(&mut frames, fps as f32), 0),
         "identity" => (
-            identity_filter(&mut frames, &ball_obs, fps as f32, false),
+            identity_filter(&mut frames, &ball_obs, fps as f32, false, false),
             0,
         ),
         "hindsight-id" => {
             let h = hindsight_filter(&mut frames, fps as f32);
             (
-                h + identity_filter(&mut frames, &ball_obs, fps as f32, true),
+                h + identity_filter(&mut frames, &ball_obs, fps as f32, true, false),
+                0,
+            )
+        }
+        "hindsight-id-hold" => {
+            let h = hindsight_filter(&mut frames, fps as f32);
+            (
+                h + identity_filter(&mut frames, &ball_obs, fps as f32, true, true),
                 0,
             )
         }
@@ -839,6 +847,10 @@ fn hindsight_filter(frames: &mut [OfflineFrame], fps: f32) -> usize {
 
 /// Longest gap between two sightings of our ball that is bridged.
 const IDENTITY_MAX_GAP_S: f32 = 4.0;
+/// With hold: gaps up to this long are bridged smoothly...
+const IDENTITY_BRIDGE_GAP_S: f32 = 1.0;
+/// ...and longer gaps, up to this, hold the last-seen position.
+const IDENTITY_HOLD_MAX_S: f32 = 30.0;
 /// Longest gap inside one ball tracklet.
 const IDENTITY_LINK_GAP_S: f32 = 0.5;
 /// Share of a tracklet's sightings strictly inside our outline for it to be ours.
@@ -854,6 +866,7 @@ fn identity_filter(
     obs: &[Vec<(f32, f32, bool)>],
     fps: f32,
     conditional: bool,
+    hold: bool,
 ) -> usize {
     struct Tl {
         pts: Vec<(usize, (f32, f32), bool)>,
@@ -921,13 +934,35 @@ fn identity_filter(
             ours.push((i, p));
         }
     }
-    let max_gap = (IDENTITY_MAX_GAP_S * fps) as usize;
+    let hold_long_gaps = hold;
+    let bridge_gap = if hold {
+        (IDENTITY_BRIDGE_GAP_S * fps) as usize
+    } else {
+        0
+    };
+    let max_gap = if hold {
+        (IDENTITY_HOLD_MAX_S * fps) as usize
+    } else {
+        (IDENTITY_MAX_GAP_S * fps) as usize
+    };
     let mut ours_pos: Vec<Option<(f32, f32)>> = vec![None; frames.len()];
     for w in 0..ours.len() {
         let (i, p) = ours[w];
         ours_pos[i] = Some(p);
         if let Some(&(j, q)) = ours.get(w + 1) {
-            if j - i > 1 && j - i <= max_gap {
+            // Short gap (ball behind legs): bridge smoothly. Longer gap (e.g.
+            // ball in the net after a goal): hold where it was last seen
+            // until it reappears; never guess a path across the pitch.
+            if j - i > 1 && j - i <= bridge_gap {
+                for (f, slot) in ours_pos.iter_mut().enumerate().take(j).skip(i + 1) {
+                    let a = (f - i) as f32 / (j - i) as f32;
+                    *slot = Some((p.0 + (q.0 - p.0) * a, p.1 + (q.1 - p.1) * a));
+                }
+            } else if hold_long_gaps && j - i > 1 && j - i <= max_gap {
+                for slot in ours_pos.iter_mut().take(j).skip(i + 1) {
+                    *slot = Some(p);
+                }
+            } else if !hold_long_gaps && j - i > 1 && j - i <= max_gap {
                 for (f, slot) in ours_pos.iter_mut().enumerate().take(j).skip(i + 1) {
                     let a = (f - i) as f32 / (j - i) as f32;
                     *slot = Some((p.0 + (q.0 - p.0) * a, p.1 + (q.1 - p.1) * a));
