@@ -57,6 +57,16 @@ const FIELD_MAX_JUMP_RAD: f32 = 0.8;
 /// A1/C ball gate (frozen for the OEV-006 first pass).
 const BALL_GATE_PLAYER_RAD: f32 = 0.35;
 const BALL_GATE_TRACK_RAD: f32 = 0.30;
+/// OEV-006 ball filters: fastest plausible ball motion across the panorama.
+const PLAUSIBLE_V_MAX_RAD_S: f32 = 2.0;
+/// Slack added to every reachability test (detection noise).
+const PLAUSIBLE_BASE_RAD: f32 = 0.05;
+/// Frames an unreachable ball must persist before it is believed.
+const PLAUSIBLE_CONFIRM_FRAMES: u32 = 30;
+/// An unreachable ball is only believed when this close to one of our players.
+const PLAUSIBLE_CONFIRM_PLAYER_RAD: f32 = 0.14;
+/// Longest stray episode the hindsight filter rewrites, seconds.
+const HINDSIGHT_MAX_EPISODE_S: f32 = 3.0;
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -105,6 +115,8 @@ struct Args {
     ownership_roi: Option<String>,
     ball_gate: bool,
     director: String,
+    ball_filter: String,
+    players_dump: Option<String>,
     fps_num: u64,
     fps_den: u64,
     label: String,
@@ -127,6 +139,8 @@ fn parse_args() -> Result<Args, String> {
         ownership_roi: None,
         ball_gate: false,
         director: "field".into(),
+        ball_filter: "none".into(),
+        players_dump: None,
         fps_num: 60000,
         fps_den: 1001,
         label: String::new(),
@@ -165,6 +179,8 @@ fn parse_args() -> Result<Args, String> {
             "--ownership-roi" => a.ownership_roi = Some(value()?),
             "--ball-gate" => a.ball_gate = true,
             "--director" => a.director = value()?,
+            "--ball-filter" => a.ball_filter = value()?,
+            "--players-dump" => a.players_dump = Some(value()?),
             "--fps-num" => a.fps_num = value()?.parse().map_err(|e| format!("--fps-num: {e}"))?,
             "--fps-den" => a.fps_den = value()?.parse().map_err(|e| format!("--fps-den: {e}"))?,
             "--label" => a.label = value()?,
@@ -176,6 +192,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if a.worlds != "recorded" && a.worlds != "tracker" {
         return Err("--worlds must be recorded or tracker".into());
+    }
+    if !["none", "plausible", "hindsight", "both", "identity"].contains(&a.ball_filter.as_str()) {
+        return Err("--ball-filter must be none, plausible, hindsight, both or identity".into());
     }
     if !["stateless", "tracked", "owned"].contains(&a.players.as_str()) {
         return Err("--players must be stateless, tracked or owned".into());
@@ -412,6 +431,11 @@ fn main() {
     });
     let mut last_ball: Option<(f32, f32)> = None;
     let mut gated_out = 0usize;
+    let mut players_dump = args.players_dump.as_ref().map(|p| {
+        let mut w = BufWriter::new(File::create(p).expect("create players dump"));
+        writeln!(w, "frame,id,yaw,pitch,owned").expect("write players dump");
+        w
+    });
     if roi.is_some() && args.worlds == "recorded" {
         eprintln!(
             "director_replay: --roi needs --worlds tracker (recorded worlds are already filtered)"
@@ -422,7 +446,39 @@ fn main() {
     let mut player_mismatch = 0usize;
 
     let mut frames = Vec::with_capacity(recorded.len());
+    // Ball identity (OEV-006): every ball candidate near our pitch, flagged
+    // strictly inside our outline or only in the above-the-line margin.
+    let mut ball_obs: Vec<Vec<(f32, f32, bool)>> = Vec::new();
     for (i, r) in recorded.iter().enumerate() {
+        if args.ball_filter == "identity" {
+            let id_roi = ownership_roi
+                .as_ref()
+                .or(roi.as_ref())
+                .expect("identity needs --ownership-roi or --roi");
+            let raw = r.detections.as_deref().unwrap_or(&[]);
+            let near = filter_mapped_field_mode(raw, id_roi, PERSON_CLASS_ID, BALL_CLASS_ID, 0.40);
+            let strict = filter_mapped_field_mode(raw, id_roi, PERSON_CLASS_ID, BALL_CLASS_ID, 0.0);
+            let key =
+                |d: &MappedDetection| d.position.map(|p| (p.yaw.to_bits(), p.pitch.to_bits()));
+            let strict_keys: Vec<_> = strict
+                .iter()
+                .filter(|d| d.class_id == BALL_CLASS_ID)
+                .filter_map(key)
+                .collect();
+            ball_obs.push(
+                near.iter()
+                    .filter(|d| d.class_id == BALL_CLASS_ID)
+                    .filter_map(|d| {
+                        let p = d.position?;
+                        Some((
+                            p.yaw,
+                            p.pitch,
+                            key(d).is_some_and(|k| strict_keys.contains(&k)),
+                        ))
+                    })
+                    .collect(),
+            );
+        }
         let t = media_ms(i as u64);
         let (ball, players) = if args.worlds == "recorded" {
             (r.ball, r.players.clone().expect("validated"))
@@ -453,6 +509,16 @@ fn main() {
                 player_mismatch += 1;
             }
             let tracks = player_tracker.as_mut().map(|pt| pt.update(&dets));
+            if let (Some(w), Some(ts)) = (players_dump.as_mut(), &tracks) {
+                for p in ts {
+                    writeln!(
+                        w,
+                        "{i},{},{},{},{}",
+                        p.entity.id, p.entity.yaw, p.entity.pitch, p.owned as u8
+                    )
+                    .expect("write players dump");
+                }
+            }
             let players: Vec<TrackedEntity> = match (args.players.as_str(), &tracks) {
                 ("tracked", Some(ts)) => ts.iter().map(|p| p.entity).collect(),
                 ("owned", Some(ts)) => ts.iter().filter(|p| p.owned).map(|p| p.entity).collect(),
@@ -506,6 +572,17 @@ fn main() {
             world: WorldState { ball, players },
         });
     }
+
+    let (hindsight_frames, plausible_rejected) = match args.ball_filter.as_str() {
+        "plausible" => (0, plausible_filter(&mut frames, fps as f32)),
+        "hindsight" => (hindsight_filter(&mut frames, fps as f32), 0),
+        "identity" => (identity_filter(&mut frames, &ball_obs, fps as f32), 0),
+        "both" => {
+            let h = hindsight_filter(&mut frames, fps as f32);
+            (h, plausible_filter(&mut frames, fps as f32))
+        }
+        _ => (0, 0),
+    };
 
     let lookahead = (args.lookahead_secs * fps).round() as usize;
     let field = FieldPanner::with_config(fps as f32, cfg.clone());
@@ -607,6 +684,9 @@ fn main() {
         "ownership_roi_file": args.ownership_roi,
         "ball_gate": args.ball_gate,
         "ball_candidates_gated_out": gated_out,
+        "ball_filter": args.ball_filter,
+        "ball_filter_hindsight_frames_rewritten": hindsight_frames,
+        "ball_filter_plausible_frames_rejected": plausible_rejected,
         "vs_recorded_pan_decision": {
             "frames_compared": compared,
             "max_abs_yaw_rad": max_dyaw,
@@ -623,4 +703,234 @@ fn main() {
         "{}",
         serde_json::to_string_pretty(&report).expect("report serializes")
     );
+}
+
+fn ang(a: (f32, f32), b: (f32, f32)) -> f32 {
+    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+}
+
+fn reachable(from: (f32, f32), to: (f32, f32), dt_s: f32) -> bool {
+    ang(from, to) <= PLAUSIBLE_BASE_RAD + PLAUSIBLE_V_MAX_RAD_S * dt_s
+}
+
+/// Causal filter: a ball the last trusted ball could not have reached is
+/// dropped unless it persists for `PLAUSIBLE_CONFIRM_FRAMES` frames and sits
+/// near one of our players. Returns the number of frames whose ball was dropped.
+fn plausible_filter(frames: &mut [OfflineFrame], fps: f32) -> usize {
+    let mut trusted: Option<((f32, f32), usize)> = None;
+    let mut pending: Option<((f32, f32), usize, u32)> = None;
+    let mut rejecting = false;
+    let mut dropped = 0;
+    for i in 0..frames.len() {
+        let Some(b) = frames[i].world.ball else {
+            continue;
+        };
+        if b.state != TrackState::Tracking {
+            if rejecting {
+                frames[i].world.ball = None;
+                dropped += 1;
+            }
+            continue;
+        }
+        let pos = (b.yaw, b.pitch);
+        let accept = match trusted {
+            None => true,
+            Some((t, ti)) if reachable(t, pos, (i - ti) as f32 / fps) => true,
+            Some(_) => {
+                let count = match pending {
+                    Some((p, pi, c)) if reachable(p, pos, (i - pi) as f32 / fps) => c + 1,
+                    _ => 1,
+                };
+                pending = Some((pos, i, count));
+                let near_player = frames[i]
+                    .world
+                    .players
+                    .iter()
+                    .any(|p| ang((p.yaw, p.pitch), pos) <= PLAUSIBLE_CONFIRM_PLAYER_RAD);
+                count >= PLAUSIBLE_CONFIRM_FRAMES && near_player
+            }
+        };
+        if accept {
+            trusted = Some((pos, i));
+            pending = None;
+            rejecting = false;
+        } else {
+            frames[i].world.ball = None;
+            dropped += 1;
+            rejecting = true;
+        }
+    }
+    dropped
+}
+
+/// Hindsight filter (offline only): a stretch that starts with an
+/// unreachable jump and ends when the ball reappears somewhere the
+/// pre-jump ball could have reached is treated as a stray ball and
+/// replaced by a straight line between the two trusted positions.
+/// Returns the number of frames rewritten.
+fn hindsight_filter(frames: &mut [OfflineFrame], fps: f32) -> usize {
+    let obs: Vec<(usize, (f32, f32))> = frames
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            f.world
+                .ball
+                .filter(|b| b.state == TrackState::Tracking)
+                .map(|b| (i, (b.yaw, b.pitch)))
+        })
+        .collect();
+    let max_ep = (HINDSIGHT_MAX_EPISODE_S * fps) as usize;
+    let mut rewritten = 0;
+    let mut j = 1;
+    while j < obs.len() {
+        let (pi, pp) = obs[j - 1];
+        let (ji, jp) = obs[j];
+        if reachable(pp, jp, (ji - pi) as f32 / fps) {
+            j += 1;
+            continue;
+        }
+        // Find the first later observation the pre-jump ball could reach.
+        let mut end = None;
+        let mut k = j + 1;
+        while k < obs.len() && obs[k].0 - ji <= max_ep {
+            if reachable(pp, obs[k].1, (obs[k].0 - pi) as f32 / fps) {
+                end = Some(k);
+                break;
+            }
+            k += 1;
+        }
+        let Some(k) = end else {
+            j += 1;
+            continue;
+        };
+        let (ki, kp) = obs[k];
+        let template = frames[pi].world.ball.expect("observation has a ball");
+        for f in ji..ki {
+            let a = (f - pi) as f32 / (ki - pi) as f32;
+            let mut b: TrackedEntity = template;
+            b.yaw = pp.0 + (kp.0 - pp.0) * a;
+            b.pitch = pp.1 + (kp.1 - pp.1) * a;
+            frames[f].world.ball = Some(b);
+            rewritten += 1;
+        }
+        j = k + 1;
+    }
+    rewritten
+}
+
+/// Longest gap between two sightings of our ball that is bridged.
+const IDENTITY_MAX_GAP_S: f32 = 4.0;
+/// Longest gap inside one ball tracklet.
+const IDENTITY_LINK_GAP_S: f32 = 0.5;
+/// Share of a tracklet's sightings strictly inside our outline for it to be ours.
+const IDENTITY_OURS_INSIDE_SHARE: f32 = 0.5;
+
+/// Offline ball identity: link every ball candidate into tracklets, call a
+/// tracklet ours when it mostly lives strictly inside our outline (a ball
+/// that arrives from beyond the line stays foreign), then follow only our
+/// ball, bridging gaps between its sightings. Returns frames whose ball is
+/// our ball (seen or bridged).
+fn identity_filter(frames: &mut [OfflineFrame], obs: &[Vec<(f32, f32, bool)>], fps: f32) -> usize {
+    struct Tl {
+        pts: Vec<(usize, (f32, f32), bool)>,
+    }
+    let link = (IDENTITY_LINK_GAP_S * fps) as usize;
+    let mut tls: Vec<Tl> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    for (i, cands) in obs.iter().enumerate() {
+        open.retain(|&t| i - tls[t].pts.last().unwrap().0 <= link);
+        let mut used = vec![false; open.len()];
+        for &(y, p, inside) in cands {
+            let pos = (y, p);
+            let best = open
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| !used[*k])
+                .filter_map(|(k, &t)| {
+                    let (li, lp, _) = *tls[t].pts.last().unwrap();
+                    let dt = (i - li) as f32 / fps;
+                    reachable(lp, pos, dt).then(|| (k, t, ang(lp, pos)))
+                })
+                .min_by(|a, b| a.2.total_cmp(&b.2));
+            match best {
+                Some((k, t, _)) => {
+                    used[k] = true;
+                    tls[t].pts.push((i, pos, inside));
+                }
+                None => {
+                    tls.push(Tl {
+                        pts: vec![(i, pos, inside)],
+                    });
+                    open.push(tls.len() - 1);
+                    used.push(true);
+                }
+            }
+        }
+    }
+    // Our ball's sightings: points of "ours" tracklets; when two overlap,
+    // keep the one continuing from our previous sighting.
+    let mut per_frame: Vec<Vec<(f32, f32)>> = vec![Vec::new(); frames.len()];
+    for tl in &tls {
+        let inside = tl.pts.iter().filter(|p| p.2).count() as f32;
+        // Tested 18 Oct: "first seen inside => ours" made strays worse
+        // (tracklets hop between nearby balls), so majority-inside it is.
+        if inside / tl.pts.len() as f32 >= IDENTITY_OURS_INSIDE_SHARE {
+            for &(i, pos, _) in &tl.pts {
+                per_frame[i].push(pos);
+            }
+        }
+    }
+    let mut ours: Vec<(usize, (f32, f32))> = Vec::new();
+    for (i, c) in per_frame.iter().enumerate() {
+        let pick = match ours.last() {
+            Some(&(_, lp)) => c
+                .iter()
+                .min_by(|a, b| ang(**a, lp).total_cmp(&ang(**b, lp))),
+            None => c.first(),
+        };
+        if let Some(&p) = pick {
+            ours.push((i, p));
+        }
+    }
+    let template = frames
+        .iter()
+        .find_map(|f| f.world.ball)
+        .unwrap_or(TrackedEntity {
+            id: 0,
+            class_id: BALL_CLASS_ID,
+            yaw: 0.0,
+            pitch: 0.0,
+            confidence: 1.0,
+            state: TrackState::Tracking,
+            age_frames: 0,
+            origin: reco_core::detect::detector::CameraId::Left,
+        });
+    let max_gap = (IDENTITY_MAX_GAP_S * fps) as usize;
+    for f in frames.iter_mut() {
+        f.world.ball = None;
+    }
+    let mut covered = 0;
+    for w in 0..ours.len() {
+        let (i, p) = ours[w];
+        let mut b = template;
+        b.state = TrackState::Tracking;
+        b.yaw = p.0;
+        b.pitch = p.1;
+        frames[i].world.ball = Some(b);
+        covered += 1;
+        if let Some(&(j, q)) = ours.get(w + 1) {
+            if j - i > 1 && j - i <= max_gap {
+                for f in i + 1..j {
+                    let a = (f - i) as f32 / (j - i) as f32;
+                    let mut b = template;
+                    b.state = TrackState::Tracking;
+                    b.yaw = p.0 + (q.0 - p.0) * a;
+                    b.pitch = p.1 + (q.1 - p.1) * a;
+                    frames[f].world.ball = Some(b);
+                    covered += 1;
+                }
+            }
+        }
+    }
+    covered
 }
